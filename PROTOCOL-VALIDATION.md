@@ -599,6 +599,11 @@ Confirmed `cmd` strings:
 | `unblock-sta` | Unblock client | `{"cmd":"unblock-sta","mac":"…"}` |
 | `spectrum-scan` | — | Handler implemented; no UI affordance found in 10.4.57 to fire it. |
 
+The block-sta deauth goes to **every BSS** (`ucihelper.ap_ifnames`, VLAN
+netdevs folded into their BSS). Until 2026-10 the block deauth went to
+`get_ifname_for_radio`, which is the first interface of each radio only. On the Archer C5,
+radio1 carries `phy1-ap0` and `phy1-ap1`, so a client on the second SSID was never kicked.
+
 Block/unblock are **one-shot commands**, not persistent per-inform state. The candidate
 persistent field `include_blocks` (present on every response) was ruled out — it stays `[]`
 even while a client is genuinely blocked. The device is expected to remember the block itself,

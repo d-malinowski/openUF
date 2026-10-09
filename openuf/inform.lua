@@ -3641,18 +3641,7 @@ function M.handle_response(json_str, st, cfg)
 					-- Kick it immediately if it's currently associated --
 					-- the nft drop rule alone stops future traffic, but
 					-- doesn't tear down an existing association.
-					local ufuci = M._ucihelper
-					if ufuci and ufuci.get_radio_table then
-						local ok_r, radios = pcall(ufuci.get_radio_table)
-						if ok_r then
-							local ifnames = {}
-							for _, radio in ipairs(radios) do
-								local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-								if ok_if and ifname then ifnames[#ifnames + 1] = ifname end
-							end
-							M._firewall.deauth(mac, ifnames)
-						end
-					end
+					M._firewall.deauth(mac, M._bss_ifnames())
 				end
 			end
 		elseif cmd == "spectrum-scan" then
@@ -3751,6 +3740,26 @@ function M.handle_response(json_str, st, cfg)
 	end
 
 	return false
+end
+
+-- Every hostapd BSS on the device, for a deauth that must find a station on
+-- whichever SSID it is on. One interface per radio missed every SSID after the
+-- first on that radio. A VLAN netdev folds into its BSS (hostapd has no
+-- control socket on it).
+function M._bss_ifnames()
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.ap_ifnames) then return {} end
+	local ok, names = pcall(ufuci.ap_ifnames)
+	if not ok or type(names) ~= "table" then return {} end
+	local out, seen = {}, {}
+	for _, name in ipairs(names) do
+		local bss = ufuci.bss_ifname and ufuci.bss_ifname(name) or name
+		if not seen[bss] then
+			seen[bss] = true
+			out[#out + 1] = bss
+		end
+	end
+	return out
 end
 
 -- ─── HTTP POST ───────────────────────────────────────────────────────────────

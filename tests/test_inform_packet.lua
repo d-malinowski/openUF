@@ -33,6 +33,18 @@ inform._sysconf = {parse = function() return nil end, apply = function() return 
 local FIXED_IV = string.rep("\0", 16)
 crypto._random_bytes = function(n) return string.rep("\0", n) end
 
+-- A device with two SSIDs on radio0 (the second one VLAN-tagged, so netifd
+-- also lists its VLAN netdev) and one on radio1, as ucihelper.ap_ifnames
+-- reports it.
+local function bss_mock()
+	return {
+		ap_ifnames = function()
+			return {"phy0-ap0", "phy0-ap1", "phy0-ap1.10", "phy1-ap0"}
+		end,
+		bss_ifname = function(n) if n == "phy0-ap1.10" then return "phy0-ap1" end return n end,
+	}
+end
+
 -- Minimal state for packet building
 local function sample_state(overrides)
 	local st = {
@@ -2711,14 +2723,7 @@ return {
 				reconcile = function(macs) reconciled = macs end,
 				deauth = function(mac, ifnames) deauthed = {mac = mac, ifnames = ifnames} end,
 			}
-			inform._ucihelper = {
-				get_radio_table = function() return {{name = "radio0"}, {name = "radio1"}} end,
-				get_ifname_for_radio = function(name)
-					if name == "radio0" then return "wlan0" end
-					if name == "radio1" then return "wlan1" end
-					return nil
-				end,
-			}
+			inform._ucihelper = bss_mock()
 			local result = inform.handle_response(
 				'{"_type":"cmd","cmd":"block-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
 			inform._firewall = { reconcile = function() end, deauth = function() end }
@@ -2728,7 +2733,10 @@ return {
 			assert_eq(#reconciled, 1, "reconcile called with the updated list")
 			assert_eq(reconciled[1], "aa:bb:cc:dd:ee:01", "reconcile sees the newly blocked MAC")
 			assert_eq(deauthed.mac, "aa:bb:cc:dd:ee:01", "deauth targets the blocked MAC")
-			assert_eq(#deauthed.ifnames, 2, "deauth issued across every configured radio")
+			-- Every BSS, not one per radio: the IoT SSID shares radio0 with
+			-- the home SSID, and its VLAN netdev folds into its own BSS.
+			assert_eq(table.concat(deauthed.ifnames, ","), "phy0-ap0,phy0-ap1,phy1-ap0",
+				"deauth issued on every BSS, VLAN netdevs folded into theirs")
 			assert_true(result, "re-inform immediately after executing a command")
 		end
 	},
