@@ -22,7 +22,9 @@ instances (`announce`, `inform`) from `/opt/openuf/`.
   count as one failure each. If the total drops sharply, check the invocation first.
 - **Target is Lua 5.1; the dev box is 5.5; CI is 5.1.** Green locally proves nothing
   for CI. No `\xNN` escapes (5.1 silently emits `x07`; use `string.char`), no `//`,
-  `goto`, `\z`, `\u{}`, `table.unpack`. `os.execute` returns a number on 5.1: both
+  `goto`, `\z`, `\u{}`, `table.unpack`. OpenWrt's Lua carries the LNUM patch:
+  `string.format("%d", x)` raises for |x| > 2^31 on the APs, but not on CI or in the lab.
+  Format epochs in ms and other large values with `%.0f`. `os.execute` returns a number on 5.1: both
   0 and 1 are truthy, so normalise before branching.
 - Syntax-check on 5.1: `docker cp openuf/<m>.lua openuf-validation-ap:/tmp/c.lua &&
   docker exec openuf-validation-ap luac -p /tmp/c.lua`
@@ -79,7 +81,11 @@ Put every verification step into a tier and name the tier:
   the win, then keep digging. The target is a pristine fix, not an accepted trade.
 
 ## Commits & docs
-- One commit per fixed finding.
+- **Test on the APs before committing.** Deploy the uncommitted change to the real APs
+  (procedure in `CLAUDE.local.md`), confirm it works there, then commit. Unit tests and the
+  lab are prerequisites, not a substitute: they can't catch device-only failures.
+- **One commit per feature** (or per fixed finding). A fix found during hardware testing is
+  folded into that feature's commit, not stacked on top as a follow-up.
 - Commit message: subject + body + `Co-Authored-By` trailer only. No session URL.
 - **Public repo: never commit real MACs or IPs.** Map to `192.0.2.N` (mgmt LAN),
   `198.51.100.N` (other VLANs), `00:00:5e:00:53:0X` (MACs), one placeholder per real
