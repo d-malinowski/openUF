@@ -143,6 +143,20 @@ function M.load()
 		if type(tbl[field]) == want then st[field] = tbl[field] end
 	end
 
+	-- blocked_stas is a list, but a cjson build that tags decoded objects
+	-- (the lab image's) saves `{}` plus an append as {"1":mac}, which
+	-- reloads with a string key that ipairs never sees -- every block gone
+	-- after a restart. Rebuild it as a plain array, in key order.
+	local entries = {}
+	for k, v in pairs(st.blocked_stas) do
+		if type(v) == "string" and tonumber(k) then
+			entries[#entries + 1] = {tonumber(k), v}
+		end
+	end
+	table.sort(entries, function(a, b) return a[1] < b[1] end)
+	st.blocked_stas = {}
+	for i, e in ipairs(entries) do st.blocked_stas[i] = e[2] end
+
 	-- Security invariant: never use a custom key when not adopted
 	if not st.adopted then
 		st.authkey = M.DEFAULT_KEY

@@ -177,6 +177,32 @@ return {
 		end
 	},
 	{
+		name = "state: a block list saved as an object loads back as a list",
+		fn = function()
+			-- The lab image's cjson keeps decoded {} tagged as an object, so
+			-- {} + one append was saved as {"1":mac}. Loaded raw, that is a
+			-- string key ipairs never sees: nft came up empty after a restart.
+			with_tmp(function()
+				local f = io.open(TMP, "w")
+				f:write('{"adopted":true,"blocked_stas":{"2":"aa:bb:cc:dd:ee:02",'
+					.. '"1":"aa:bb:cc:dd:ee:01","x":"junk","3":7}}')
+				f:close()
+				local st = state.load()
+				local got = {}
+				for _, m in ipairs(st.blocked_stas) do got[#got + 1] = m end
+				assert_eq(table.concat(got, ","), "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02",
+					"numbered entries come back in order; junk dropped")
+				st.blocked_stas[#st.blocked_stas + 1] = "aa:bb:cc:dd:ee:03"
+				state.save(st)
+				f = io.open(TMP, "r")
+				local raw = f:read("*a")
+				f:close()
+				assert_true(raw:find('"blocked_stas":["aa:bb:cc:dd:ee:01","aa:bb:cc:dd:ee:02","aa:bb:cc:dd:ee:03"]', 1, true) ~= nil,
+					"saved back as a JSON array")
+			end)
+		end
+	},
+	{
 		name = "state: every field any module writes survives a save/load round trip",
 		fn = function()
 			-- The invariant, checked against the SOURCE rather than a list

@@ -2823,6 +2823,100 @@ return {
 		end
 	},
 	{
+		name = "inform packet: setparam blocked_sta replaces the ledger, reconciles, deauths only new MACs",
+		fn = function()
+			-- The wire form captured from 10.4.57: the site's blocked
+			-- clients joined with "\n", beside system_cfg/mgmt_cfg.
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:09"}})
+			local reconciled, deauthed = nil, {}
+			inform._firewall = {
+				reconcile = function(macs) reconciled = macs end,
+				deauth = function(mac, ifnames) deauthed[#deauthed + 1] = mac .. "@" .. table.concat(ifnames, ",") end,
+			}
+			inform._ucihelper = bss_mock()
+			local result = inform.handle_response(cjson.encode({_type = "setparam",
+				blocked_sta = "aa:bb:cc:dd:ee:01\nAA:BB:CC:DD:EE:02"}), st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+			assert_eq(table.concat(st.blocked_stas, ","), "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02",
+				"ledger is the controller's list, lowercased; a MAC it dropped is gone")
+			assert_eq(table.concat(reconciled, ","), "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02",
+				"nft rebuilt from the new list")
+			assert_eq(table.concat(deauthed, " "), "aa:bb:cc:dd:ee:02@phy0-ap0,phy0-ap1,phy1-ap0",
+				"only the newly blocked MAC is deauthed, on every BSS")
+			assert_false(result, "a plain setparam does not re-inform")
+		end
+	},
+	{
+		name = "inform packet: setparam blocked_sta \"\" clears every block",
+		fn = function()
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
+			local reconciled, deauthed = nil, false
+			inform._firewall = {
+				reconcile = function(macs) reconciled = macs end,
+				deauth = function() deauthed = true end,
+			}
+			inform.handle_response('{"_type":"setparam","blocked_sta":""}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_eq(#st.blocked_stas, 0, "present-but-empty means nothing is blocked")
+			assert_eq(#reconciled, 0, "nft set emptied")
+			assert_false(deauthed, "unblocking deauths nobody")
+		end
+	},
+	{
+		name = "inform packet: setparam without blocked_sta leaves the ledger alone",
+		fn = function()
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
+			local called = false
+			inform._firewall = {
+				reconcile = function() called = true end,
+				deauth = function() called = true end,
+			}
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"cfgversion=abc"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_eq(table.concat(st.blocked_stas, ","), "aa:bb:cc:dd:ee:01", "absent is not empty")
+			assert_false(called, "firewall untouched")
+		end
+	},
+	{
+		name = "inform packet: setparam blocked_sta with the same set does not rebuild nft",
+		fn = function()
+			-- Every config push carries the list: reconcile drops and
+			-- recreates the table, so an unchanged list must not touch it.
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:01"}})
+			local called = false
+			inform._firewall = {
+				reconcile = function() called = true end,
+				deauth = function() called = true end,
+			}
+			inform.handle_response(cjson.encode({_type = "setparam",
+				blocked_sta = "aa:bb:cc:dd:ee:01\naa:bb:cc:dd:ee:02\naa:bb:cc:dd:ee:01"}), st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_false(called, "same set in another order (with a duplicate) is a no-op")
+			assert_eq(#st.blocked_stas, 2, "ledger kept")
+		end
+	},
+	{
+		name = "inform packet: setparam blocked_sta skips malformed entries",
+		fn = function()
+			local st = sample_state()
+			local reconciled
+			inform._firewall = {
+				reconcile = function(macs) reconciled = macs end,
+				deauth = function() end,
+			}
+			inform._ucihelper = bss_mock()
+			inform.handle_response(cjson.encode({_type = "setparam",
+				blocked_sta = "aa:bb:cc:dd:ee:01\n\nnot-a-mac\naa:bb:cc:dd:ee:0;reboot\n aa:bb:cc:dd:ee:03 \n"}), st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+			assert_eq(table.concat(st.blocked_stas, ","), "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:03",
+				"only well-formed MACs kept (surrounding whitespace trimmed)")
+			assert_eq(table.concat(reconciled, ","), "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:03",
+				"nft sees the same list")
+		end
+	},
+	{
 		name = "inform packet: handle_response cmd re-informs immediately even for unhandled commands",
 		fn = function()
 			local st = sample_state()

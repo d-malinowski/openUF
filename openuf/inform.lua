@@ -3538,6 +3538,15 @@ function M.handle_response(json_str, st, cfg)
 			end
 		end
 
+		-- blocked_sta: the site's whole block list, newline-separated, on
+		-- every config push and again when the controller sees the device
+		-- come back (PROTOCOL-VALIDATION.md, "blocked_sta"). Present-but-empty
+		-- is a real "nothing blocked"; absent means not sent, so the ledger
+		-- stands.
+		if type(resp.blocked_sta) == "string" then
+			M._sync_blocked_stas(st, resp.blocked_sta)
+		end
+
 		M._state.save(st)
 		return newly_adopted  -- re-inform immediately with the new key if adopted
 	end
@@ -3610,13 +3619,12 @@ function M.handle_response(json_str, st, cfg)
 			st.locating = (cmd == "set-locate")
 			M._state.save(st)
 		elseif cmd == "block-sta" or cmd == "unblock-sta" then
-			-- One-shot command, confirmed live: block/unblock never appears
-			-- as a persistent field on any inform response (a candidate
-			-- top-level `include_blocks` list stays empty even while a
-			-- client is genuinely blocked) -- the device itself is expected
-			-- to remember the block, the same way real hardware would.
-			-- Persisted in state.blocked_stas and re-applied at M.run()
-			-- startup (M._firewall.reconcile), so it survives a restart.
+			-- The immediate path. `include_blocks` stays empty even while a
+			-- client is blocked; the persistent copy is setparam's
+			-- blocked_sta (M._sync_blocked_stas), which only arrives on the
+			-- next config push. Persisted in state.blocked_stas and re-applied
+			-- at M.run() startup (M._firewall.reconcile), so it survives a
+			-- restart.
 			local mac = resp.mac
 			if type(mac) == "string" then
 				st.blocked_stas = st.blocked_stas or {}
@@ -3754,6 +3762,43 @@ end
 -- whichever SSID it is on. One interface per radio missed every SSID after the
 -- first on that radio. A VLAN netdev folds into its BSS (hostapd has no
 -- control socket on it).
+-- Replace the block ledger with the controller's list (setparam blocked_sta)
+-- and rebuild the nft set, but only when the set of MACs changed: reconcile
+-- drops and recreates the table, so redoing it on every push would open a
+-- gap for nothing. A MAC new to the ledger is deauthed as block-sta does.
+-- Returns true when the ledger changed.
+function M._sync_blocked_stas(st, raw)
+	local list, want = {}, {}
+	for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
+		local mac = line:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+		if mac then
+			if not want[mac] then want[mac] = true; list[#list + 1] = mac end
+		elseif line:match("%S") then
+			io.stderr:write(("inform: blocked_sta: ignoring %q\n"):format(line))
+		end
+	end
+	local have, n_have = {}, 0
+	for _, m in ipairs(st.blocked_stas or {}) do
+		m = tostring(m):lower()
+		if not have[m] then have[m] = true; n_have = n_have + 1 end
+	end
+	local changed = (n_have ~= #list)
+	for _, m in ipairs(list) do
+		if not have[m] then changed = true break end
+	end
+	if not changed then return false end
+	st.blocked_stas = list
+	M._firewall.reconcile(list)
+	local ifnames
+	for _, m in ipairs(list) do
+		if not have[m] then
+			ifnames = ifnames or M._bss_ifnames()
+			M._firewall.deauth(m, ifnames)
+		end
+	end
+	return true
+end
+
 function M._bss_ifnames()
 	local ufuci = M._ucihelper
 	if not (ufuci and ufuci.ap_ifnames) then return {} end

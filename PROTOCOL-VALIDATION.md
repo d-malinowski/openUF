@@ -616,10 +616,59 @@ collecting each `"cmd", "<name>"` literal. Most have no meaning on an AP:
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
-Block/unblock are **one-shot commands**, not persistent per-inform state. The candidate
-persistent field `include_blocks` (present on every response) was ruled out — it stays `[]`
-even while a client is genuinely blocked. The device is expected to remember the block itself,
-which is why `state.json` carries `blocked_stas` and `firewall.reconcile()` runs at startup.
+Block/unblock commands are the **immediate** path. The noop field `include_blocks` is not the
+block list: it stays `[]` even while a client is blocked. The persistent list is `setparam`'s
+top-level `blocked_sta`, described next. `state.json` carries `blocked_stas` and
+`firewall.reconcile()` runs at startup, so blocks survive a restart between pushes.
+
+#### `blocked_sta`: the site's block list on every config push
+
+The wire format was captured in the 10.4.57 lab on 2026-10-09. Every full `setparam` carries a
+top-level `blocked_sta` string beside `system_cfg`, `mgmt_cfg` and `cfgversion`. Its value is
+the MAC of every client with `blocked: true` in the site, joined with `"\n"`:
+
+| Site state | Wire |
+|---|---|
+| nothing blocked | `"blocked_sta":""` (also seen from the real UCG Ultra) |
+| one blocked | `"blocked_sta":"de:ad:be:ef:00:03"` |
+| two blocked | `"blocked_sta":"de:ad:be:ef:00:03\nde:ad:be:ef:00:04"` |
+
+- **Builder.** For a MediaTek/Atheros/Broadcom AP the generator (`config/eWivisHeQsnaqDtx`)
+  delegates to `config/eirJvdtm`. That class queries clients by `site_id` with blocked = true
+  and returns `mac` joined by `"\n"`. The list is site-wide, not filtered per AP, so it is
+  authoritative.
+- **Gate.** The key is sent only when `supportBlockedSta()` is true, which is the case for a
+  U6-IW (`devmgr/l/MiVjHefaf:837`).
+- **When it is sent.** The same handler also sends a standalone
+  `setparam{blocked_sta, interval}` (`:705`) when a device the controller had marked
+  disconnected comes back. A restart inside the heartbeat window is not such a reconnect: only
+  noops came back.
+- **Not pushed by a block alone.** `block-sta` and `unblock-sta` send only the `cmd`. The list
+  arrives on the next config push.
+- **Lab triggers.** A device rename triggered the push reliably. `force-provision` worked
+  twice, then stopped producing a `setparam` with `cfgversion` unchanged; an `led_override`
+  edit did not trigger one either.
+
+How openUF uses it (`inform.lua` `_sync_blocked_stas`):
+- The key **present** replaces `st.blocked_stas`, including `""`, which is a real "nothing
+  blocked". The key **absent** leaves the ledger alone.
+- nft is rebuilt only when the set of MACs changed: `reconcile` drops and recreates the table,
+  and the list arrives on every push.
+- A MAC new to the ledger is deauthed on every BSS, the same as `block-sta`.
+
+Lab, 2026-10-09:
+1. Blocked 00:03 and 00:04 by REST, ran the new code, then a push. 00:04 had dropped out of
+   the ledger (see below) and the push put it back: `blocked_stas` became
+   `["de:ad:be:ef:00:03","de:ad:be:ef:00:04"]`, with both in `bridge openuf blocked_macs`.
+   A later block (00:05) survived an inform restart, with nft rebuilt from the ledger.
+2. Unblocked both, ran a push: `""` emptied both the ledger and the set.
+3. 0 `handle_response failed` throughout.
+
+The same session found a lab-only ledger loss. The lab image's cjson tags a decoded `{}` as an
+object, so `{}` plus one append saved as `{"1":mac}`. That reloads with a string key, which
+`ipairs` never sees, so after a restart nft came up empty and 00:04's block was lost.
+`state.load` now rebuilds the list as a plain array. The APs' `lua-cjson-2.1.0-r5` round-trips
+correctly; checked on the Archer.
 
 ### Connection tracking notifs (`STA_ASSOC_TRACKER`)
 
@@ -2687,7 +2736,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 16 | Set Replacement Device / Load Configuration | **None** — controller-side Mongo document clone (`commonDeviceCloneConfigService`), then an ordinary adopt + `setparam` | ✅ Both confirmed live; zero product code needed. Replacement auto-adopts the target ~50 s after the source goes away. |
 | 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port. Extended 2026-09-12: each socket is asked about its OWN bridge, a socket whose MAC learning is off is served by the `bridge openuf_learn` nft tap, and rows carry `vlan` (+ a tap-harvested `ip`) — which is what puts the client on the right **network**, not just the right port. See [`mac_table[].vlan`](#mac_tablevlan--how-a-wired-client-gets-its-network) |
 | 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
-| 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). |
+| 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"`, plus `setparam` `blocked_sta` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). The `blocked_sta` list (2026-10-09) is newline-separated and site-wide; `""` clears it (see Response `_type`s) |
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` (+ 802.11k `rrm_beacon_req`) | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls), and ✅ **confirmed rendering** in the live Environment tab 2026-09-02 (AX3000T): the 30-minute window listed exactly the BSSes in that AP's own scan cache, with matching signals, and the spectrum chart drew them alongside `This AP`. Note what the `scan dump` source can and cannot see: the cache is filled **passively, from beacons the radio overhears on the channel it is already parked on**, so the list is neighbours on/adjacent to the operating channel and nothing else — 6 entries on a 2.4 GHz radio on ch 11, exactly 1 on a 5 GHz radio on ch 44. That is the deliberate trade for never dwelling off-channel. ✅ Closed 2026-09-02 with 802.11k client-assisted enrichment (`openuf/rrmscan.lua`) -- Ubiquiti's own Channel AI mechanism -- which took a 5 GHz radio's list from **0 neighbours to 4** without the AP leaving its channel; see [the section above](#enriching-it-without-scanning--80211k-beacon-reports). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |
 | 22 | Radios tab Avg. Signal / Interference / Airtime / MIMO | `vap_table.avg_client_signal`; `radio_table.athstats`; `radio_table.radio_caps` | ✅ All four confirmed live on a fresh reset (`-64`/`-50 dBm`, `3%`, `7%`, `2x2`), with bidirectional filter behavior verified |
