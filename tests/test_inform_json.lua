@@ -751,6 +751,18 @@ return {
 		end
 	},
 	{
+		name = "inform json: guest_token is reported while the portal is on, only",
+		fn = function()
+			-- Without it the controller refuses every portal login on this AP
+			-- ("Missing Guest Token in AP[..] during guest authorization").
+			local tok = string.rep("ab", 16)
+			local on = build({st = {guest_portal = {enabled = true}, guest_token = tok}})
+			assert_eq(on.guest_token, tok, "portal on")
+			local off = build({st = {guest_token = tok}})
+			assert_eq(off.guest_token, nil, "portal off: not reported")
+		end
+	},
+	{
 		name = "inform json: vap_table nests connected clients as sta_table",
 		fn = function()
 			inform._sta_stats_cache = {}

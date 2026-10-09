@@ -1953,6 +1953,23 @@ function M.get_ifnames_for_vap(radio, ssid)
 	return vlan_ifnames(iface, out)
 end
 
+-- Every live netdev of the enabled openUF VAPs whose wlanconf id is in ids
+-- (a set), as {ifname=, ssid=}: the guest portal's interfaces.
+function M.wlanconf_ifnames(ids)
+	local out = {}
+	if type(ids) ~= "table" or next(ids) == nil then return out end
+	local cursor = get_uci().cursor()
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		if s.disabled == "1" or not (s.openuf_wlanconf_id and ids[s.openuf_wlanconf_id]) then return end
+		local ok_if, ifnames = pcall(M.get_ifnames_for_vap, s.device, s.ssid)
+		if not ok_if then return end
+		for _, ifname in ipairs(ifnames) do
+			out[#out + 1] = {ifname = ifname, ssid = s.ssid}
+		end
+	end)
+	return out
+end
+
 -- "Minimum RSSI" enforcement: send a single 802.11 deauthentication frame to
 -- mac on ifname. Deliberately standalone from firewall.lua's block-sta
 -- feature -- confirmed via web research that Minimum RSSI is a roaming aid,

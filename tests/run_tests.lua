@@ -135,6 +135,7 @@ local test_files = {
 	"tests/test_syswrapper.lua",
 	"tests/test_sysconf.lua",
 	"tests/test_l2guard.lua",
+	"tests/test_guestportal.lua",
 	"tests/test_inform_json.lua",
 	"tests/test_led.lua",
 	"tests/test_airtime.lua",

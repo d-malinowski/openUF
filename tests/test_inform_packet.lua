@@ -24,6 +24,9 @@ inform._l2guard = {reconcile = function() return 0 end,
 	parse = function() return nil end, spec_from = function() return {} end}
 inform._sysconf = {parse = function() return nil end, apply = function() return {} end,
 	apply_cron = function() return false end}
+-- And the guest portal (nft, a listening socket); guest tests stub their own.
+inform._guestportal._exec = function() return 0 end
+inform._guestportal.listen = function() return {close = function() end} end
 
 -- Deterministic IV for the TEST FILE's own crypto instance -- affects only
 -- tests that call crypto.* directly (e.g. the zlib round-trip). inform's
@@ -4675,6 +4678,209 @@ return {
 				orig.handle_response, orig.send, orig.reload, orig.rrm
 			assert_eq(asked, "state,notifs", "state inform first, then the notifs")
 			assert_eq(not_asked, "state", "nothing when the controller did not ask")
+		end
+	},
+	{
+		name = "inform packet: a portal push enforces it; portal off tears it down",
+		fn = function()
+			local real = inform._guestportal
+			local calls = {reconcile = {}, listen = 0, closed = 0}
+			inform._guestportal = {
+				parse = real.parse, is_guest_rule = real.is_guest_rule, PORT = real.PORT,
+				bridge_mac = function(ifname) return ifname == "phy0-ap1" and "02:00:00:00:00:aa" or nil end,
+				reconcile = function(spec, vaps, macs)
+					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs}
+					return 1
+				end,
+				listen = function()
+					calls.listen = calls.listen + 1
+					return {close = function() calls.closed = calls.closed + 1 end}
+				end,
+			}
+			local asked_ids
+			inform._ucihelper = {wlanconf_ifnames = function(ids)
+				asked_ids = ids
+				return {{ifname = "phy0-ap1", ssid = "g"}, {ifname = "phy1-ap1", ssid = "g"}}
+			end}
+			local save = inform._state.save
+			inform._state.save = function() end
+			local function push(st, portal)
+				local sys = "aaa.1.id=w1\nwireless.1.ssid=g\nwireless.1.parent=wifi0\n"
+					.. "wireless.1.is_guest=true\nredirector.status=" .. portal .. "\n"
+					.. "redirector.url=http://192.0.2.2:8880/guest/s/default/\n"
+					.. "ebtables.7.cmd=-t nat -A PREROUTING --in-interface ath0 -j GUESTIN\n"
+				inform.handle_response(cjson.encode({_type = "setparam", system_cfg = sys}),
+					st, {net = {lan_cpueth = "eth0"}})
+			end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				push(st, "enabled")
+				assert_true(st.guest_portal and st.guest_portal.enabled, "the portal's facts kept")
+				assert_eq(st.guest_portal.unknown, nil, "the report is not persisted")
+				assert_true(type(st.guest_token) == "string" and st.guest_token:match("^%x+$") ~= nil
+					and #st.guest_token == 32, "a guest_token to report")
+				assert_true(asked_ids.w1, "the guest WLAN's netdevs were asked for")
+				local r = calls.reconcile[1]
+				assert_eq(#r.vaps, 2, "both guest netdevs")
+				assert_eq(r.vaps[1].bridge_mac, "02:00:00:00:00:aa", "with their bridge MAC")
+				assert_eq(table.concat(r.macs, ","), "de:ad:be:ef:00:02", "and the ledger")
+				assert_eq(calls.listen, 1, "listening")
+				assert_eq(inform._guest_ctx.url, "http://192.0.2.2:8880/guest/s/default/", "the answer's target")
+				local token = st.guest_token
+				push(st, "enabled")
+				assert_eq(calls.listen, 1, "a second push does not listen again")
+				assert_eq(st.guest_token, token, "nor change the token")
+				push(st, "disabled")
+				assert_eq(st.guest_portal, nil, "off")
+				assert_eq(calls.reconcile[3].spec, nil, "tables torn down")
+				assert_eq(calls.closed, 1, "listener closed")
+				assert_eq(inform._guest_server, nil, "and forgotten")
+				assert_eq(inform._guest_built, nil, "nothing built")
+			end)
+			inform._guestportal, inform._ucihelper, inform._state.save = real, nil, save
+			inform._guest_server, inform._guest_built, inform._guest_ctx = nil, nil, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: authorize-guest refills the nft set only while the portal is built",
+		fn = function()
+			local real = inform._guestportal
+			local filled
+			inform._guestportal = {set_authorized = function(macs) filled = macs end}
+			local save = inform._state.save
+			inform._state.save = function() end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				inform._guest_built = nil
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"de:ad:be:ef:00:03"}', st)
+				assert_eq(filled, nil, "no portal: the ledger only")
+				inform._guest_built = "phy0-ap1=x"
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"de:ad:be:ef:00:04"}', st)
+				assert_eq(table.concat(filled, ","), "de:ad:be:ef:00:02,de:ad:be:ef:00:03,de:ad:be:ef:00:04",
+					"the whole ledger, sorted")
+				inform.handle_response('{"_type":"cmd","cmd":"unauthorize-guest","mac":"de:ad:be:ef:00:02"}', st)
+				assert_eq(table.concat(filled, ","), "de:ad:be:ef:00:03,de:ad:be:ef:00:04", "and on unauthorize")
+			end)
+			inform._guestportal, inform._state.save, inform._guest_built = real, save, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: l2guard leaves the guest rules to guestportal",
+		fn = function()
+			local real = inform._l2guard
+			inform._l2guard = {
+				parse = function() return {unknown = {
+					"-t nat -A PREROUTING --in-interface ath0 -j GUESTIN", "-t nat -A X -j NEWTHING"}} end,
+				spec_from = function() return {} end, reconcile = function() return 0 end,
+			}
+			local log
+			local ok, err = pcall(function()
+				log = with_stderr(function() inform._l2guard_apply_push("x", sample_state()) end)
+			end)
+			inform._l2guard = real
+			if not ok then error(err, 0) end
+			assert_eq(log:find("GUESTIN", 1, true), nil, "the guest hook is not reported")
+			assert_true(log:find("NEWTHING", 1, true) ~= nil, "a real unknown still is")
+		end
+	},
+	{
+		name = "inform packet: _guest_resync rebuilds only when the guest netdevs changed",
+		fn = function()
+			local real, rt = inform._guestportal, inform._time
+			local built = 0
+			inform._guestportal = {
+				bridge_mac = function() return "02:00:00:00:00:aa" end,
+				reconcile = function() built = built + 1; return 1 end,
+				listen = function() return {close = function() end} end, PORT = 1,
+			}
+			local live = {}
+			inform._ucihelper = {wlanconf_ifnames = function() return live end}
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_portal = {enabled = true, url = "http://192.0.2.2/"},
+					guest_token = "00"})
+				inform._guest_enforce(st)          -- startup: wireless not up yet
+				assert_eq(built, 1, "built once (with nothing to hook)")
+				inform._guest_next = 0
+				assert_false(inform._guest_resync(st), "still nothing live: no rebuild")
+				live = {{ifname = "phy0-ap1", ssid = "g"}}
+				assert_false(inform._guest_resync(st), "not before the interval")
+				now = now + inform.GUEST_RESYNC_INTERVAL
+				with_stderr(function() assert_true(inform._guest_resync(st), "the VAP came up: rebuilt") end)
+				assert_eq(built, 2, "rebuilt once")
+				now = now + inform.GUEST_RESYNC_INTERVAL
+				assert_false(inform._guest_resync(st), "unchanged: left alone")
+				assert_false(inform._guest_resync(sample_state()), "portal off: nothing to do")
+			end)
+			inform._guestportal, inform._time, inform._ucihelper = real, rt, nil
+			inform._guest_server, inform._guest_built, inform._guest_ctx, inform._guest_next = nil, nil, nil, 0
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: _idle sleeps plainly, or answers guests until the deadline",
+		fn = function()
+			local t = 0
+			local selects = {}
+			local sock = {
+				gettime = function() return t end,
+				select = function(r, _, timeout)
+					selects[#selects + 1] = (r and "R" or "-") .. timeout
+					-- Two guests arrive a second apart, then nobody.
+					if r and #selects <= 2 then t = t + 1; return {r[1]} end
+					t = t + timeout
+					return {}
+				end,
+			}
+			inform._guest_server = nil
+			inform._idle(sock, 10)
+			assert_eq(table.concat(selects, ","), "-10", "no portal: one plain sleep")
+			local real = inform._guestportal
+			local served = 0
+			inform._guestportal = {serve_one = function(server, ctx)
+				assert_eq(type(ctx.arp), "function", "the answer can look the guest up")
+				served = served + 1
+				return true
+			end}
+			inform._guest_server = {}
+			inform._guest_ctx = {url = "http://192.0.2.2/", ap = "00:00:5e:00:53:02", vaps = {}}
+			selects, t = {}, 0
+			local ok, err = pcall(inform._idle, sock, 10)
+			inform._guestportal = real
+			if not ok then
+				inform._guest_server, inform._guest_ctx = nil, nil
+				error(err, 0)
+			end
+			assert_eq(served, 2, "two guests answered")
+			assert_eq(table.concat(selects, ","), "R10,R9,R8", "waits only for what is left")
+			-- Readable with nothing to accept: rest out the wait, do not spin.
+			inform._guestportal = {serve_one = function() return false end}
+			selects, t = {}, 0
+			ok, err = pcall(inform._idle, sock, 10)
+			inform._guestportal = real
+			inform._guest_server, inform._guest_ctx = nil, nil
+			if not ok then error(err, 0) end
+			assert_eq(table.concat(selects, ","), "R10,-9", "one try, then a plain sleep")
+		end
+	},
+	{
+		name = "inform packet: forgetting the controller tears the guest portal down",
+		fn = function()
+			local real = inform._guestportal
+			local torn, closed = false, false
+			inform._guestportal = {reconcile = function(spec) torn = (spec == nil) end}
+			inform._guest_server = {close = function() closed = true end}
+			inform._guest_built = "x"
+			local ok, err = pcall(inform._forget_controller)
+			inform._guestportal = real
+			local left = inform._guest_server
+			inform._guest_server, inform._guest_built = nil, nil
+			if not ok then error(err, 0) end
+			assert_true(torn, "tables deleted")
+			assert_true(closed and left == nil, "listener closed")
 		end
 	},
 }

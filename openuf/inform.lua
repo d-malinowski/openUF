@@ -65,6 +65,7 @@ local sysconf   = _require_sibling("sysconf")
 local l2guard   = _require_sibling("l2guard")
 local airtime   = _require_sibling("airtime")
 local assoctrack = _require_sibling("assoctrack")
+local guestportal = _require_sibling("guestportal")
 
 local M = {}
 
@@ -89,6 +90,7 @@ M._airtime    = airtime
 M._sysconf    = sysconf
 M._l2guard    = l2guard
 M._assoctrack = assoctrack
+M._guestportal = guestportal
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -2012,6 +2014,11 @@ function M.build_json(st, cfg, ufhw)
 			and math.floor(sat_sum_all / sat_count_all + 0.5) or nil,
 		spectrum_scanning       = false,
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
+		-- Guest portal: the controller refuses to authorize a guest on an AP
+		-- that reported no guest_token ("Missing Guest Token in AP[..]
+		-- during guest authorization"). Only while the portal is on.
+		guest_token      = (type(st.guest_portal) == "table" and st.guest_portal.enabled)
+			and st.guest_token or nil,
 		-- Real devices report this under the hyphenated key "system-stats"
 		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
 		-- against a real captured USG inform payload (stephanlascar/
@@ -3063,9 +3070,9 @@ local RECOGNIZED_SYSTEM_CFG = {
 	-- is not read and stays in the report.
 	"^ebtables%.status$",
 	"^ebtables%.%d+%.cmd$",
-	-- Guest portal on/off (M._guest_wlans). The rest of redirector.* is the
-	-- portal's address, which nothing enforces yet.
+	-- Guest portal on/off (M._guest_wlans) and where it is (guestportal.lua).
 	"^redirector%.status$",
+	"^redirector%.url$",
 }
 
 local RECOGNIZED_MGMT_CFG = {
@@ -3550,6 +3557,15 @@ function M.handle_response(json_str, st, cfg)
 					io.stderr:write("inform: l2guard: " .. tostring(err_l2) .. "\n")
 				end
 			end
+			-- The guest portal's own ebtables rules (guestportal.lua), after
+			-- the WiFi pass for the same reason; _guest_resync covers a
+			-- guest VAP whose netdev is not up yet.
+			if M._guestportal then
+				local ok_gp, err_gp = pcall(M._guest_apply_push, sys_raw, st)
+				if not ok_gp then
+					io.stderr:write("inform: guestportal: " .. tostring(err_gp) .. "\n")
+				end
+			end
 		end
 
 		-- blocked_sta: the site's whole block list, newline-separated, on
@@ -3676,11 +3692,14 @@ function M.handle_response(json_str, st, cfg)
 			end
 		elseif cmd == "authorize-guest" or cmd == "unauthorize-guest" then
 			-- Guest portal: {"cmd":"(un)authorize-guest","mac":...}
-			-- (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)"). Only
-			-- the ledger build_json reports `authorized` from; nothing on
-			-- the device blocks an unauthorized guest yet.
+			-- (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)"). The
+			-- ledger build_json reports `authorized` from, and the nft set
+			-- that lets the guest past the portal.
 			M._guest_authorize(st, resp.mac, cmd == "authorize-guest")
 			M._state.save(st)
+			if M._guest_built then
+				pcall(M._guestportal.set_authorized, M._guest_macs(st))
+			end
 		elseif cmd == "scan" or cmd == "scan_band" then
 			M._handle_scan_cmd(resp, cfg)
 		elseif cmd == "spectrum-scan" then
@@ -3840,6 +3859,172 @@ function M._guest_sta_authorized(st, vap, mac)
 	local wlans = st and st.guest_wlans
 	if not (wlans and vap and vap.id and wlans[vap.id]) then return true end
 	return (st.guest_authorized or {})[mac] ~= nil
+end
+
+-- ─── Guest portal enforcement (guestportal.lua) ─────────────────────────────
+
+-- The ledger as a sorted list, for the nft set.
+function M._guest_macs(st)
+	local out = {}
+	for mac in pairs(st.guest_authorized or {}) do out[#out + 1] = mac end
+	table.sort(out)
+	return out
+end
+
+-- The portal WLANs' live netdevs, each with its SSID and bridge MAC.
+function M._guest_vaps(st)
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.wlanconf_ifnames) then return {} end
+	local ok, vaps = pcall(ufuci.wlanconf_ifnames, st.guest_wlans)
+	if not ok or type(vaps) ~= "table" then return {} end
+	for _, v in ipairs(vaps) do v.bridge_mac = M._guestportal.bridge_mac(v.ifname) end
+	return vaps
+end
+
+local function guest_vaps_key(vaps)
+	local parts = {}
+	for _, v in ipairs(vaps) do parts[#parts + 1] = v.ifname .. "=" .. tostring(v.bridge_mac) end
+	return table.concat(parts, " ")
+end
+
+-- While the portal is on: the listening socket (served from M._idle), what
+-- the answer needs, and the VAP list the tables were built for.
+M._guest_server = nil
+M._guest_ctx    = nil
+M._guest_built  = nil
+
+-- Make the kernel and the listener match st.guest_portal.
+function M._guest_enforce(st, vaps)
+	local gp = M._guestportal
+	local spec = st.guest_portal
+	if not (type(spec) == "table" and spec.enabled) then
+		gp.reconcile(nil)
+		M._guest_built, M._guest_ctx = nil, nil
+		if M._guest_server then M._guest_server:close() end
+		M._guest_server = nil
+		return 0
+	end
+	-- The portal's guest_token (build_json). Its value would key the
+	-- controller's encrypted-cookie redirect, which openUF does not claim;
+	-- the plain id=/ap= redirect only needs one to exist.
+	if type(st.guest_token) ~= "string" then
+		local bytes = M._crypto.random_iv(16)
+		st.guest_token = (bytes:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+		M._state.save(st)
+	end
+	vaps = vaps or M._guest_vaps(st)
+	local n = gp.reconcile(spec, vaps, M._guest_macs(st))
+	M._guest_built = guest_vaps_key(vaps)
+	M._guest_ctx = {url = spec.url, ap = st.mac, vaps = vaps}
+	if not M._guest_server then
+		local ok, server, err = pcall(gp.listen, M._socket())
+		if ok and server then
+			M._guest_server = server
+		else
+			io.stderr:write("guestportal: cannot listen on port " .. gp.PORT .. ": "
+				.. tostring(ok and err or server) .. "\n")
+		end
+	end
+	return n
+end
+
+M._socket = function() return require("socket") end
+
+-- A push's portal facts -> st.guest_portal, and the kernel made to match.
+-- A push without redirector.status (a partial one) leaves it alone.
+function M._guest_apply_push(sys_raw, st)
+	local spec = M._guestportal.parse(sys_raw)
+	if not spec then return false end
+	for _, u in ipairs(spec.unknown) do
+		io.stderr:write("guestportal: unrecognised guest rule shape, not applied: "
+			.. ("%q"):format(u) .. "\n")
+	end
+	spec.unknown = nil
+	st.guest_portal = spec.enabled and spec or nil
+	M._guest_enforce(st)
+	return true
+end
+
+-- Once a minute while the portal is on: rebuild when the guest VAPs' netdevs
+-- changed (a push's `wifi reload` finishing, wireless coming up after the
+-- daemon). An empty list is "not answering yet" and changes nothing.
+M.GUEST_RESYNC_INTERVAL = 60
+M._guest_next = 0
+function M._guest_resync(st)
+	local spec = st and st.guest_portal
+	if not (M._guestportal and type(spec) == "table" and spec.enabled) then return false end
+	local now = M._time()
+	if now < M._guest_next then return false end
+	M._guest_next = now + M.GUEST_RESYNC_INTERVAL
+	local vaps = M._guest_vaps(st)
+	if #vaps == 0 or guest_vaps_key(vaps) == M._guest_built then return false end
+	io.stderr:write("guestportal: guest interfaces changed (" .. guest_vaps_key(vaps)
+		.. ") -- rebuilding\n")
+	M._guest_enforce(st, vaps)
+	return true
+end
+
+-- The guest's SSID for the portal's ssid=: the only one, or the VAP that
+-- has the station.
+M._station_on = function(ifname, mac)
+	local p = io.popen("iw dev " .. ifname .. " station get " .. mac .. " 2>/dev/null")
+	if not p then return false end
+	local out = p:read("*a") or ""
+	p:close()
+	return out:find("Station", 1, true) ~= nil
+end
+
+function M._guest_ssid_for(vaps, mac)
+	local first, single = nil, true
+	for _, v in ipairs(vaps or {}) do
+		if first == nil then first = v.ssid elseif v.ssid ~= first then single = false end
+	end
+	if single then return first end
+	for _, v in ipairs(vaps) do
+		if v.ifname:match("^[%w%-%._]+$") and M._station_on(v.ifname, mac) then return v.ssid end
+	end
+	return first
+end
+
+M._read_arp = function()
+	local f = io.open("/proc/net/arp", "r")
+	if not f then return "" end
+	local s = f:read("*a")
+	f:close()
+	return s or ""
+end
+
+-- Sleep for wait seconds; while the portal listens, answer guests meanwhile.
+function M._idle(socket, wait)
+	local server = M._guest_server
+	if not server then
+		socket.select(nil, nil, wait)
+		return
+	end
+	local deadline = socket.gettime() + wait
+	while true do
+		local left = deadline - socket.gettime()
+		if left <= 0 then return end
+		server = M._guest_server
+		if not server then
+			socket.select(nil, nil, left)
+			return
+		end
+		local r = socket.select({server}, nil, left)
+		if r and r[1] then
+			local ctx = M._guest_ctx or {}
+			local ok, served = pcall(M._guestportal.serve_one, server, {
+				url = ctx.url, ap = ctx.ap,
+				ssid_for = function(mac) return M._guest_ssid_for(ctx.vaps, mac) end,
+				arp = M._read_arp, now = M._time,
+			})
+			-- Readable but nothing to accept: do not spin on it.
+			if not (ok and served) then
+				socket.select(nil, nil, math.max(0, deadline - socket.gettime()))
+				return
+			end
+		end
+	end
 end
 
 -- Replace the block ledger with the controller's list (setparam blocked_sta)
@@ -4068,6 +4253,7 @@ end
 function M._forget_controller()
 	M._controller_interval = nil
 	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
+	if M._guestportal then pcall(M._guest_enforce, {}) end
 	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end
 	-- A controller that switched Airtime Fairness off no longer does.
 	if M._airtime then pcall(M._airtime.set_enabled, true) end
@@ -4388,8 +4574,11 @@ function M._l2guard_apply_push(sys_raw, st)
 	local eb = M._l2guard.parse(sys_raw)
 	if not eb then return false end
 	for _, u in ipairs(eb.unknown or {}) do
-		io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
-			.. ("%q"):format(u) .. "\n")
+		-- The guest portal's rules are guestportal.lua's to read.
+		if not (M._guestportal and M._guestportal.is_guest_rule(u)) then
+			io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
+				.. ("%q"):format(u) .. "\n")
+		end
 	end
 	local spec = M._l2guard.spec_from(eb)
 	local names = M._l2guard_live_ifnames()
@@ -4649,6 +4838,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- build_json so the fresh scan dump is what this inform reports.
 	pcall(M._maybe_service_scan_request, cfg)
 	pcall(M._l2guard_resync, st)
+	pcall(M._guest_resync, st)
 	pcall(M._hairpin_resync)
 	pcall(M._usteer_filter_resync)
 
@@ -4824,6 +5014,10 @@ function M.run(cfg, ufhw)
 			M._l2guard.reconcile(st.l2guard, names)
 		end)
 	end
+	-- The guest portal's tables, likewise (lab-validated only).
+	if M._guestportal and type(st.guest_portal) == "table" then
+		pcall(M._guest_enforce, st)
+	end
 
 	local socket = require("socket")
 	local ctx = {
@@ -4833,7 +5027,7 @@ function M.run(cfg, ufhw)
 	}
 	while true do
 		local wait = M._tick(st, cfg, ufhw, ctx)
-		if wait > 0 then socket.select(nil, nil, wait) end
+		if wait > 0 then M._idle(socket, wait) end
 	end
 end
 

@@ -31,7 +31,7 @@ the device has.
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
-| `kmod-nft-bridge` | The Multicast/Broadcast Blocker and the L2 hardening (`bridge openuf_l2guard`). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
+| `kmod-nft-bridge` | The Multicast/Broadcast Blocker, the L2 hardening (`bridge openuf_l2guard`) and the guest portal (`bridge openuf_guest`, lab-validated only). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, the controller's Client → Reconnect (`kick-sta`), client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
 | `kmod-sched-act-police` | The **upload** half of WiFi Speed Limit only. `police` is a tc *action*, a separate module from the ingress qdisc and absent from a stock filogic image. Without it the download cap applies and the upload cap does not — openUF logs which interface `tc` rejected and names this package rather than reporting the whole limit as applied |
@@ -443,7 +443,7 @@ announced on stderr rather than passed off as a fresh install.
 | `inform_url` | URL for the inform heartbeat (every 10 s, or the interval the controller's `noop` names). Seeded from `conf.lua` on a first boot (or after a factory reset) and overwritten by the controller or by `syswrapper.sh set-inform`; once present here it always wins over `conf.lua` |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts. Replaced by the controller's `blocked_sta` list on every config push, so it can't drift from the controller's list |
-| `guest_wlans`, `guest_authorized` | Guest portal bookkeeping (⚠️ lab-validated only). `guest_wlans` holds the wlanconf ids of the guest WLANs while the controller has the portal on, replaced on every config push. `guest_authorized` maps each MAC the controller sent `authorize-guest` for to the time it arrived, and `unauthorize-guest` removes it. On a portal WLAN, each station's `authorized` is reported from this map; everywhere else it is `true`. At most 512 entries; past that the oldest goes, and the controller re-authorizes it on the next heartbeat if its guest record is still active. Nothing blocks an unauthorized guest yet |
+| `guest_wlans`, `guest_authorized`, `guest_portal`, `guest_token` | Guest portal state (⚠️ lab-validated only). `guest_wlans`: the wlanconf ids of the guest WLANs while the controller has the portal on, replaced on every config push. `guest_authorized`: each MAC the controller sent `authorize-guest` for, with the time it arrived; `unauthorize-guest` removes it. This map is where each station's `authorized` on a portal WLAN comes from (`true` everywhere else), and it fills the `authorized` nft set. It holds at most 512 entries; past that the oldest goes, and the controller re-authorizes it on the next heartbeat if its guest record is still active. `guest_portal`: what the enforcement is built from (portal URL, the portal's address and ports, restricted subnets), present only while the portal is on. `guest_token`: generated once, then reported while the portal is on. See § Guest portal |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
 | `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf`. In static mode these are **re-applied on every start**, because the address is `ip addr` state that a reboot discards and the controller does not re-push it (a matching `cfgversion` gets a `noop` back, carrying no `system_cfg` at all) — the same reason `blocked_stas` and `led_enabled` are reconciled at startup |
 
@@ -1074,6 +1074,64 @@ Needs **`kmod-nft-bridge`**: `iifname`/`oifname` in the bridge family live in
 ```sh
 nft list table bridge openuf_l2guard
 ```
+
+### Guest portal (Hotspot): ⚠️ lab-validated only
+
+Never run against a real guest WLAN on hardware; treat it as a preview. It turns on by
+itself when the controller pushes a guest WLAN with the portal enabled
+(`redirector.status=enabled` plus the guest `ebtables.*` rules). It turns off, removing
+everything, when the portal or the guest WLAN goes away, or on a factory reset.
+
+**What runs.** `guestportal.lua` builds two nftables tables from the pushed rules.
+
+`bridge openuf_guest` hooks every live netdev of the guest WLANs. For an unauthorized guest:
+- **Allowed:** EAPOL, the portal's ports on the controller, broadcast DHCP, ARP and DNS.
+- **Dropped:** IPv6, other broadcast, multicast, and the restricted subnets
+  (`10/8`, `172.16/12`, `192.168/16` by default).
+- **Plain HTTP:** marked and handed to the bridge's own IP stack.
+- **Everything else:** dropped.
+
+A MAC in the `authorized` set (filled from `state.json`'s `guest_authorized`) may reach
+any host other than the AP, but the restricted subnets still apply.
+
+`ip openuf_guest` redirects the marked HTTP to port **8820**. The inform daemon answers
+there between heartbeats with a `302` to the controller's portal, adding:
+- `?id=<guest MAC>`, looked up in `/proc/net/arp`;
+- `&ap=<AP MAC>`;
+- `&t=<now>`: the controller refuses a `t` more than 60 s off its own clock, so the AP's clock must be right;
+- `&url=<what the guest asked for>`;
+- `&ssid=…`.
+
+Logging in on the portal makes the controller send `authorize-guest`. The guest is let
+through within one heartbeat.
+
+The daemon also reports a random `guest_token`. Without one, the controller refuses
+every portal login on the AP and logs "Missing Guest Token in AP[…] during guest
+authorization".
+
+**Where it differs from UniFi firmware, on purpose:**
+- **DNS passes for every guest.** UniFi firmware answers an unauthorized guest's DNS
+  itself; openUF runs no resolver.
+- **HTTPS is dropped, not answered.** The client's plain-HTTP connectivity check is what
+  finds the portal.
+- **The redirect needs an IPv4 address on the guest network's bridge.** The answer
+  leaves from there. A guest WLAN on a VLAN where the AP has no address keeps its
+  guests blocked, and they never see the portal.
+
+**Needs** `kmod-nft-bridge` (for `iifname`/`oifname`), and `kmod-nft-nat` for the
+redirect. firewall4 already pulls in `kmod-nft-nat`.
+
+**Check it:**
+
+    nft list table bridge openuf_guest
+    nft list table ip openuf_guest
+    netstat -lnt | grep 8820
+
+**Log lines and what they mean:**
+- `guestportal: … not bridged`: those guests are blocked but not redirected.
+- `nft rejected …`: a rule failed. The log says which one and why.
+- `guestportal: unrecognised guest rule shape`: the controller pushed a rule openUF
+  doesn't know. It was not applied.
 
 ### Hairpin on SSIDs with Proxy ARP or Multicast Enhancement
 

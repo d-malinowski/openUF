@@ -1000,6 +1000,36 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: wlanconf_ifnames lists the live netdevs of the named WLANs, enabled only",
+		fn = function()
+			with_ucihelper(function(db)
+				local mock = ucihelper._uci.cursor()
+				local function iface(name, dev, ssid, id, disabled)
+					mock:set("wireless", name, "wifi-iface")
+					mock:set("wireless", name, "device", dev)
+					mock:set("wireless", name, "ssid", ssid)
+					if id then mock:set("wireless", name, "openuf_wlanconf_id", id) end
+					if disabled then mock:set("wireless", name, "disabled", "1") end
+				end
+				iface("openuf_radio0_guest", "radio0", "Guest", "w1")
+				iface("openuf_radio1_guest", "radio1", "Guest", "w1")
+				iface("openuf_radio0_home", "radio0", "Home", "w2")
+				iface("openuf_radio0_off", "radio0", "Off", "w1", true)
+				iface("default_radio0", "radio0", "OpenWrt")
+				ucihelper.get_ifnames_for_vap = function(radio, ssid)
+					if ssid == "Guest" then return {radio == "radio0" and "phy0-ap1" or "phy1-ap1"} end
+					return {"phy0-ap0"}
+				end
+				local got = ucihelper.wlanconf_ifnames({w1 = true})
+				assert_eq(#got, 2, "both radios of the guest WLAN, not the disabled one or the others")
+				assert_eq(got[1].ifname .. "/" .. got[1].ssid, "phy0-ap1/Guest", "first")
+				assert_eq(got[2].ifname, "phy1-ap1", "second")
+				assert_eq(#ucihelper.wlanconf_ifnames({}), 0, "no ids: nothing")
+				assert_eq(#ucihelper.wlanconf_ifnames(nil), 0, "nil: nothing")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config records the blocker on the section and reconciles nft",
 		fn = function()
 			with_ucihelper(function(db)

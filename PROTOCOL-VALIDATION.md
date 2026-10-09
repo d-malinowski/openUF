@@ -618,7 +618,7 @@ meaning on an AP:
 
 | Relevant to an AP | Not for an AP / correctly ignored |
 |---|---|
-| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest` (handled; guest ledger only, lab-validated) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest` (handled: guest ledger + portal enforcement, lab-validated only) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
@@ -754,11 +754,10 @@ The ebtables ruleset, condensed. These are all `-t nat` rules; `ath<n>` stands f
   chain itself from `authorize-guest`. Whatever leaves GUESTIN unmatched hits its DROP policy.
 - GUESTOUT accepts DHCP replies and ARP, and drops IPv6, other broadcast and multicast.
 
-So the controller ships its whole enforcement as ebtables + iptables, and the device's own
+So the controller ships its whole enforcement as ebtables + iptables. The device's own
 parts are the `AUTHORIZED_GUESTS` membership and a local HTTP/DNS answerer for the
-redirect marks. openUF applies none of it today. `l2guard` accepts only the BGA rule shapes
-and logs `l2guard: unrecognised ebtables rule shape, not applied` 47 times per push. The guest
-VAP gets client isolation and nothing else.
+redirect marks. Until C2, openUF applied none of it. `l2guard` accepted only the BGA rule
+shapes and logged `l2guard: unrecognised ebtables rule shape, not applied` 47 times per push.
 
 **Station `authorized` is the portal state, and the controller reconciles it every inform.**
 `devmgr/dhdeXcHqLRBKMUZk` runs for each `vap_table[].sta_table[]` entry. When the VAP is a
@@ -790,7 +789,63 @@ on a portal WLAN and `true` elsewhere. Lab, same three mock stations:
   nothing after it.
 - After an inform restart, an authorized guest stayed `true` and no command was resent.
 
-Nothing enforces the portal yet (that is C2).
+**The redirect the portal expects** (CFR, 10.4.57, `devmgr/IXbVCbWPDmZdkfbJ`). The initial
+redirect handler reads the guest from the query string:
+- `id`: the guest's MAC;
+- `ap`: the AP's MAC;
+- `url`: where the guest was going;
+- `ssid`;
+- `t`: the AP's epoch seconds. A `t` more than 60 s from the controller's clock is refused.
+
+It stores them in its encrypted `ec` cookie for the login. An `ec` query parameter replaces all of these with an
+encrypted cookie made by the AP (keyed by the AP's `guest_token`), but only on devices
+with `supportRedirectorInitialEC`, which `redirector.initialec=enabled` would announce.
+openUF does not get that key and uses the plain form.
+
+**`guest_token` is required anyway.** Every login path (`"guest authorization"`), and the
+`ec` paths, first checks that the AP's device record has a non-empty `guest_token`. If it
+doesn't, the controller logs `Missing Guest Token in AP[<mac>] in Site[…] during guest
+authorization` and refuses. The portal still answers the browser `{"authorized":true}`, but
+no guest record is written and no `authorize-guest` follows. Lab: exactly that, until openUF
+reported one. The record's `guest_token` is copied from the device's stats inform
+(`devmgr/PGOcbDWlbnYQdFW:1040`, `copyAttrsIfPresent(…, "guest_kicks", "guest_token")`), so
+the device names it. Its format is unverified, because macOS case-folding hides the
+decrypting class in this decompile. openUF sends 32 random hex characters, persisted, while
+the portal is on. The controller keeps the last value after the portal goes off, which is harmless.
+
+**openUF's enforcement (C2, lab-validated only, 2026-10-10).** `guestportal.lua` reads the
+facts from the guest rules:
+- the `(ip, port)` ACCEPTs (8880, 8843 and 8881 to `<ctl>`);
+- the `-I … -j REDIRECT_HTTP` intercept (8882 to `<ctl>`);
+- the `--ip-dst … -j DROP` subnets;
+- `redirector.url`.
+
+Every known guest rule shape is classified. Any other guest-chain rule is logged as
+unrecognised, and l2guard no longer reports them. From these facts it builds its own nft
+chains in the controller's order. The marked HTTP gets `ether daddr` set to the bridge MAC
+plus `pkttype host` (ebtables `redirect`), and is NAT-redirected to port 8820. The inform
+loop answers there with the `302` above. Lab, 2026-10-10, with a fake guest in its own
+network namespace behind a test bridge (MAC `de:ad:be:ef:00:03`, which is also a mock station on
+the guest WLAN), and a fake gateway serving `203.0.113.10`:
+- Unauthorized: `GET http://203.0.113.10/` → `302` to
+  `…/guest/s/default/?id=de%3Aad%3Abe%3Aef%3A00%3A03&ap=…&t=…&url=http%3A%2F%2F203.0.113.10%2F&ssid=probe-wlan`;
+  HTTPS timed out.
+- The controller accepted that link (`200`), and `POST /guest/s/default/login` answered
+  `{"authorized":true,"redirect_url":"http://203.0.113.10/"}`. Before openUF reported a
+  `guest_token`, that same answer came back but the login was refused, as above.
+- The next inform brought `authorize-guest` for `…:03`. The MAC was in the nft set within the
+  heartbeat, and the same `GET` returned the gateway's page (`200`). A `GET` to the AP's own
+  address was still redirected, and `10.9.9.9` stayed unreachable.
+- REST `unauthorize-guest` → the `unauthorize-guest` cmd → the MAC left the set, and the guest
+  was redirected again.
+- `is_guest:false` on the WLAN → `redirector.status=disabled` → both tables were deleted, the
+  listener closed and the guest was free. `is_guest:true` rebuilt everything.
+
+Throughout: `handle_response failed` = 0, and no unrecognised rule lines.
+
+Deliberate gaps: unauthorized DNS is passed rather than answered locally, marked HTTPS is
+dropped rather than answered, and the `redirect` needs an IPv4 address on the guest
+VAP's bridge.
 
 | Wire (all `{"_type":"cmd", …, "mac":"…"}`) | Sent when |
 |---|---|

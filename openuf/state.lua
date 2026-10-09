@@ -118,6 +118,11 @@ M.FIELDS = {
 	-- one-shot cmds, so both have to outlive a restart.
 	guest_wlans               = "table",
 	guest_authorized          = "table",
+	-- The portal's enforcement facts (guestportal.parse) while it is on;
+	-- the nft tables are rebuilt from it at startup.
+	guest_portal              = "table",
+	-- Reported as guest_token while the portal is on (32 hex).
+	guest_token               = "string",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security
