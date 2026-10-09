@@ -618,7 +618,7 @@ meaning on an AP:
 
 | Relevant to an AP | Not for an AP / correctly ignored |
 |---|---|
-| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200) (handled) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200) (handled) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
@@ -715,6 +715,77 @@ Verified:
   AX3000T. `scan freq 2412 ap-force passive` was accepted on both. The next `scan dump` held
   8 and 12 BSSes, all seen less than 30 s earlier. 5 GHz was not swept here: the office
   5 GHz is DFS, and the nightly `11k-scan` already sweeps it through the same `_force_scan`.
+
+#### Guest portal (Hotspot): what the controller pushes and expects
+
+Captured in the 10.4.57 lab on 2026-10-09 (C0 discovery). Setup: `guest_access.portal_enabled`
+on with `auth: none`, then `PUT rest/wlanconf/<id> {"is_guest":true}` on the lab WLAN. The
+`system_cfg` diff across that toggle (310 → 390 lines) is the whole of what the device is
+told. `<ctl>` is the controller's IP, and `ath0`/`ath1` are the guest WLAN's two VAPs.
+
+| Key | Off → on | Meaning |
+|---|---|---|
+| `wireless.<n>.is_guest`, `aaa.<n>.is_guest` | `false` → `true` | the VAP is a guest VAP |
+| `wireless.<n>.usage` | `user` → `guest` | same, the field the stats side keys on |
+| `wireless.<n>.l2_isolation` | `disabled` → `enabled` | forced client isolation (already mapped to `isolate`) |
+| `redirector.status`, `redirector.https.status` | `disabled` → `enabled` | the AP runs the redirect target |
+| `redirector.url`, `redirector.url_https` | (new) `http://<ctl>:8880/guest/s/default/` | where an unauthorized guest is sent |
+| `redirector.redirect_pattern` | (new) `http://<ctl>:8882` | |
+| `dnsmasq.status`, `dnsmasq.1.devname=br0`, `dnsmasq.1.status` | `disabled` → `enabled` | a local DNS answerer for unauthorized guests |
+| `iptables.status` + `iptables.1..3.cmd` | `disabled` → 3 rules | `-t nat -A PREROUTING -p tcp -m mark --mark 0x40000000/0xc0000000 -j REDIRECT --to-ports 80` (0x80000000 → 443; udp 53 → 53) |
+| `ebtables.5..51.cmd` | (new) 47 rules | the enforcement itself, below |
+| `ebtables.52..53.cmd` | (new) | `-t broute -A BROUTING -i ath<n> -p 802_1Q -j DROP` |
+| `qos.status` + `qos.ebt.*`, `qos.if.*`, `qos.vap.*`, `qos.mode=1` | `disabled` → enabled | per-VAP marks (`0x1000`, `0x2000`) and interface speeds: the shaping frame `rate-update` plugs into |
+
+The ebtables ruleset, condensed. These are all `-t nat` rules; `ath<n>` stands for each guest VAP:
+- `-N GUESTIN -P DROP`, `-N GUESTOUT -P ACCEPT`; `PREROUTING --in-interface ath<n> -j GUESTIN`,
+  `POSTROUTING --out-interface ath<n> -j GUESTOUT`.
+- GUESTIN accepts EAPOL (`--proto 0x888e`), DHCP requests (broadcast, udp 68→67) and ARP.
+  It also accepts tcp 8880/8843 to `<ctl>` (the portal) and tcp 8881 to `<ctl>`. Its first
+  rule (`-I`) sends tcp 8882 to `<ctl>` to `REDIRECT_HTTP`.
+- DNS (udp/tcp 53) goes to `GUEST_DNS` (`-P DROP`). That chain jumps to `AUTHORIZED_GUESTS`,
+  then to `REDIRECT_DNS` (mark `0x40000000`, `-j redirect`).
+- GUESTIN drops IPv6 (`0x86dd`), other broadcast, multicast `224.0.0.0/4`, and the three
+  `restricted_subnet_*` from `guest_access` (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`).
+- tcp 443 goes to `CAPTIVE_PORTAL` (`-P RETURN`, empty).
+- `-N AUTHORIZED_GUESTS -P RETURN` is **pushed empty**. `GUESTIN -p 0x800 --pkttype-type
+  otherhost -j AUTHORIZED_GUESTS` comes before `tcp 80 -j REDIRECT_HTTP` / `tcp 443 -j
+  REDIRECT_HTTPS` (marks `0x40000000`/`0x80000000`, `-j redirect`). The device fills the
+  chain itself from `authorize-guest`. Whatever leaves GUESTIN unmatched hits its DROP policy.
+- GUESTOUT accepts DHCP replies and ARP, and drops IPv6, other broadcast and multicast.
+
+So the controller ships its whole enforcement as ebtables + iptables, and the device's own
+parts are the `AUTHORIZED_GUESTS` membership and a local HTTP/DNS answerer for the
+redirect marks. openUF applies none of it today. `l2guard` accepts only the BGA rule shapes
+and logs `l2guard: unrecognised ebtables rule shape, not applied` 47 times per push. The guest
+VAP gets client isolation and nothing else.
+
+**Station `authorized` is the portal state, and the controller reconciles it every inform.**
+`devmgr/dhdeXcHqLRBKMUZk` runs for each `vap_table[].sta_table[]` entry. When the VAP is a
+guest VAP and `guest_access.portal_enabled` is on:
+- no active guest record, and the station reports `authorized` true → `unauthorize-guest` +
+  `guest_kicks++` (`devmgr/l/MiVjHefaf:1448`);
+- an active guest record, and the station reports `authorized` not true → `authorize-guest`;
+- a guest record over its usage quota → `unauthorize-guest` and the record is ended;
+- otherwise nothing.
+
+`is("authorized", true)` defaults a **missing** key to true. openUF sends no `authorized`,
+so every guest-VAP station counts as authorized. Lab: with three mock stations on the guest
+WLAN, `unauthorize-guest` was queued for each of them on **every inform**, and `guest_kicks`
+reached 77 in about 10 minutes. On a guest WLAN, openUF's station entries must report
+`authorized` as the portal state.
+
+| Wire (all `{"_type":"cmd", …, "mac":"…"}`) | Sent when |
+|---|---|
+| `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above. A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
+| `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above |
+| `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per authorization (`qos_policy_applied` latch), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's user group rate is sent instead (same sender) |
+
+`mgmt_cfg` carries `selfrun_guest_mode=pass` in **every** push, guest WLAN or not. Its
+source is the site property `config.selfrun_guest_mode`, and any value other than `pass`
+goes out as `off` (`config/GWoWvNEX`). It is not in the 10.4.57 UI. The name suggests how
+guests are treated while the AP runs without its controller, with `pass` letting them
+through. That is unverified: the device side is UniFi firmware, which this project doesn't read.
 
 ### Connection tracking notifs (`STA_ASSOC_TRACKER`)
 
