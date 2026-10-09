@@ -283,8 +283,11 @@ return {
 			with_exec(function(cmds)
 				rrmscan.collector_stop()
 				local all = table.concat(cmds, "\n")
-				assert_true(all:find("pkill -f 'ubus subscribe hostapd'", 1, true) ~= nil,
+				assert_true(all:find("kill $(pgrep -f '[u]bus subscribe hostapd')", 1, true) ~= nil,
 					"kills the subscriber by the pattern collector_ensure spawns")
+				-- busybox on the Archer C5 (OpenWrt 25.12) has no pkill
+				-- applet: a pkill here is a no-op on real hardware.
+				assert_false(all:find("pkill", 1, true) ~= nil, "does not rely on pkill")
 				assert_true(all:find("rm -f " .. rrmscan.EVENT_FILE, 1, true) ~= nil,
 					"removes the notification file it was appending to")
 			end)

@@ -190,8 +190,16 @@ function M.collector_ensure()
 	return true
 end
 
+-- Not `pkill`: the Archer C5's busybox (OpenWrt 25.12) has no pkill applet,
+-- so the kill silently did nothing and an orphaned collector kept appending
+-- to the event file forever. pgrep is there. The pattern's first letter is
+-- bracketed because this is a compound command: sh does not exec it
+-- directly, so the shell's own command line -- which contains the pattern --
+-- is a live process pgrep would otherwise match and kill mid-command.
+-- "[u]bus" still matches "ubus" and no longer matches itself.
 function M.collector_stop()
-	M._exec("pkill -f '" .. SUBSCRIBE_MATCH .. "' 2>/dev/null")
+	M._exec("kill $(pgrep -f '[" .. SUBSCRIBE_MATCH:sub(1, 1) .. "]"
+		.. SUBSCRIBE_MATCH:sub(2) .. "') 2>/dev/null")
 	M._exec("rm -f " .. M.EVENT_FILE .. " 2>/dev/null")
 end
 

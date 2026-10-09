@@ -895,7 +895,8 @@ Reports are collected by a detached `ubus subscribe hostapd.*` child that parks 
 child is reparented to init it outlives the daemon, so openUF kills it explicitly — on
 service stop, on uninstall, and when `rrm_enrichment` is turned off. If you ever find it
 running with openUF stopped (`pgrep -f 'ubus subscribe hostapd'`), nothing is draining the
-file and it will grow: `pkill -f 'ubus subscribe hostapd'` and delete it.
+file and it will grow: `kill $(pgrep -f '[u]bus subscribe hostapd')` and delete it (busybox
+on OpenWrt 25.12 has no `pkill`).
 
 Only clients advertising **active or passive** beacon measurement are ever asked. Clients
 advertising *beacon-table* only are skipped on purpose: the one real example acknowledged
