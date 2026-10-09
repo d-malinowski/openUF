@@ -927,7 +927,12 @@ the reports (hostapd delivers them as ubus *notifications*, so `ubus listen` sho
 — only `ubus subscribe` works), `logread | grep BEACON-REQ-TX-STATUS` shows requests going
 out, and `/tmp/openuf-rrm.jsonl` is the spool, drained on every inform.
 
-Use the controller's RF scan (`spectrum-scan`) when you want a real full sweep.
+Use the controller's RF scan (`spectrum-scan`) when you want a real full sweep. The
+controller's `scan` command (REST `cmd/devmgr {"cmd":"scan","mac":…}`, optionally with
+`radio_name` or `freq`) and Radio AI's full scan (`scan_band`) also sweep for real: openUF
+runs `iw dev <if> scan ap-force` on the requested radio or band before the next inform.
+Each request is logged, e.g. `inform: scan_band: scanned 1 of 1 radio(s)`, and an iw
+refusal is logged as `iw refused to scan <if>`.
 
 ### WiFi Connectivity (connection stages)
 

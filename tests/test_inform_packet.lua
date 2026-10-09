@@ -2794,6 +2794,59 @@ return {
 		end
 	},
 	{
+		name = "inform packet: scan and scan_band sweep the requested radios and re-inform",
+		fn = function()
+			-- Two radios (2.4 + 5 GHz), each sweep recorded. The controller
+			-- reads the result from the next inform's scan_radio_table, so the
+			-- sweep has to happen here, before the immediate re-inform.
+			local orig_uci, orig_stderr = inform._ucihelper, io.stderr
+			io.stderr = {write = function() end}
+			local popens
+			inform._ucihelper = {
+				get_radio_table = function()
+					return {{name = "radio0", radio = "na"}, {name = "radio1", radio = "ng"}}
+				end,
+				get_ifname_for_radio = function(r) return r == "radio0" and "phy0-ap0" or "phy1-ap0" end,
+				_popen = function(cmd) popens[#popens + 1] = cmd; return "scan-ok\n" end,
+			}
+			local function run(body)
+				popens = {}
+				local r = inform.handle_response(body, sample_state(), {})
+				return r, popens
+			end
+			local ok, err = pcall(function()
+				-- What the Scan button sends: no radio, no freq -> every radio.
+				local r, p = run('{"_type":"cmd","cmd":"scan","type":"active","mode":"sync"}')
+				assert_true(r, "re-inform immediately after a scan")
+				assert_eq(#p, 2, "scan with no radio_name sweeps every radio")
+				assert_contains(p[1], "iw dev phy0-ap0 scan ap-force >", "active, forced, full sweep")
+				assert_contains(p[2], "iw dev phy1-ap0 scan ap-force >", "and the other radio")
+
+				_, p = run('{"_type":"cmd","cmd":"scan","radio_name":"radio1"}')
+				assert_eq(#p, 1, "radio_name narrows to that radio")
+				assert_contains(p[1], "iw dev phy1-ap0 ", "the named radio")
+
+				_, p = run('{"_type":"cmd","cmd":"scan","type":"passive","freq":"5180"}')
+				assert_eq(#p, 1, "a freq without a radio picks the radio on that band")
+				assert_contains(p[1], "iw dev phy0-ap0 scan freq 5180 ap-force passive >",
+					"freq before the flags, passive last")
+
+				_, p = run('{"_type":"cmd","cmd":"scan","radio_name":"radio9"}')
+				assert_eq(#p, 0, "an unknown radio_name sweeps nothing")
+
+				r, p = run('{"_type":"cmd","cmd":"scan_band","band":"ng"}')
+				assert_true(r, "re-inform immediately after scan_band")
+				assert_eq(#p, 1, "scan_band sweeps only that band's radio")
+				assert_contains(p[1], "iw dev phy1-ap0 scan ap-force >", "the 2.4 GHz radio")
+
+				_, p = run('{"_type":"cmd","cmd":"scan_band","band":"6e"}')
+				assert_eq(#p, 0, "a band this AP has no radio for sweeps nothing")
+			end)
+			inform._ucihelper, io.stderr = orig_uci, orig_stderr
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform packet: handle_response cmd kick-sta without a mac is a safe no-op",
 		fn = function()
 			local st = sample_state()

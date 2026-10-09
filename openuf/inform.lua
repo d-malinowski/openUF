@@ -3660,6 +3660,8 @@ function M.handle_response(json_str, st, cfg)
 			if type(resp.mac) == "string" then
 				M._firewall.deauth(resp.mac, M._bss_ifnames())
 			end
+		elseif cmd == "scan" or cmd == "scan_band" then
+			M._handle_scan_cmd(resp, cfg)
 		elseif cmd == "spectrum-scan" then
 			-- Trigger a scan per radio (sweeps every channel), then read back
 			-- per-channel survey data and build a spectrum_table entry per
@@ -4404,9 +4406,17 @@ M.SCAN_REQUEST_MAX_AGE = 600
 -- indistinguishable from a successful one. The scan output itself is
 -- discarded (callers read the kernel's caches: `scan dump`, `survey dump`).
 -- Returns true when the sweep ran; logs and returns false when iw refused.
-function M._force_scan(ufuci, ifname, who)
+-- opts (optional): freqs = {MHz...} narrows the sweep, passive = true listens
+-- only. iw's grammar puts freq before the flags and passive last.
+function M._force_scan(ufuci, ifname, who, opts)
+	local args = ""
+	if opts and opts.freqs and #opts.freqs > 0 then
+		args = " freq " .. table.concat(opts.freqs, " ")
+	end
+	args = args .. " ap-force"
+	if opts and opts.passive then args = args .. " passive" end
 	local out = ufuci._popen("iw dev " .. ifname
-		.. " scan ap-force >/dev/null 2>&1 && echo scan-ok")
+		.. " scan" .. args .. " >/dev/null 2>&1 && echo scan-ok")
 	if out:find("scan-ok", 1, true) then return true end
 	io.stderr:write("inform: " .. who .. ": iw refused to scan " .. ifname .. "\n")
 	return false
@@ -4417,17 +4427,67 @@ end
 -- build_json runs next and its `scan dump` then carries the fresh results.
 -- Returns how many sweeps actually ran, not how many were asked for.
 function M._scan_all_radios(cfg)
+	return M._scan_radios(cfg, "11k-scan")
+end
+
+-- The same, limited to the radios pick(radio) accepts (all when nil), with
+-- _force_scan's opts. Returns sweeps run, then radios picked.
+function M._scan_radios(cfg, who, pick, opts)
 	local ufuci = M._ucihelper
-	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
+	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0, 0 end
 	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
-	if not ok_r or type(radios) ~= "table" then return 0 end
-	local issued = 0
+	if not ok_r or type(radios) ~= "table" then return 0, 0 end
+	local issued, picked = 0, 0
 	for _, radio in ipairs(radios) do
-		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-		if ok_if and ifname and M._force_scan(ufuci, ifname, "11k-scan") then
-			issued = issued + 1
+		if not pick or pick(radio) then
+			picked = picked + 1
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+			if ok_if and ifname and M._force_scan(ufuci, ifname, who, opts) then
+				issued = issued + 1
+			end
 		end
 	end
+	return issued, picked
+end
+
+-- UniFi band of a frequency in MHz, as radio_table's `radio` names it (the
+-- controller's own band table: 6 GHz starts at 5925).
+local function band_of_freq(mhz)
+	if mhz < 3000 then return "ng" end
+	if mhz < 5925 then return "na" end
+	return "6e"
+end
+
+-- The controller's scan requests (PROTOCOL-VALIDATION.md, "scan and
+-- scan_band"): `scan` from the device's own Scan button,
+-- {type "active"|"passive", mode "sync", freq?, radio_name?}; `scan_band`
+-- {band} from Radio AI's full-scan pass, once per band. Both only set the
+-- device's `scanning` flag; the next stats inform clears it and stamps
+-- last_scan, and the controller reads the neighbours out of that inform's
+-- scan_radio_table. So: sweep now, blocking, and let the immediate re-inform
+-- after a cmd carry the fresh `scan dump`. Returns sweeps run.
+function M._handle_scan_cmd(resp, cfg)
+	local cmd, pick, opts = resp.cmd, nil, nil
+	if cmd == "scan_band" then
+		local band = resp.band
+		pick = function(r) return r.radio == band end
+	else
+		local freqs = {}
+		for f in tostring(resp.freq or ""):gmatch("%d+") do
+			freqs[#freqs + 1] = f
+		end
+		local rn = resp.radio_name
+		local fband = freqs[1] and band_of_freq(tonumber(freqs[1]))
+		if type(rn) == "string" and rn ~= "" then
+			pick = function(r) return r.name == rn end
+		elseif fband then
+			-- A frequency without a radio: only the radio that can tune it.
+			pick = function(r) return r.radio == fband end
+		end
+		opts = {freqs = freqs, passive = (resp.type == "passive")}
+	end
+	local issued, picked = M._scan_radios(cfg, cmd, pick, opts)
+	io.stderr:write(("inform: %s: scanned %d of %d radio(s)\n"):format(cmd, issued, picked))
 	return issued
 end
 

@@ -598,7 +598,9 @@ Confirmed `cmd` strings:
 | `block-sta` | Block client | `{"cmd":"block-sta","mac":"…"}` |
 | `unblock-sta` | Unblock client | `{"cmd":"unblock-sta","mac":"…"}` |
 | `kick-sta` | Client → Reconnect | `{"cmd":"kick-sta","mac":"…"}`. Queued only to the AP in the client's `ap_mac`, with no capability gate (`devmgr/KlNisgrKpTMarFmxEJt`). One-shot deauth on every BSS. Lab: REST `cmd/stamgr` → `inform: cmd: kick-sta` on the next heartbeat |
-| `spectrum-scan` | — | Handler implemented; no UI affordance found in 10.4.57 to fire it. |
+| `scan` | REST `cmd/devmgr` only (no UI action in 10.4.57) | `{"cmd":"scan","type":"active","mode":"sync"}`, plus `freq` and `radio_name` when given. See [`scan` and `scan_band`](#scan-and-scan_band-a-neighbour-sweep-on-request) |
+| `scan_band` | Radio AI full scan | `{"cmd":"scan_band","band":"na"}`, one per band. Same section |
+| `spectrum-scan` | Airtime Scan (frontend `SPECTRUM_SCAN`) | Handler implemented. The 10.4.57 frontend has the action, but its display gate is not traced, and the controller has never sent it to openUF. |
 
 The block-sta deauth and kick-sta both go to **every BSS** (`ucihelper.ap_ifnames`, VLAN
 netdevs folded into their BSS). Until 2026-10 the block deauth went to
@@ -608,11 +610,15 @@ radio1 carries `phy1-ap0` and `phy1-ap1`, so a client on the second SSID was nev
 #### Every `cmd` the controller can queue to a device (10.4.57 audit, 2026-10-09)
 
 I found these by decompiling every `com.ubnt.service` class that references `"cmd"` and
-collecting each `"cmd", "<name>"` literal. Most have no meaning on an AP:
+collecting each `"cmd", "<name>"` literal. That misses a name held in a constant:
+`quick-scan` was found later in the frontend's command enum, and the REST handlers
+restricted to UAP were then listed to close the gap (the rest are `set/unset-vwire-uplink`,
+`set/unset-priority-uplink` for wireless uplink, and `lte-*` for U-LTE). Most have no
+meaning on an AP:
 
 | Relevant to an AP | Not for an AP / correctly ignored |
 |---|---|
-| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta` (handled) · `spectrum-scan` (+`spectrum-cfg`) · `scan` (`type`, `mode`, `freq`, `radio_name`) · `scan_band` (`band`; only for devices without `wifi_caps2` 0x200) · guest portal: `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200) (handled) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
@@ -669,6 +675,46 @@ object, so `{}` plus one append saved as `{"1":mac}`. That reloads with a string
 `ipairs` never sees, so after a restart nft came up empty and 00:04's block was lost.
 `state.load` now rebuilds the list as a plain array. The APs' `lua-cjson-2.1.0-r5` round-trips
 correctly; checked on the Archer.
+
+#### `scan` and `scan_band`: a neighbour sweep on request
+
+Both were decompiled from 10.4.57 and fired in the lab on 2026-10-09.
+
+| `cmd` | Sender | Wire (captured in the lab) |
+|---|---|---|
+| `scan` | REST `cmd/devmgr {cmd:"scan", mac}` (`devmgr/b/g/AcrQJeJCScLn`, UAP/UDM, site admin). The 10.4.57 frontend never sends it: its only `"scan"` is the `discovered_via` enum | `{"cmd":"scan","type":"active","mode":"sync"}`. `type` and `mode` default to `active` and `sync`; `freq` and `radio_name` are passed through only when the request carries them |
+| `scan_band` | Radio AI, method `FULL_SCAN` (the default), once per band in the request (`system/aMFTAPaY`) | `{"cmd":"scan_band","band":"na"}` |
+
+- **What the controller expects back.** Both senders only set the device's `scanning = true`.
+  The next stats inform clears it and stamps `last_scan` (`devmgr/PGOcbDWlbnYQdFW:1033`).
+  Neither looks at anything else the device sends. The neighbours are read from
+  `scan_radio_table`, the same field the passive Environment view uses.
+- **`scan_band` gates.** It goes only to devices without `wifi_caps2` 0x200
+  (`supportNeighbourInScan`) that have a radio on that band. Radio AI waits 5 s per device and
+  then 60 s before it reads the results. While another site scan is running it skips the
+  sweep.
+- **Lab trigger for `scan_band`.** `POST /v2/api/site/default/radio-ai/optimize/preview` with
+  `{"radios":["na"],"method":"FULL_SCAN","calculation_id":"<uuid>","include_devices":["<ap mac>"]}`.
+  `calculation_id` must be a UUID: anything else returns `api.err.InvalidValue`.
+
+How openUF answers (`inform.lua` `_handle_scan_cmd`). It runs a blocking `iw dev <if> scan
+ap-force` on the requested radios, so the immediate re-inform after a `cmd` carries the
+fresh `scan dump`:
+- `scan_band` sweeps the radios whose `radio` equals `band`.
+- `scan` sweeps the radio named by `radio_name`, or else the radio on the band of `freq`, or
+  else every radio. `freq` becomes `iw … scan freq <MHz> ap-force`, and `type: "passive"`
+  appends `passive` (iw's grammar puts the frequencies before the flags and `passive` last).
+
+Verified:
+- **Lab, 2026-10-09.** `scan` → `inform: scan: scanned 2 of 2 radio(s)`, and the controller
+  went from `scanning: true` to `false` with `last_scan` stamped. The Radio AI preview for
+  `na` → `scan_band` `band: "na"` → `scanned 2 of 2` (both lab radios are `na`), then
+  `scanning: false` with a new `last_scan`. 0 `handle_response failed`.
+- **Hardware, 2026-10-09, both boards (2.4 GHz only).** The handler ran on the device:
+  `scan_band ng` picked radio1 (`phy1-ap0`) on the Archer C5 and radio0 (`phy0-ap0`) on the
+  AX3000T. `scan freq 2412 ap-force passive` was accepted on both. The next `scan dump` held
+  8 and 12 BSSes, all seen less than 30 s earlier. 5 GHz was not swept here: the office
+  5 GHz is DFS, and the nightly `11k-scan` already sweeps it through the same `_force_scan`.
 
 ### Connection tracking notifs (`STA_ASSOC_TRACKER`)
 
@@ -2773,6 +2819,8 @@ through the real UI with the resulting wire payload captured or the effect verif
   live capture from real hardware.
 - **`bootrom_version`** has no counterpart in the device schema. Probably ignored.
 - **The `spectrum-scan` cmd handler** has never received a real controller-issued command.
+  The frontend's Airtime Scan action sends it (`SPECTRUM_SCAN`, found 2026-10-09), but the
+  gate that decides whether that action is shown for openUF is not traced yet.
 - ~~**openUF's `usteer` config option names**~~ — ✅ resolved 2026-09-10, verified against the
   installed package; the option names and the named `local` section are both correct.
   The option openUF toggled was inert, though. See the corrected `USTEER_DEFAULTS` row: the
