@@ -112,6 +112,12 @@ M.FIELDS = {
 	l2guard                   = "table",
 	-- Airtime Fairness (atf.mode): a debugfs flag, back on after a reboot.
 	atf_enabled               = "boolean",
+	-- Guest portal: the WLANs that need it ({wlanconf_id = true}, from the
+	-- last system_cfg) and the guests the controller authorized
+	-- ({mac = epoch s}, from authorize-guest). Only carried by pushes and
+	-- one-shot cmds, so both have to outlive a restart.
+	guest_wlans               = "table",
+	guest_authorized          = "table",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security

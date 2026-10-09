@@ -2876,6 +2876,70 @@ return {
 		end
 	},
 	{
+		name = "inform packet: authorize-guest / unauthorize-guest drive the guest ledger",
+		fn = function()
+			local st = sample_state()
+			local saved = 0
+			local save = inform._state.save
+			inform._state.save = function() saved = saved + 1 end
+			local ok, err = pcall(function()
+				local r = inform.handle_response(
+					'{"_type":"cmd","cmd":"authorize-guest","mac":"AA:BB:CC:DD:EE:01"}', st)
+				assert_true(r, "re-inform so the controller sees authorized at once")
+				assert_not_nil(st.guest_authorized["aa:bb:cc:dd:ee:01"], "recorded, lowercased")
+				assert_eq(saved, 1, "persisted")
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"x;reboot"}', st)
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest"}', st)
+				local n = 0
+				for _ in pairs(st.guest_authorized) do n = n + 1 end
+				assert_eq(n, 1, "a malformed or missing mac records nothing")
+				inform.handle_response(
+					'{"_type":"cmd","cmd":"unauthorize-guest","mac":"aa:bb:cc:dd:ee:01"}', st)
+				assert_eq(next(st.guest_authorized), nil, "unauthorize-guest drops it")
+			end)
+			inform._state.save = save
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: the guest ledger is capped, oldest authorization first",
+		fn = function()
+			local st = sample_state({guest_authorized = {}})
+			local max = inform.GUEST_LEDGER_MAX
+			for i = 1, max do
+				st.guest_authorized[("02:00:00:00:%02x:%02x"):format(math.floor(i / 256), i % 256)] = 1000 + i
+			end
+			inform._guest_authorize(st, "aa:bb:cc:dd:ee:01", true)
+			local n = 0
+			for _ in pairs(st.guest_authorized) do n = n + 1 end
+			assert_eq(n, max, "held at the cap")
+			assert_eq(st.guest_authorized["02:00:00:00:00:01"], nil, "the oldest went")
+			assert_not_nil(st.guest_authorized["aa:bb:cc:dd:ee:01"], "the new one stays")
+		end
+	},
+	{
+		name = "inform packet: system_cfg records the portal WLANs; portal off clears them",
+		fn = function()
+			-- Shape from the 10.4.57 lab capture (PROTOCOL-VALIDATION.md,
+			-- "Guest portal"): wireless.<n>.is_guest per WLAN, one
+			-- redirector.status for the site, "disabled" when off.
+			local function push(st, portal)
+				local sys = "aaa.1.id=w1\nwireless.1.ssid=g\nwireless.1.parent=wifi0\n"
+					.. "wireless.1.is_guest=true\naaa.2.id=w2\nwireless.2.ssid=h\n"
+					.. "wireless.2.parent=wifi0\nwireless.2.is_guest=false\n"
+					.. "redirector.status=" .. portal .. "\n"
+				inform.handle_response('{"_type":"setparam","system_cfg":"' .. sys .. '"}',
+					st, {net = {lan_cpueth = "eth0"}})
+			end
+			local st = sample_state()
+			push(st, "enabled")
+			assert_true(st.guest_wlans.w1, "the guest WLAN needs the portal")
+			assert_eq(st.guest_wlans.w2, nil, "the other WLAN does not")
+			push(st, "disabled")
+			assert_eq(next(st.guest_wlans), nil, "portal off: no WLAN needs it")
+		end
+	},
+	{
 		name = "inform packet: setparam blocked_sta replaces the ledger, reconciles, deauths only new MACs",
 		fn = function()
 			-- The wire form captured from 10.4.57: the site's blocked

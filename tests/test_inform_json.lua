@@ -142,6 +142,15 @@ local function build(opts)
 	inject_sysinfo(opts and opts.with_clients, opts and opts.with_wired, opts and opts.with_scan,
 		opts and opts.with_radio_caps)
 	if opts and opts.with_uci then inject_ucihelper() end
+	-- vap_id: the wlanconf id the fixture vap echoes (get_vap_table's `id`).
+	if opts and opts.vap_id then
+		local get = inform._ucihelper.get_vap_table
+		inform._ucihelper.get_vap_table = function()
+			local vaps = get()
+			for _, v in ipairs(vaps) do v.id, v.wlanconf_id = opts.vap_id, opts.vap_id end
+			return vaps
+		end
+	end
 	local st = {
 		authkey    = state.DEFAULT_KEY,
 		adopted    = opts and opts.adopted or false,
@@ -152,6 +161,7 @@ local function build(opts)
 		hostname   = "testap",
 		locating   = opts and opts.locating,
 	}
+	for k, v in pairs(opts and opts.st or {}) do st[k] = v end
 	local json_str = inform.build_json(st, nil, ufhw)
 	return cjson.decode(json_str), st
 end
@@ -715,6 +725,29 @@ return {
 			assert_eq(d.vap_table[1].cu_self_rx, 18, "vap cu_self_rx matches its radio's radio_table_stats")
 			assert_eq(d.vap_table[1].cu_self_tx, 9, "vap cu_self_tx matches its radio's radio_table_stats")
 			assert_eq(d.vap_table[1].cu_interf, 10, "vap cu_interf matches its radio's radio_table_stats")
+		end
+	},
+	{
+		name = "inform json: sta authorized follows the guest ledger on a portal WLAN only",
+		fn = function()
+			-- The controller unauthorizes any station on a portal WLAN that
+			-- reports authorized without a guest record, and treats an absent
+			-- `authorized` as true (PROTOCOL-VALIDATION.md, "Guest portal").
+			local by_mac = function(d)
+				local out = {}
+				for _, s in ipairs(d.vap_table[1].sta_table) do out[s.mac] = s.authorized end
+				return out
+			end
+			local ledger = {["aa:bb:cc:dd:ee:ff"] = 1700000000}
+			local a = by_mac(build({with_uci = true, with_clients = true, vap_id = "w1",
+				st = {guest_wlans = {w1 = true}, guest_authorized = ledger}}))
+			assert_eq(a["aa:bb:cc:dd:ee:ff"], true, "authorized guest reports true")
+			assert_eq(a["11:22:33:44:55:66"], false, "unknown guest reports false, not absent")
+			local b = by_mac(build({with_uci = true, with_clients = true, vap_id = "w1",
+				st = {guest_wlans = {other = true}, guest_authorized = {}}}))
+			assert_eq(b["11:22:33:44:55:66"], true, "a WLAN without the portal reports true")
+			local c = by_mac(build({with_uci = true, with_clients = true}))
+			assert_eq(c["11:22:33:44:55:66"], true, "no guest record at all reports true")
 		end
 	},
 	{

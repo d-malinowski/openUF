@@ -618,7 +618,7 @@ meaning on an AP:
 
 | Relevant to an AP | Not for an AP / correctly ignored |
 |---|---|
-| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200) (handled) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest` (handled; guest ledger only, lab-validated) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
@@ -775,9 +775,26 @@ WLAN, `unauthorize-guest` was queued for each of them on **every inform**, and `
 reached 77 in about 10 minutes. On a guest WLAN, openUF's station entries must report
 `authorized` as the portal state.
 
+**openUF's answer (C1, lab-validated only, 2026-10-09).** Every `system_cfg` push records the
+portal WLANs: the `aaa.<n>.id` of each `wireless.<n>.is_guest=true` WLAN, while
+`redirector.status=enabled` (it reads `disabled` when the portal is off). This goes to
+`st.guest_wlans`. `authorize-guest` / `unauthorize-guest` add the MAC to / remove it from
+`st.guest_authorized`. Each `sta_table[]` entry now carries `authorized`: the ledger's answer
+on a portal WLAN and `true` elsewhere. Lab, same three mock stations:
+- After a force-provision, `guest_kicks` stayed at 1205 over 60 s; before, it rose on every
+  inform. `stat/sta` shows the three stations as `authorized: false`.
+- A REST `authorize-guest` for `…:01` brought **the first `authorize-guest` cmd ever seen**
+  on the next inform. The ledger took the MAC, `stat/sta` showed it `authorized: true`, and
+  no `rate-update` came (no `up`/`down` on the record).
+- A REST `unauthorize-guest` brought one `unauthorize-guest` (`guest_kicks` 1205 → 1206) and
+  nothing after it.
+- After an inform restart, an authorized guest stayed `true` and no command was resent.
+
+Nothing enforces the portal yet (that is C2).
+
 | Wire (all `{"_type":"cmd", …, "mac":"…"}`) | Sent when |
 |---|---|
-| `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above. A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
+| `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above (openUF: into `st.guest_authorized`). A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
 | `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above |
 | `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per authorization (`qos_policy_applied` latch), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's user group rate is sent instead (same sender) |
 

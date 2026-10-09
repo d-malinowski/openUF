@@ -1450,6 +1450,8 @@ function M.build_json(st, cfg, ufhw)
 				sta_table[#sta_table + 1] = {
 					active     = true,
 					mac        = sta.mac,
+					-- Guest portal state; see M._guest_sta_authorized.
+					authorized = M._guest_sta_authorized(st, vap, sta.mac),
 					ap_mac     = mac_str,
 					channel    = vap.channel,
 					radio      = vap.radio,
@@ -2593,6 +2595,11 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- one, taking the nested sta_table -- and thus every wireless
 				-- client -- with them).
 				wlanconf_id           = a.id,
+				-- wireless.<n>.is_guest: the WLAN is a guest network
+				-- (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)").
+				-- Always present, "true"/"false". Read by _guest_wlans,
+				-- not by UCI.
+				is_guest              = _wire_bool(w.is_guest) or false,
 				x_passphrase          = a["wpa.psk"],
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
 				-- aaa.<n>.wpa3.ft.status: FT for the SAE akm specifically,
@@ -3056,6 +3063,9 @@ local RECOGNIZED_SYSTEM_CFG = {
 	-- is not read and stays in the report.
 	"^ebtables%.status$",
 	"^ebtables%.%d+%.cmd$",
+	-- Guest portal on/off (M._guest_wlans). The rest of redirector.* is the
+	-- portal's address, which nothing enforces yet.
+	"^redirector%.status$",
 }
 
 local RECOGNIZED_MGMT_CFG = {
@@ -3364,6 +3374,10 @@ function M.handle_response(json_str, st, cfg)
 			-- the wifi branch left that consumer reading a nil table -- an
 			-- empty trunk list that fails silently.
 			local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
+			-- Which WLANs a station must pass the guest portal on. Every
+			-- system_cfg lists every WLAN and redirector.status, so this
+			-- replaces the record outright.
+			st.guest_wlans = M._guest_wlans(vap_table, sys_raw)
 
 			-- VLANs that a WIRED port is assigned to. Computed before the
 			-- WiFi pass because their L2 is the same bridge a tagged SSID
@@ -3660,6 +3674,13 @@ function M.handle_response(json_str, st, cfg)
 			if type(resp.mac) == "string" then
 				M._firewall.deauth(resp.mac, M._bss_ifnames())
 			end
+		elseif cmd == "authorize-guest" or cmd == "unauthorize-guest" then
+			-- Guest portal: {"cmd":"(un)authorize-guest","mac":...}
+			-- (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)"). Only
+			-- the ledger build_json reports `authorized` from; nothing on
+			-- the device blocks an unauthorized guest yet.
+			M._guest_authorize(st, resp.mac, cmd == "authorize-guest")
+			M._state.save(st)
 		elseif cmd == "scan" or cmd == "scan_band" then
 			M._handle_scan_cmd(resp, cfg)
 		elseif cmd == "spectrum-scan" then
@@ -3764,6 +3785,63 @@ end
 -- whichever SSID it is on. One interface per radio missed every SSID after the
 -- first on that radio. A VLAN netdev folds into its BSS (hostapd has no
 -- control socket on it).
+-- Guest portal (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)").
+--
+-- On a guest WLAN with the portal on, the controller compares each station's
+-- reported `authorized` with its own guest records on every inform: a
+-- station it has no record for but that reports authorized gets
+-- unauthorize-guest, and a station it has a record for that reports
+-- unauthorized gets authorize-guest. An absent `authorized` counts as true,
+-- so before this every station on such a WLAN drew an unauthorize-guest per
+-- inform and authorize-guest was never sent at all.
+
+-- Cap on st.guest_authorized. Past it the oldest authorization goes first;
+-- the controller re-sends authorize-guest for any guest it still has a
+-- record for, so a dropped entry costs one inform, not access.
+M.GUEST_LEDGER_MAX = 512
+
+-- Set of wlanconf ids (vap.wlanconf_id) on which stations must pass the
+-- portal: guest WLANs while redirector.status=enabled. Without the portal a
+-- guest WLAN is only isolated, and the controller does not check
+-- `authorized` there.
+function M._guest_wlans(vap_table, sys_raw)
+	local out = {}
+	if type(sys_raw) ~= "string"
+			or not ("\n" .. sys_raw .. "\n"):find("\nredirector%.status=enabled\n") then
+		return out
+	end
+	for _, vap in ipairs(vap_table or {}) do
+		if vap.is_guest and vap.wlanconf_id then out[vap.wlanconf_id] = true end
+	end
+	return out
+end
+
+-- Record or drop one guest authorization. A malformed MAC is ignored.
+function M._guest_authorize(st, mac, authorized)
+	mac = type(mac) == "string" and mac:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+	if not mac then return end
+	st.guest_authorized = st.guest_authorized or {}
+	if not authorized then
+		st.guest_authorized[mac] = nil
+		return
+	end
+	st.guest_authorized[mac] = os.time()
+	local n, oldest, oldest_t = 0, nil, nil
+	for m, t in pairs(st.guest_authorized) do
+		n = n + 1
+		if not oldest_t or t < oldest_t then oldest, oldest_t = m, t end
+	end
+	if n > M.GUEST_LEDGER_MAX then st.guest_authorized[oldest] = nil end
+end
+
+-- The `authorized` a station on this vap reports: the ledger's word on a
+-- portal WLAN, true everywhere else (what the controller assumes anyway).
+function M._guest_sta_authorized(st, vap, mac)
+	local wlans = st and st.guest_wlans
+	if not (wlans and vap and vap.id and wlans[vap.id]) then return true end
+	return (st.guest_authorized or {})[mac] ~= nil
+end
+
 -- Replace the block ledger with the controller's list (setparam blocked_sta)
 -- and rebuild the nft set, but only when the set of MACs changed: reconcile
 -- drops and recreates the table, so redoing it on every push would open a
