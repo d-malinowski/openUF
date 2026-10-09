@@ -597,12 +597,24 @@ Confirmed `cmd` strings:
 | `set-locate` | Locate button | `{"cmd":"set-locate","device_id":…}` |
 | `block-sta` | Block client | `{"cmd":"block-sta","mac":"…"}` |
 | `unblock-sta` | Unblock client | `{"cmd":"unblock-sta","mac":"…"}` |
+| `kick-sta` | Client → Reconnect | `{"cmd":"kick-sta","mac":"…"}`. Queued only to the AP in the client's `ap_mac`, with no capability gate (`devmgr/KlNisgrKpTMarFmxEJt`). One-shot deauth on every BSS. Lab: REST `cmd/stamgr` → `inform: cmd: kick-sta` on the next heartbeat |
 | `spectrum-scan` | — | Handler implemented; no UI affordance found in 10.4.57 to fire it. |
 
-The block-sta deauth goes to **every BSS** (`ucihelper.ap_ifnames`, VLAN
+The block-sta deauth and kick-sta both go to **every BSS** (`ucihelper.ap_ifnames`, VLAN
 netdevs folded into their BSS). Until 2026-10 the block deauth went to
 `get_ifname_for_radio`, which is the first interface of each radio only. On the Archer C5,
 radio1 carries `phy1-ap0` and `phy1-ap1`, so a client on the second SSID was never kicked.
+
+#### Every `cmd` the controller can queue to a device (10.4.57 audit, 2026-10-09)
+
+I found these by decompiling every `com.ubnt.service` class that references `"cmd"` and
+collecting each `"cmd", "<name>"` literal. Most have no meaning on an AP:
+
+| Relevant to an AP | Not for an AP / correctly ignored |
+|---|---|
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta` (handled) · `spectrum-scan` (+`spectrum-cfg`) · `scan` (`type`, `mode`, `freq`, `radio_name`) · `scan_band` (`band`; only for devices without `wifi_caps2` 0x200) · guest portal: `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+
+An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
 Block/unblock are **one-shot commands**, not persistent per-inform state. The candidate
 persistent field `include_blocks` (present on every response) was ruled out — it stays `[]`

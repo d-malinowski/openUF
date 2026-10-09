@@ -2769,6 +2769,45 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response cmd kick-sta deauths on every BSS and blocks nothing",
+		fn = function()
+			-- Client -> Reconnect. A one-shot deauth: the client may come
+			-- straight back, so no ledger entry and no nft reconcile.
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:02"}})
+			local deauthed, reconciled
+			inform._firewall = {
+				reconcile = function() reconciled = true end,
+				deauth = function(mac, ifnames) deauthed = {mac = mac, ifnames = ifnames} end,
+			}
+			inform._ucihelper = bss_mock()
+			local result = inform.handle_response(
+				'{"_type":"cmd","cmd":"kick-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+			assert_true(deauthed ~= nil, "kick-sta deauthenticates")
+			assert_eq(deauthed.mac, "aa:bb:cc:dd:ee:01", "deauth targets the kicked MAC")
+			assert_eq(table.concat(deauthed.ifnames, ","), "phy0-ap0,phy0-ap1,phy1-ap0",
+				"deauth issued on every BSS")
+			assert_eq(reconciled, nil, "a kick does not touch the block table")
+			assert_eq(#st.blocked_stas, 1, "a kick adds nothing to the block ledger")
+			assert_true(result, "re-inform immediately after executing a command")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd kick-sta without a mac is a safe no-op",
+		fn = function()
+			local st = sample_state()
+			local deauthed = false
+			inform._firewall = { reconcile = function() end, deauth = function() deauthed = true end }
+			inform._ucihelper = bss_mock()
+			local result = inform.handle_response('{"_type":"cmd","cmd":"kick-sta"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+			assert_eq(deauthed, false, "nothing to deauth without a mac")
+			assert_true(result, "still re-informs")
+		end
+	},
+	{
 		name = "inform packet: handle_response cmd block-sta without a mac field is a safe no-op",
 		fn = function()
 			local st = sample_state()

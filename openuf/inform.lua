@@ -3644,6 +3644,14 @@ function M.handle_response(json_str, st, cfg)
 					M._firewall.deauth(mac, M._bss_ifnames())
 				end
 			end
+		elseif cmd == "kick-sta" then
+			-- Client -> Reconnect: {"cmd":"kick-sta","mac":...}, queued to
+			-- the AP the client is on (PROTOCOL-VALIDATION.md, "Response
+			-- _types"). A one-shot deauth and nothing more: the client may
+			-- reassociate at once, so no ledger and no nft (unlike block-sta).
+			if type(resp.mac) == "string" then
+				M._firewall.deauth(resp.mac, M._bss_ifnames())
+			end
 		elseif cmd == "spectrum-scan" then
 			-- Trigger a scan per radio (sweeps every channel), then read back
 			-- per-channel survey data and build a spectrum_table entry per
