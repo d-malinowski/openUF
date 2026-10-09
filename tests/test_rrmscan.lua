@@ -240,35 +240,109 @@ return {
 	{
 		name = "rrmscan: the collector is started only when it is not running",
 		fn = function()
-			with_popen(function(cmd)
-				if cmd:find("pgrep", 1, true) then return "" end   -- not running
-				if cmd:find("ubus list", 1, true) then
-					return "hostapd.phy0-ap0\nhostapd.phy1-ap0\nnetwork.wireless\n"
-				end
-				return ""
-			end, function()
-				with_exec(function(cmds)
-					assert_true(rrmscan.collector_ensure(), "starts when absent")
-					local all = table.concat(cmds, "\n")
-					assert_true(all:find("ubus subscribe hostapd.phy0-ap0 hostapd.phy1-ap0", 1, true) ~= nil,
-						"subscribes to every hostapd BSS at once")
-					-- `ubus listen` catches broadcast events and receives
-					-- NOTHING here; only subscribe gets hostapd's per-object
-					-- notifications. Confirmed live.
-					assert_false(all:find("ubus listen", 1, true) ~= nil,
-						"never uses listen, which sees no beacon reports")
-					assert_true(all:find("&") ~= nil, "runs in the background")
+			local orig_script = rrmscan.COLLECTOR_SCRIPT
+			rrmscan.COLLECTOR_SCRIPT = os.tmpname()
+			local ok, err = pcall(function()
+				with_popen(function(cmd)
+					if cmd:find("pgrep", 1, true) then return "" end   -- not running
+					if cmd:find("ubus list", 1, true) then
+						return "hostapd.phy0-ap0\nhostapd.phy1-ap0\nnetwork.wireless\n"
+					end
+					return ""
+				end, function()
+					with_exec(function(cmds)
+						assert_true(rrmscan.collector_ensure(), "starts when absent")
+						local all = table.concat(cmds, "\n")
+						assert_true(all:find("sh " .. rrmscan.COLLECTOR_SCRIPT
+							.. " hostapd.phy0-ap0 hostapd.phy1-ap0", 1, true) ~= nil,
+							"runs the script over every hostapd BSS at once")
+						assert_true(all:find("&") ~= nil, "runs in the background")
+						local script = rrmscan._read_file(rrmscan.COLLECTOR_SCRIPT)
+						-- `ubus listen` catches broadcast events and receives
+						-- NOTHING here; only subscribe gets hostapd's per-object
+						-- notifications. Confirmed live.
+						assert_true(script:find('ubus subscribe "$@"', 1, true) ~= nil,
+							"the script subscribes to the objects it is given")
+						assert_false(script:find("ubus listen", 1, true) ~= nil,
+							"never uses listen, which sees no beacon reports")
+						-- So collector_running keeps matching the live process.
+						assert_true(("ubus subscribe hostapd.phy0-ap0"):find("ubus subscribe hostapd", 1, true) ~= nil,
+							"the spawned process still matches the liveness pattern")
+					end)
+				end)
+
+				-- Running, and it is this script unchanged: left alone.
+				with_popen(function(cmd)
+					if cmd:find("pgrep", 1, true) then return "4711\n" end  -- running
+					return ""
+				end, function()
+					with_exec(function(cmds)
+						assert_false(rrmscan.collector_ensure(), "no-op while running")
+						assert_eq(#cmds, 0, "spawns no second collector")
+					end)
 				end)
 			end)
-
-			with_popen(function(cmd)
-				if cmd:find("pgrep", 1, true) then return "4711\n" end  -- running
-				return ""
-			end, function()
-				with_exec(function(cmds)
-					assert_false(rrmscan.collector_ensure(), "no-op while running")
-					assert_eq(#cmds, 0, "spawns no second collector")
+			os.remove(rrmscan.COLLECTOR_SCRIPT)
+			rrmscan.COLLECTOR_SCRIPT = orig_script
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- A collector is reparented to init, so it survives an openUF upgrade
+		-- and a config change. One from an older openUF writes untimestamped
+		-- lines; one without the on_auth hook leaves stale set evidence in
+		-- place. Either must be replaced, not merely found alive.
+		name = "rrmscan: a running collector that is not the wanted script is replaced",
+		fn = function()
+			local orig_script = rrmscan.COLLECTOR_SCRIPT
+			rrmscan.COLLECTOR_SCRIPT = os.tmpname()
+			local ok, err = pcall(function()
+				local answers = function(cmd)
+					if cmd:find("pgrep", 1, true) then return "4711\n" end
+					if cmd:find("ubus list", 1, true) then return "hostapd.phy0-ap0\n" end
+					return ""
+				end
+				-- Old-style collector: ubus subscribe is alive, no script file.
+				os.remove(rrmscan.COLLECTOR_SCRIPT)
+				with_popen(answers, function()
+					with_exec(function(cmds)
+						assert_true(rrmscan.collector_ensure(), "replaced")
+						local all = table.concat(cmds, "\n")
+						assert_true(all:find("kill $(pgrep", 1, true) ~= nil, "the old one is stopped")
+						assert_true(all:find("sh " .. rrmscan.COLLECTOR_SCRIPT, 1, true) ~= nil,
+							"and the script started")
+					end)
 				end)
+				-- Same script but a hook is now wanted: replaced again.
+				with_popen(answers, function()
+					with_exec(function(cmds)
+						assert_true(rrmscan.collector_ensure({on_auth = "true"}), "replaced on opts change")
+					end)
+				end)
+				-- And left alone once it matches.
+				with_popen(answers, function()
+					with_exec(function(cmds)
+						assert_false(rrmscan.collector_ensure({on_auth = "true"}), "kept when unchanged")
+						assert_eq(#cmds, 0, "nothing spawned or killed")
+					end)
+				end)
+			end)
+			os.remove(rrmscan.COLLECTOR_SCRIPT)
+			rrmscan.COLLECTOR_SCRIPT = orig_script
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "rrmscan: harvest takes a blob drained once for several consumers",
+		fn = function()
+			local blob = read_fixture("ubus_beacon_report.txt")
+			with_events("", function()
+				assert_true(#rrmscan.harvest(blob) > 0, "parses the blob it is given")
+			end)
+			-- Timestamp prefixes added by the collector do not disturb it.
+			local stamped = blob:gsub("([^\n]+)", "5905613.20 %1")
+			with_events("", function()
+				assert_eq(#rrmscan.harvest(stamped), #rrmscan.harvest(blob), "prefix-agnostic")
 			end)
 		end
 	},

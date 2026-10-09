@@ -7,6 +7,7 @@ dofile("openuf/lib/lib.lua")	-- needed by announce (loaded by inform)
 local crypto = dofile("openuf/crypto.lua")
 local state  = dofile("openuf/state.lua")
 local inform = dofile("openuf/inform.lua")
+local cjson  = require("cjson")
 
 -- Redirect state file to /tmp so handle_response tests don't need /etc/openuf
 inform._state._state_file = "/tmp/openuf_test_inform.json"
@@ -4232,6 +4233,190 @@ return {
 
 			io.stderr = orig_stderr
 			inform._warned_bandsteering_mode = false
+		end
+	},
+	{
+		-- Every 10.x controller sends capability=notif,notif-assoc-stat in
+		-- mgmt_cfg (captured on 10.4.57, PROTOCOL-VALIDATION.md). It is the
+		-- only signal that the controller wants STA_ASSOC_TRACKER notifs.
+		name = "inform: mgmt_cfg capability notif-assoc-stat is recorded and persisted",
+		fn = function()
+			local st = sample_state()
+			inform._rrm_collector_next = 999
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"capability=notif,notif-assoc-stat\\ncfgversion=2\\n"}', st)
+			assert_eq(st.notif_assoc_stat, true, "asked")
+			assert_eq(inform._rrm_collector_next, 0, "the collector check is re-armed at once")
+			inform._rrm_collector_next = 999
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"capability=notif,notif-assoc-stat\\ncfgversion=2\\n"}', st)
+			assert_eq(inform._rrm_collector_next, 999, "but not by a setparam that changes nothing")
+			inform._rrm_collector_next = 0
+			assert_eq(state.FIELDS.notif_assoc_stat, "boolean", "survives a restart (setparam is not resent)")
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"capability=notif\\ncfgversion=3\\n"}', st)
+			assert_eq(st.notif_assoc_stat, false, "a capability list without it turns it off")
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"capability=notif,notif-assoc-stat-v2\\ncfgversion=4\\n"}', st)
+			assert_eq(st.notif_assoc_stat, false, "matched as a whole list item, not a prefix")
+		end
+	},
+	{
+		name = "inform: connection tracking needs the controller's ask and no conf.lua veto",
+		fn = function()
+			assert_false(inform._assoc_enabled({}, {config = {}}), "not asked")
+			assert_true(inform._assoc_enabled({notif_assoc_stat = true}, {config = {}}), "asked, conf silent")
+			assert_true(inform._assoc_enabled({notif_assoc_stat = true}, nil), "no cfg at all")
+			assert_false(inform._assoc_enabled({notif_assoc_stat = true}, {config = {assoc_tracker = false}}),
+				"conf.lua assoc_tracker = false wins")
+		end
+	},
+	{
+		-- The envelope proven in the lab against 10.4.57: inform_as_notif,
+		-- notif_reason "event", notif_payload, beside the device identity.
+		-- The controller's noop reply carries no interval and must not reach
+		-- handle_response.
+		name = "inform: queued notifs go out one POST each in the notif envelope",
+		fn = function()
+			local at = inform._assoctrack
+			local o_post, o_build, o_hr = inform.http_post, inform.build_packet, inform.handle_response
+			local o_queue, o_ident = at._queue, inform._notif_identity
+			local bodies, hr_calls = {}, 0
+			inform.build_packet = function(json) return json end
+			inform.http_post = function(url, pkt) bodies[#bodies + 1] = cjson.decode(pkt); return "noop" end
+			inform.handle_response = function() hr_calls = hr_calls + 1 end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20", model = "U6IW", version = "6.8.2.15592"}
+			at._queue = {{message_type = "STA_ASSOC_TRACKER", n = 1}, {message_type = "STA_ASSOC_TRACKER", n = 2}}
+			local sent = inform._send_notifs({adopted = true, inform_url = "http://x/inform"})
+			local q_after = #at._queue
+			inform.http_post, inform.build_packet, inform.handle_response = o_post, o_build, o_hr
+			at._queue, inform._notif_identity = o_queue, o_ident
+			assert_eq(sent, 2, "both sent")
+			assert_eq(q_after, 0, "queue drained")
+			assert_eq(#bodies, 2, "one POST per notif")
+			local b = bodies[1]
+			assert_eq(b.inform_as_notif, true, "inform_as_notif")
+			assert_eq(b.notif_reason, "event", "notif_reason")
+			assert_eq(b.notif_payload.message_type, "STA_ASSOC_TRACKER", "payload")
+			assert_eq(b.notif_payload.n, 1, "in queue order")
+			assert_eq(b.mac, "00:00:5e:00:53:20", "device identity")
+			assert_eq(b.version, "6.8.2.15592", "firmware version")
+			assert_eq(type(b.time), "number", "time")
+			assert_eq(hr_calls, 0, "the noop reply never reaches handle_response")
+		end
+	},
+	{
+		name = "inform: a failed notif POST puts it and the rest back in order",
+		fn = function()
+			local at = inform._assoctrack
+			local o_post, o_build = inform.http_post, inform.build_packet
+			local o_queue, o_ident = at._queue, inform._notif_identity
+			local posts = 0
+			inform.build_packet = function(json) return json end
+			inform.http_post = function() posts = posts + 1; if posts == 2 then return nil, "timeout" end return "noop" end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20"}
+			at._queue = {{n = 1}, {n = 2}, {n = 3}}
+			local sent = inform._send_notifs({adopted = true, inform_url = "http://x/inform"})
+			local q = at._queue
+			inform.http_post, inform.build_packet = o_post, o_build
+			at._queue, inform._notif_identity = o_queue, o_ident
+			assert_eq(sent, 1, "one got through")
+			assert_eq(#q, 2, "two kept")
+			assert_eq(q[1].n, 2, "the failed one first")
+			assert_eq(q[2].n, 3, "then the one never tried")
+		end
+	},
+	{
+		name = "inform: nothing is sent before adoption",
+		fn = function()
+			local at = inform._assoctrack
+			local o_post, o_queue, o_ident = inform.http_post, at._queue, inform._notif_identity
+			local posts = 0
+			inform.http_post = function() posts = posts + 1; return "noop" end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20"}
+			at._queue = {{n = 1}}
+			inform._send_notifs({adopted = false, inform_url = "http://x/inform"})
+			local left = #at._queue
+			inform.http_post, at._queue, inform._notif_identity = o_post, o_queue, o_ident
+			assert_eq(posts, 0, "no POST")
+			assert_eq(left, 1, "kept for later")
+		end
+	},
+	{
+		-- With rrm_enrichment off, the collector used to be stopped. It is
+		-- now also connection tracking's source, so it must keep running --
+		-- with the table installed BEFORE the collector whose auth hook
+		-- writes into it -- while beacon-report harvesting stays off.
+		name = "inform: connection tracking keeps the collector alive with rrm_enrichment off",
+		fn = function()
+			local o_rrm, o_at, o_time = inform._rrmscan, inform._assoctrack, inform._time
+			local calls, ensure_opts = {}, nil
+			local at = setmetatable({
+				ensure_table = function() calls[#calls + 1] = "table"; return true end,
+				teardown = function() calls[#calls + 1] = "teardown" end,
+			}, {__index = o_at})
+			inform._assoctrack = at
+			inform._rrmscan = {
+				collector_running = function() return true end,
+				collector_stop    = function() calls[#calls + 1] = "stop" end,
+				collector_ensure  = function(opts) calls[#calls + 1] = "collector"; ensure_opts = opts end,
+				drain             = function() return "" end,
+				harvest           = function() calls[#calls + 1] = "harvest"; return {}, {} end,
+			}
+			inform._time = function() return 5000 end
+			inform._rrm_collector_next = 0
+			inform._assoc_installed = false
+			local st = {notif_assoc_stat = true}
+			inform._rrm_tick({config = {rrm_enrichment = false}}, st)
+			local seq = table.concat(calls, ",")
+
+			-- Then the controller stops asking: table and hook go away.
+			calls = {}
+			inform._rrm_collector_next = 0
+			inform._rrm_tick({config = {rrm_enrichment = false}}, {})
+			local seq2 = table.concat(calls, ",")
+
+			inform._rrmscan, inform._assoctrack, inform._time = o_rrm, o_at, o_time
+			inform._rrm_collector_next = 0
+			inform._assoc_installed = false
+			assert_eq(seq, "table,collector", "table first, then the collector; no stop, no harvest")
+			assert_true(ensure_opts and type(ensure_opts.on_auth) == "string"
+				and ensure_opts.on_auth:find("destroy element", 1, true) ~= nil,
+				"the collector carries the auth hook")
+			assert_eq(seq2, "stop,teardown", "neither consumer wants it: collector stopped, table removed")
+		end
+	},
+	{
+		-- Notifs ride on the heartbeat: after a state inform succeeded, and
+		-- only when the controller asked for them.
+		name = "inform: a heartbeat sends queued notifs after the state inform, when asked",
+		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response, send = inform._send_notifs,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+			}
+			local order = {}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.http_post = function() order[#order + 1] = "state"; return "body" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.handle_response = function() return false end
+			inform._send_notifs = function() order[#order + 1] = "notifs"; return 0 end
+
+			local ctx = {interval = 10, backoff = 10}
+			inform._tick({inform_url = "u", notif_assoc_stat = true}, {config = {}}, nil, ctx)
+			local asked = table.concat(order, ",")
+			order = {}
+			inform._tick({inform_url = "u"}, {config = {}}, nil, ctx)
+			local not_asked = table.concat(order, ",")
+
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response, inform._send_notifs,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post, orig.parse_packet,
+				orig.handle_response, orig.send, orig.reload, orig.rrm
+			assert_eq(asked, "state,notifs", "state inform first, then the notifs")
+			assert_eq(not_asked, "state", "nothing when the controller did not ask")
 		end
 	},
 }

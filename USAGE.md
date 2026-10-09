@@ -929,6 +929,60 @@ out, and `/tmp/openuf-rrm.jsonl` is the spool, drained on every inform.
 
 Use the controller's RF scan (`spectrum-scan`) when you want a real full sweep.
 
+### WiFi Connectivity (connection stages)
+
+Insights → AirView → Connectivity shows each client connection as five stages:
+Association, Authentication, DHCP, DNS and Success, each with a success ratio and a latency.
+The controller can't see any of that itself. A UniFi AP sends one *notif inform* per
+connection attempt (`STA_ASSOC_TRACKER`), and the controller asks for them in every
+`mgmt_cfg` (`capability=notif,notif-assoc-stat`). Without them the view reads 0 % with
+"Initial WiFi Connections (0)". That means no data, not failed connections.
+
+| Setting | Meaning |
+|---|---|
+| `assoc_tracker` | `true` by default, and also when the key is missing from an older `conf.lua`. Set `false` to send nothing; the nft table is removed on the next cycle |
+
+Where each stage comes from:
+
+| Stage | Source |
+|---|---|
+| Association, Authentication | hostapd's `auth`, `assoc` and `sta-authorized` ubus notifications, timestamped from `/proc/uptime` as they arrive (10 ms resolution). `sta-authorized` arrives after the 4-way handshake |
+| DHCP | The station's first DHCP request, and the server's unicast ACK or else the station's first frame from a real IPv4 source address |
+| DNS, Success | The station's first DNS query and the first DNS answer sent back to it, with a packet count |
+
+The DHCP and DNS stages come from `table bridge openuf_assoc`. It has five dynamic sets keyed
+on the station MAC (`dhcp_req`, `dhcp_ack`, `ip_seen`, `dns_q`, `dns_resp`), filled with
+`add`, which never refreshes an element. So each element's remaining `expires` dates the
+first matching frame to the millisecond, and its counter counts the rest. The table never
+drops or changes a frame. When hostapd reports a new 802.11 authentication, the event collector
+clears that station's elements right away, before the station can send any data.
+
+The verdict is reached once the station gets a DNS answer (success). Otherwise it comes when
+the station leaves or 30 s have passed since it was authorized:
+
+- DHCP request but no lease: a DHCP failure.
+- DNS queries but no answer: a DNS failure.
+- Associated but never authorized (a wrong passphrase looks like this): a WPA failure.
+- A fast (802.11r) roam with no DNS: "soft failure, roam". The controller counts that as
+  a successful connection.
+- **No DHCP and no DNS at all: nothing is sent.** The controller's Success rule needs DNS
+  answers, so a sensor that never resolves a name can't pass, and openUF won't invent a
+  pass or a failure for it.
+
+The collector is the same detached `ubus subscribe hostapd.*` that 802.11k enrichment uses
+(above). It now runs from `/tmp/openuf-collect.sh` and keeps running while either feature is
+on. Each notif is its own inform POST, sent after the regular heartbeat, at most 8 per
+cycle; a backlog of more than 64 drops the oldest.
+
+Troubleshooting:
+- `grep notif_assoc_stat /etc/openuf/state.json` must read `true`. It is set from the
+  controller's `mgmt_cfg`. A Force Provision resends it.
+- `nft list table bridge openuf_assoc` must exist. Its sets fill while a client connects.
+- `head /tmp/openuf-rrm.jsonl` lines must start with a number (the uptime stamp). Unstamped
+  lines come from a collector an older openUF started. It is replaced within a minute.
+- A connection on a BSS that has no `vap_table` entry yet (right after a config push) is
+  dropped rather than filed under the wrong band.
+
 The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
 can suppress group-addressed frames wholesale but has no notion of an allow-list — so
 openUF enforces it with nftables, in its own `bridge openuf_bcfilt` table (separate

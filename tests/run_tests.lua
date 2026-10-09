@@ -145,6 +145,7 @@ local test_files = {
 	"tests/test_firewall.lua",
 	"tests/test_bcfilter.lua",
 	"tests/test_rrmscan.lua",
+	"tests/test_assoctrack.lua",
 	"tests/test_shaper.lua",
 	"tests/test_switchvlan.lua",
 	"tests/test_modelmap.lua",

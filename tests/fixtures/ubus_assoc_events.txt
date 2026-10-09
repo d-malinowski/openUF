@@ -1,0 +1,6 @@
+5905612.10 { "probe": {"address":"00:00:5e:00:53:02","ifname":"phy1-ap0","target":"ff:ff:ff:ff:ff:ff","signal":-85,"freq":2412,"ht_capabilities":{"ht_capabilities_info":11584}} }
+5905612.55 { "disassoc": {"address":"00:00:5e:00:53:01","ifname":"phy1-ap0"} }
+5905613.20 { "auth": {"address":"00:00:5e:00:53:01","ifname":"phy1-ap0","target":"00:00:5e:00:53:10","signal":-64,"freq":2412} }
+5905613.25 { "assoc": {"address":"00:00:5e:00:53:01","ifname":"phy1-ap0","target":"00:00:5e:00:53:10","signal":-62,"freq":2412} }
+5905613.32 { "sta-authorized": {"address":"00:00:5e:00:53:01","ifname":"phy1-ap0","auth-alg":"open"} }
+5905614.01 { "link-measurement-report": {"address":"00:00:5e:00:53:01","dialog-token":1,"rx-antenna-id":0,"tx-antenna-id":0,"rcpi":94,"rsni":29} }

@@ -604,6 +604,101 @@ persistent field `include_blocks` (present on every response) was ruled out — 
 even while a client is genuinely blocked. The device is expected to remember the block itself,
 which is why `state.json` carries `blocked_stas` and `firewall.reconcile()` runs at startup.
 
+### Connection tracking notifs (`STA_ASSOC_TRACKER`)
+
+**Symptom.** Insights → AirView → Connectivity read 0 % on Association, Authentication, DHCP,
+DNS and Success, with "Initial WiFi Connections (0)" and 0 ms latencies (real UCG Ultra,
+2026-10-09). The view's source, `GET /v2/api/site/<site>/wifi-connectivity`, returned
+`total_attempts: 0`. That is an empty dataset, not failures. The roaming table on the same page
+was full, because the controller derives roams from `sta_table` itself.
+
+**The request.** Every `mgmt_cfg` carries `capability=notif,notif-assoc-stat` (built
+unconditionally in `com.ubnt.service.config.GWoWvNEX`: `notif`, optional `fastapply-bg`,
+then `notif-assoc-stat`). openUF ignored it until now.
+
+**Decompile** (CFR on 10.4.57 `internal-dependencies.jar`; decompile per class straight from
+the jar with `--jarfilter`, because unzip on macOS folds `service/l` and `service/L`
+together):
+
+- The inform servlet (`devmgr/l/MiVjHefaf`) branches on `inform_as_notif: true` before any
+  stats or capability handling. `notif_reason` takes the enum `devmgr/l/kuhBRF`
+  (`event`, `cmd`, `setparam`, `cmd-provision`, `cmd-upgrade`, `cli-upgrade`, `crashlog`,
+  `recovery`, `trace`). For `event`, `notif_payload.event_string` is tried first against the
+  device handler's map, then `notif_payload.message_type` against a second map that holds
+  `STA_ASSOC_TRACKER` and `BEACON_BLE_SCAN` (`devmgr/AxWM`). The reply is
+  `{"_type":"noop"}` with **no `interval`**.
+- `STA_ASSOC_TRACKER` → `devmgr/w/a/AcrQJeJCScLn` fans out on `event_type` ∈
+  `association | success | failure | soft failure | fixup | sta_leave | sta_roam`
+  (`htDMji`):
+  - `MiVjHefaf` (bean `metricsStaAssocEventHandler`) handles success, failure, soft failure,
+    fixup and unknown. It feeds the 5-minute stats (`sta_assoc_total`, `sta_auth_total`,
+    `sta_dhcp_total`, `sta_wpa_auth_total`, `*_failures`). It reads `assoc_delta`,
+    `auth_delta`, `wpa_auth_delta`, `ip_delta` (only if `ip_assign_type == "dhcp"`),
+    `traffic_delta`, `auth_ts` with `getLong`/`getDouble`, and the failure counts with
+    `getInt`. Send every key.
+  - `lhuvxd` (bean `wifiConnectivityStaAssocTrackerEventHandler`) feeds the funnel through
+    `wifiConnectionEventsService` into `unifi_stat.wifi_connectivity_event`. It needs `vap`
+    to resolve to a `vap_table` entry with a `wlanconf_id` that is not an "element" WLAN,
+    and `auth_rssi` (or `avg_rssi`) ≥ −75 unless the event succeeded. **Success** means
+    `event_type` is not `failure`, AND either (a) `soft failure` with
+    `ip_assign_type == "roam"`, or (b) on a device with `supportTrafficStaTrackerEvents()`,
+    `traffic_delta > 0` **and** `dns_responses > 0`, or (c) otherwise
+    `dns_resp_seen == "yes"`. Failure causes map from `assoc_failures`, `auth_failures`,
+    `wpa_auth_failures`, `radius_auth_status` (`success`/`failure`), `ip_failures`
+    (DHCP_TIMEOUT), `traffic_failures`, `dns_resp_seen` (`yes`/`no`/`N/A`) and
+    `dns_timeouts`.
+  - `eirJvdtm` (roam detection) consumes `association`, `sta_roam` and `sta_leave`. openUF
+    does not send those, because roaming already works from `sta_table`.
+
+**Lab, 10.4.57, 2026-10-09.** All three were sent from the AP container with openUF's own
+`build_packet`/`http_post`:
+
+| Sent | Result |
+|---|---|
+| Notif with identity fields only (`mac`, `model`, `version`, `serial`, `ip`, `cfgversion`, `uptime`, …) | Accepted, bare noop. `stat_5minutes` for the AP: `sta_assoc_total=12, sta_auth_total=8, sta_dhcp_total=850, sta_wpa_auth_total=45` |
+| `success`, `traffic_delta = 0`, `dns_responses = 2` | Funnel unchanged (`total_attempts: 0`). U6-IW takes branch (b), so `traffic_delta` must be > 0 |
+| `success`, `traffic_delta = 120` | `total_attempts: 1`, all ratios 100, `association_latency 12`, `authentication_latency 33`, `dhcp_latency 805`, `total_latency 120` |
+
+The deltas are **cumulative from `auth_ts`**: authentication = `wpa_auth_delta` −
+`assoc_delta` (45 − 12), DHCP = `ip_delta` − `wpa_auth_delta` (850 − 45), and total =
+`traffic_delta`. `vap_table[].bw` is *not* required. The handler's `getInt("bw")` tolerates
+its absence.
+
+Then through openUF's own `assoctrack.poll` + `_send_notifs`: a success landed as
+`failure_reason: SUCCESS`, latency 1050 ms. A DHCP-request-without-lease landed as
+`failure_reason: DHCP_TIMEOUT`, `failure_stage: DHCP`, and the funnel's DHCP/DNS/Success
+ratios fell to 75 %.
+
+**Live, real controller (UCG Ultra), 2026-10-09.** After deploy and a Force Provision
+(which sets `notif_assoc_stat`), a Pixel 3 was deauthenticated on the Archer C5 and came
+back on the AX3000T. Within one heartbeat the funnel showed `total_attempts: 1`, all ratios
+100, `association_latency 10`, `authentication_latency 120`, `dhcp_latency 120`,
+`total_latency 320`, `failure_reason: SUCCESS`, filed under the AX3000T. The first attempt
+(an iPad, SAE) was lost to a device-only bug: OpenWrt's Lua (LNUM patch) formats `%d`
+through a 32-bit integer and raised on the millisecond `event_id`. Fixed with `%.0f`.
+
+**hostapd side, Archer C5 (OpenWrt 25.12, hostapd ubus), one deauth + reconnect:**
+
+    5905612.55 { "disassoc": {"address":"…","ifname":"phy1-ap0"} }
+    5905613.20 { "auth": {"address":"…","ifname":"phy1-ap0","target":"<bssid>","signal":-64,"freq":2412} }
+    5905613.25 { "assoc": {"address":"…","ifname":"phy1-ap0","target":"<bssid>","signal":-62,"freq":2412} }
+    5905613.32 { "sta-authorized": {"address":"…","ifname":"phy1-ap0","auth-alg":"open"} }
+
+These are subscriber notifications (`ubus subscribe`, not `listen`). `sta-authorized`
+coincides with `AP-STA-CONNECTED` and follows `EAPOL-4WAY-HS-COMPLETED`. `auth-alg` is the
+802.11 algorithm (`open` for WPA2-PSK, `ft` for a fast roam). Nothing past the handshake is
+visible to hostapd, so the DHCP/DNS evidence comes from nft (see USAGE.md).
+
+**nft facts this relies on**, checked with real frames through a veth bridge (lab, nft
+1.0.9, kernel 6.12):
+- `add @set { ether saddr }` on an existing element does **not** refresh its timeout: after
+  three more hits, `expires` had kept counting down and the per-element counter read 4.
+- Text listing prints `expires 1m52s974ms`; `-j` rounds it to whole seconds.
+- `destroy element` ignores a missing element (nft ≥ 1.0.8, kernel ≥ 6.3). Both APs run
+  nft 1.1.6 on 6.12.94 and accepted the full table in a dry run (`nft -c`).
+- A bare `nft -f` of a table body appends a second copy of every rule.
+  `table X` / `delete table X` / `table X { … }` in one file is idempotent.
+
 ---
 
 ## `system_cfg`: the real config channel

@@ -64,6 +64,7 @@ local roamassist = _require_sibling("roamassist")
 local sysconf   = _require_sibling("sysconf")
 local l2guard   = _require_sibling("l2guard")
 local airtime   = _require_sibling("airtime")
+local assoctrack = _require_sibling("assoctrack")
 
 local M = {}
 
@@ -87,6 +88,7 @@ M._roamassist = roamassist
 M._airtime    = airtime
 M._sysconf    = sysconf
 M._l2guard    = l2guard
+M._assoctrack = assoctrack
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -124,6 +126,19 @@ M.RRM_REQUEST_INTERVAL = 600
 -- exactly where it matters and the steady state costs nothing.
 M.RRM_COLLECTOR_CHECK_INTERVAL = 60
 M._rrm_collector_next = 0
+
+-- Connection tracking for the controller's WiFi Connectivity view (see
+-- assoctrack.lua). _vap_by_ifname maps a hostapd BSS netdev to the vap_table
+-- `name` the controller resolves an event's `vap` against -- refreshed by every
+-- build_json. _notif_identity is the device-identifying subset of the last
+-- payload, which every notif inform repeats: the lab controller accepted a
+-- notif carrying only these fields and filed its stats under this AP.
+M._vap_by_ifname     = {}
+M._notif_identity    = nil
+M._assoc_installed   = false
+-- Notif informs are one POST each. A burst of reconnects (an AP restart roams
+-- everybody back) is drained over a few cycles instead of in one.
+M.NOTIFS_PER_CYCLE   = 8
 
 -- Matches rrmscan.merge_into's own cutoff, which exists because the
 -- controller's rogue-AP ingestion silently drops any entry with age >= 30.
@@ -1261,6 +1276,7 @@ function M.build_json(st, cfg, ufhw)
 				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
 				if ok_sta then
 					local bss = ufuci.bss_ifname and ufuci.bss_ifname(ifname) or ifname
+					if vap.name then M._vap_by_ifname[bss] = vap.name end
 					if not caps_read[bss] and M._sysinfo.hostapd_sta_caps then
 						caps_read[bss] = true
 						local ok_c, c = pcall(M._sysinfo.hostapd_sta_caps, bss)
@@ -2016,6 +2032,14 @@ function M.build_json(st, cfg, ufhw)
 
 	if ufuci and ufuci.end_pass then ufuci.end_pass() end
 	if M._sysinfo.end_pass then M._sysinfo.end_pass() end
+	M._notif_identity = {
+		mac = payload.mac, serial = payload.serial, model = payload.model,
+		platform = payload.platform, hostname = payload.hostname, ip = payload.ip,
+		inform_url = payload.inform_url, cfgversion = payload.cfgversion,
+		version = payload.version, required_version = payload.required_version,
+		["default"] = payload["default"], state = payload.state,
+		locating = payload.locating, uptime = payload.uptime,
+	}
 	return M._fix_empty_arrays(cjson.encode(payload))
 end
 
@@ -3036,6 +3060,7 @@ local RECOGNIZED_SYSTEM_CFG = {
 
 local RECOGNIZED_MGMT_CFG = {
 	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
+	"^capability$",
 }
 
 -- Set from handle_response when cfg.config.debug_dump_file is on -- the
@@ -3162,6 +3187,16 @@ function M.handle_response(json_str, st, cfg)
 						-- breaking the inform loop for good (http-only builds have
 						-- no luasec, so switching to that https URL is fatal).
 						if v ~= "" then st.inform_url = v end
+					elseif k == "capability" then
+						-- "notif,notif-assoc-stat" from every 10.x controller:
+						-- the request for per-connection STA_ASSOC_TRACKER
+						-- notifs (assoctrack.lua). Only sent when asked.
+						local asked = ("," .. v .. ","):find(",notif-assoc-stat,", 1, true) ~= nil
+						-- A change re-arms the collector check now rather than
+						-- up to a minute later: a setparam is not an "applied"
+						-- push, so nothing else would.
+						if asked ~= (st.notif_assoc_stat == true) then M._rrm_collector_next = 0 end
+						st.notif_assoc_stat = asked
 					elseif k == "use_aes_gcm" then
 						st.use_gcm = (v == "true")
 					elseif k == "cfgversion" then
@@ -4023,10 +4058,39 @@ end
 -- Everything here is pcall-wrapped and best-effort: no hostapd, no ubus, no
 -- capable client and no answer are all ordinary outcomes, and none of them may
 -- interrupt an inform.
-function M._rrm_tick(cfg)
+-- Connection tracking runs only when the controller asked for it (mgmt_cfg
+-- capability notif-assoc-stat) and conf.lua has not switched it off.
+function M._assoc_enabled(st, cfg)
+	if not M._assoctrack or type(st) ~= "table" or st.notif_assoc_stat ~= true then
+		return false
+	end
+	return not (cfg and cfg.config and cfg.config.assoc_tracker == false)
+end
+
+-- Fold the drained collector lines into connection attempts and decide the
+-- ones that are complete. The nft listing is skipped while nobody is
+-- mid-connection, which is nearly every heartbeat.
+function M._assoc_poll(blob)
+	local at = M._assoctrack
+	at.ingest(at.parse_events(blob))
+	if next(at._stas) == nil then return end
+	local up = tonumber(((M._read_file("/proc/uptime") or ""):match("^(%S+)")))
+	if not up then return end
+	at.poll({
+		now = up, epoch = M._time(), sets = at.read_sets(up),
+		vap_by_ifname = M._vap_by_ifname,
+	})
+end
+
+-- The hostapd event collector serves two consumers: 802.11k enrichment
+-- (rrm_enrichment) and connection tracking. It runs while either wants it,
+-- and the file it fills is drained once per heartbeat for both.
+function M._rrm_tick(cfg, st)
 	local rrm = M._rrmscan
 	if not rrm then return false end
-	if not (cfg and cfg.config and cfg.config.rrm_enrichment) then
+	local rrm_on   = cfg and cfg.config and cfg.config.rrm_enrichment
+	local assoc_on = M._assoc_enabled(st, cfg)
+	if not rrm_on and not assoc_on then
 		-- Enrichment is off, but a collector from an earlier run with it ON may
 		-- still be alive: it is a detached `ubus subscribe` child reparented to
 		-- init, so it outlives both the config change and the daemon. Nothing
@@ -4044,6 +4108,10 @@ function M._rrm_tick(cfg)
 			M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
 			local ok_r, running = pcall(rrm.collector_running)
 			if ok_r and running then pcall(rrm.collector_stop) end
+			if M._assoc_installed then
+				pcall(M._assoctrack.teardown)
+				M._assoc_installed = false
+			end
 		end
 		return false
 	end
@@ -4055,10 +4123,30 @@ function M._rrm_tick(cfg)
 	local now = M._time()
 	if now >= M._rrm_collector_next then
 		M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
-		pcall(rrm.collector_ensure)
+		-- The table first: the collector's on_auth hook writes into it.
+		if assoc_on then
+			local ok_t, inst = pcall(M._assoctrack.ensure_table)
+			M._assoc_installed = (ok_t and inst) or M._assoc_installed
+		elseif M._assoc_installed then
+			pcall(M._assoctrack.teardown)
+			M._assoc_installed = false
+		end
+		pcall(rrm.collector_ensure,
+			assoc_on and {on_auth = M._assoctrack.forget_shell("m")} or nil)
 	end
 
-	local ok, fresh, reporters = pcall(rrm.harvest)
+	local blob
+	if rrm.drain then
+		local ok_d, b = pcall(rrm.drain)
+		if ok_d then blob = b end
+	end
+	if assoc_on then
+		local ok_a, err_a = pcall(M._assoc_poll, blob)
+		if not ok_a then io.stderr:write("inform: assoctrack: " .. tostring(err_a) .. "\n") end
+	end
+	if not rrm_on then return true end
+
+	local ok, fresh, reporters = pcall(rrm.harvest, blob)
 	if ok then
 		-- A station that answered is off the bench, whatever it reported.
 		for mac in pairs(reporters or {}) do M._rrm_asked[mac] = nil end
@@ -4317,6 +4405,35 @@ end
 -- crash loop every five seconds that reports no statistics and logs nothing
 -- beyond a traceback. A bad cycle now costs one heartbeat and one log line,
 -- and the next cycle gets another go.
+-- Send queued STA_ASSOC_TRACKER notifs, each as its own inform POST:
+-- inform_as_notif/notif_reason/notif_payload next to the device identity.
+-- The controller answers a bare noop (no interval) from its notif branch,
+-- before any stats or config handling -- so the reply is deliberately not
+-- fed to handle_response, which would read the missing interval as "back to
+-- the default cadence". A failed POST puts the rest back for next cycle.
+function M._send_notifs(st)
+	local at = M._assoctrack
+	if not at or not (st and st.adopted) or not M._notif_identity then return 0 end
+	local batch = at.take(M.NOTIFS_PER_CYCLE)
+	for i, p in ipairs(batch) do
+		local body = {}
+		for k, v in pairs(M._notif_identity) do body[k] = v end
+		body.time            = M._time()
+		body.inform_as_notif = true
+		body.notif_reason    = "event"
+		body.notif_payload   = p
+		local ok_p, pkt = pcall(M.build_packet, cjson.encode(body), st)
+		local resp = ok_p and M.http_post(st.inform_url, pkt) or nil
+		if not resp then
+			local rest = {}
+			for j = i, #batch do rest[#rest + 1] = batch[j] end
+			at.requeue(rest)
+			return i - 1
+		end
+	end
+	return #batch
+end
+
 function M._tick(st, cfg, ufhw, ctx)
 	-- base_interval is the device's own cadence; interval is what the loop
 	-- actually waits, which the controller's noop may have moved.
@@ -4327,7 +4444,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
 	-- Before build_json, so anything a client reported since the last cycle
 	-- rides out on THIS inform rather than waiting for the next.
-	pcall(M._rrm_tick, cfg)
+	pcall(M._rrm_tick, cfg, st)
 	-- The controller's nightly scan (syswrapper.sh 11k-scan), also before
 	-- build_json so the fresh scan dump is what this inform reports.
 	pcall(M._maybe_service_scan_request, cfg)
@@ -4377,6 +4494,10 @@ function M._tick(st, cfg, ufhw, ctx)
 		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
 		return ctx.interval
 	end
+	-- After the state inform, never instead of it: the controller has just
+	-- heard from this AP, and a notif from a device it considers lost is
+	-- discarded anyway.
+	if M._assoc_enabled(st, cfg) then pcall(M._send_notifs, st) end
 	-- The controller's requested cadence, or the device's own when the last
 	-- noop named none. The backoff was reset to the old cadence above, before
 	-- this response could move it; follow it here too, or the first failure

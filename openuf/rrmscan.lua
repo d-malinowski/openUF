@@ -59,6 +59,13 @@ M._popen = function(cmd)
 	return out
 end
 M._exec  = function(cmd) return os.execute(cmd) end
+M._read_file = function(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
 M._now   = function() return os.time() end
 
 -- Where the background collector parks hostapd's ubus notifications.
@@ -179,13 +186,68 @@ function M.hostapd_objects()
 	return objs
 end
 
+-- The collector, as a script rather than an inline command: it is a loop now,
+-- and quoting a loop through os.execute's sh -c is where bugs hide.
+--
+-- Every line is prefixed with /proc/uptime when it arrives, because a
+-- notification carries no timestamp of its own and assoctrack.lua measures
+-- connection stages from these (auth -> assoc -> authorized, ~40 and ~120 ms
+-- apart on the Archer C5). `read` and `printf` are ash builtins, so the loop
+-- forks nothing per line -- it runs for every probe request in range, a few
+-- per second.
+--
+-- opts.on_auth, when given, is a shell fragment run the moment an "auth"
+-- line arrives, with the station's MAC in $m. It exists for work that cannot
+-- wait for the next drain (see assoctrack.forget_shell). The MAC is checked
+-- for shape before it reaches the fragment.
+M.COLLECTOR_SCRIPT = "/tmp/openuf-collect.sh"
+
+function M.collector_script(opts)
+	opts = opts or {}
+	local lines = {
+		"#!/bin/sh",
+		"# openUF hostapd event collector -- written by rrmscan.lua, do not edit.",
+		'ubus subscribe "$@" | while IFS= read -r l; do',
+		"	read -r u _ < /proc/uptime",
+	}
+	if opts.on_auth then
+		lines[#lines + 1] = "	case \"$l\" in"
+		lines[#lines + 1] = "	*'{ \"auth\": {\"address\":\"'*)"
+		lines[#lines + 1] = "		m=${l#*'\"address\":\"'}; m=${m%%'\"'*}"
+		lines[#lines + 1] = "		case \"$m\" in"
+		lines[#lines + 1] = "		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:"
+			.. "[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) " .. opts.on_auth .. " ;;"
+		lines[#lines + 1] = "		esac ;;"
+		lines[#lines + 1] = "	esac"
+	end
+	lines[#lines + 1] = "	printf '%s %s\\n' \"$u\" \"$l\""
+	lines[#lines + 1] = "done"
+	return table.concat(lines, "\n") .. "\n"
+end
+
 -- (Re)start the collector across every current BSS. Safe to call on every
 -- cycle: it is a no-op while one is running.
-function M.collector_ensure()
-	if M.collector_running() then return false end
+--
+-- A running collector is only kept if it is THIS script, unchanged: one
+-- started by an older openUF (a bare `ubus subscribe >> file`, no
+-- timestamps) or with a different on_auth would otherwise survive the
+-- upgrade or the config change -- it is reparented to init -- and feed
+-- untimestamped lines until the next `wifi reload` happened to kill it.
+function M.collector_ensure(opts)
+	local want = M.collector_script(opts)
+	if M.collector_running() then
+		local have = M._read_file(M.COLLECTOR_SCRIPT)
+		local ours = (M._popen("pgrep -f '" .. M.COLLECTOR_SCRIPT .. "' 2>/dev/null") or ""):match("%d")
+		if have == want and ours then return false end
+		M.collector_stop()
+	end
 	local objs = M.hostapd_objects()
 	if #objs == 0 then return false end
-	M._exec("ubus subscribe " .. table.concat(objs, " ") ..
+	local f = io.open(M.COLLECTOR_SCRIPT, "w")
+	if not f then return false end
+	f:write(want)
+	f:close()
+	M._exec("sh " .. M.COLLECTOR_SCRIPT .. " " .. table.concat(objs, " ") ..
 		" >> " .. M.EVENT_FILE .. " 2>/dev/null &")
 	return true
 end
@@ -200,7 +262,7 @@ end
 function M.collector_stop()
 	M._exec("kill $(pgrep -f '[" .. SUBSCRIBE_MATCH:sub(1, 1) .. "]"
 		.. SUBSCRIBE_MATCH:sub(2) .. "') 2>/dev/null")
-	M._exec("rm -f " .. M.EVENT_FILE .. " 2>/dev/null")
+	M._exec("rm -f " .. M.EVENT_FILE .. " " .. M.COLLECTOR_SCRIPT .. " 2>/dev/null")
 end
 
 -- Drain the notification file into neighbour records.
@@ -214,13 +276,22 @@ end
 -- so a notification written between the read and the truncate is lost rather
 -- than corrupted -- acceptable for opportunistic enrichment, and the next
 -- request re-reports the same neighbourhood anyway.
-function M.harvest()
+function M.drain()
 	local f = io.open(M.EVENT_FILE, "r")
-	if not f then return {}, {} end
+	if not f then return nil end
 	local blob = f:read("*a") or ""
 	f:close()
 	local t = io.open(M.EVENT_FILE, "w")
 	if t then t:close() end
+	return blob
+end
+
+-- `blob` is what drain() returned; omitted, harvest drains the file itself.
+-- The caller passes it when another consumer (assoctrack) reads the same
+-- drain -- the file can only be emptied once.
+function M.harvest(blob)
+	if blob == nil then blob = M.drain() end
+	if not blob then return {}, {} end
 
 	local now, seen, out = M._now(), {}, {}
 	-- Every station that produced an ANSWER, alongside the neighbours it

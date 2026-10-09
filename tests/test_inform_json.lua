@@ -2624,4 +2624,23 @@ return {
 			assert_true(wired_macs["aa:bb:cc:dd:ee:02"], "the other bridge-learned host is still reported")
 		end
 	},
+	{
+		-- A connection event names its BSS by the hostapd netdev; the
+		-- controller resolves it against vap_table `name`. build_json is the
+		-- one place that knows both, so it records the mapping -- and the
+		-- device identity every notif inform repeats.
+		name = "build_json: records the BSS -> vap name map and the notif identity",
+		fn = function()
+			inform._vap_by_ifname, inform._notif_identity = {}, nil
+			local p = build({with_uci = true, with_clients = true, adopted = true})
+			assert_eq(inform._vap_by_ifname["wlan0"], "openuf_test", "wlan0 is the vap named openuf_test")
+			local id = inform._notif_identity
+			assert_true(type(id) == "table", "identity captured")
+			assert_eq(id.mac, p.mac, "same mac as the state inform")
+			assert_eq(id.model, p.model, "model")
+			assert_eq(id.version, p.version, "firmware version")
+			assert_eq(id.cfgversion, p.cfgversion, "cfgversion")
+			assert_eq(id.serial, p.serial, "serial")
+		end
+	},
 }

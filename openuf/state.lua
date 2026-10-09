@@ -93,6 +93,9 @@ M.FIELDS = {
 	-- Live kernel state, not UCI, so it is reapplied from here at startup the
 	-- way the blocked-client rules are.
 	led_enabled               = "boolean",
+	-- mgmt_cfg's capability list asked for STA_ASSOC_TRACKER notifs. Only
+	-- carried by setparam, so it has to outlive a restart.
+	notif_assoc_stat          = "boolean",
 	locating                  = "boolean",
 	locate_prev_trigger       = "string",
 	-- The per-port VLAN reversibility ledger: the stock `ports` strings of

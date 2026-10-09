@@ -70,6 +70,15 @@ config = {
 	-- is to keep the Environment tab honest, not to poll.
 	rrm_request_interval = 600,
 
+	-- WiFi Connectivity (controller: Insights -> AirView -> Connectivity): report
+	-- each client connection's Association / Authentication / DHCP / DNS stages,
+	-- the way a UniFi AP does, when the controller asks for them (it does). Reads
+	-- hostapd's connect events and installs one passive nft table
+	-- (`bridge openuf_assoc`) that only records first-seen DHCP/DNS frames per
+	-- station; it never drops or alters traffic. Set false to send nothing and
+	-- remove the table.
+	assoc_tracker = true,
+
 	-- Roaming Assistant (controller: WLAN -> Advanced, 5 GHz): how much louder,
 	-- in dB, another AP must hear a weak client before openUF moves it there.
 	-- The threshold itself comes from the controller.
