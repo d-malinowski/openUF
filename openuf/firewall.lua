@@ -61,6 +61,121 @@ function M.reconcile(blocked_macs)
 	return true
 end
 
+-- Injectable: run a command and return its output.
+M._read = function(cmd)
+	local p = io.popen(cmd)
+	if not p then return "" end
+	local out = p:read("*a") or ""
+	p:close()
+	return out
+end
+
+-- Injectable: a file's contents, or nil.
+M._read_file = function(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
+local function macs_in(text)
+	local out = {}
+	for line in (text or ""):gmatch("[^\n]+") do
+		local mac = line:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if mac then out[mac] = true end
+	end
+	return out
+end
+
+--[[
+	The refusal half of a block, as the UniFi firmware has it: the driver
+	refuses association from a blocked MAC (iwpriv addmac_blksta on every
+	user and guest VAP, re-applied whenever one comes up; firmware-confirmed
+	for 3.9.27 to 4.0.15). hostapd's equivalent is its deny ACL, which turns
+	away authentication and association and drops any station it already
+	has with that MAC. The nft drop stays as the backstop: hostapd checks
+	its accept list first, so a MAC filter in allow mode that lists a
+	blocked MAC still lets it associate.
+
+	The runtime list lives only in hostapd: a restart or a BSS reload
+	resets it to what the BSS's config file says (deny_mac_file, the
+	controller's MAC filter in deny mode). So the list is read back and
+	repaired on every call, and the caller keeps calling while anything is
+	blocked. Every runtime entry the config file doesn't list is taken to be
+	openUF's: nothing else on OpenWrt adds deny ACL entries at runtime
+	(usteer and DAWN ban through ubus). That makes the sync stateless, so an
+	unblock while openUF was not running is still cleaned up.
+
+	blocked: the MAC list; bsses: the AP BSS netdevs. Returns true when
+	another look is needed: a BSS that did not answer, or a change made that
+	the next call will read back.
+]]--
+function M.deny_sync(blocked, bsses)
+	local want = {}
+	for _, m in ipairs(blocked or {}) do
+		m = tostring(m):lower()
+		if is_mac(m) then want[m] = true end
+	end
+	local names = {}
+	for _, b in ipairs(bsses or {}) do
+		if type(b) == "string" and b:match("^[%w%._%-]+$") then names[#names + 1] = b end
+	end
+	if #names == 0 then return next(want) ~= nil end
+
+	local script = {}
+	for _, b in ipairs(names) do
+		script[#script + 1] = "echo '@ " .. b .. "'; hostapd_cli -i " .. b
+			.. " deny_acl SHOW 2>/dev/null || echo FAIL"
+	end
+	script[#script + 1] = "echo '@'; for f in /var/run/hostapd-*.conf; do"
+		.. " grep -E '^(interface|bss|deny_mac_file)=' \"$f\"; done 2>/dev/null"
+	local shown, failed, deny_file = {}, {}, {}
+	local cur, conf_bss
+	for line in M._read(table.concat(script, "; ")):gmatch("[^\n]+") do
+		local marker = line:match("^@ ?(.*)$")
+		if marker then
+			cur = marker ~= "" and marker or nil
+			if cur then shown[cur] = {} end
+		elseif cur then
+			if line:match("^FAIL") then failed[cur] = true
+			else
+				local mac = line:lower():match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+				if mac then shown[cur][mac] = true end
+			end
+		else
+			local key, val = line:match("^([%w_]+)=(.*)$")
+			if key == "interface" or key == "bss" then conf_bss = val
+			elseif key == "deny_mac_file" and conf_bss then deny_file[conf_bss] = val end
+		end
+	end
+
+	local cmds, again = {}, false
+	for _, b in ipairs(names) do
+		if failed[b] or not shown[b] then
+			again = true
+		else
+			local keep = deny_file[b] and macs_in(M._read_file(deny_file[b])) or {}
+			for m in pairs(want) do
+				if not shown[b][m] then
+					cmds[#cmds + 1] = "hostapd_cli -i " .. b .. " deny_acl ADD_MAC " .. m
+				end
+			end
+			for m in pairs(shown[b]) do
+				if not want[m] and not keep[m] then
+					cmds[#cmds + 1] = "hostapd_cli -i " .. b .. " deny_acl DEL_MAC " .. m
+				end
+			end
+		end
+	end
+	if #cmds > 0 then
+		table.sort(cmds)
+		M._exec("{ " .. table.concat(cmds, "; ") .. "; } >/dev/null 2>&1")
+		again = true
+	end
+	return again
+end
+
 -- Immediately kick mac if it's currently associated to any of the given
 -- wireless interfaces (ifnames), on top of the nft drop rule from
 -- M.reconcile -- the drop rule alone stops future traffic, but a station

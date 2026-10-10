@@ -3518,6 +3518,7 @@ function M.handle_response(json_str, st, cfg)
 		st.mac, st.ip, st.hostname = mac, ip, hostname
 		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 		M._firewall.reconcile(st.blocked_stas)
+		M._deny_pending = true
 		M._forget_controller()
 		return false
 	end
@@ -3599,9 +3600,12 @@ function M.handle_response(json_str, st, cfg)
 				end
 				M._state.save(st)
 				M._firewall.reconcile(st.blocked_stas)
+				M._deny_pending = true
+				pcall(M._block_resync, st)
 				if cmd == "block-sta" then
 					-- Kick it immediately if it's currently associated --
-					-- the nft drop rule alone stops future traffic, but
+					-- hostapd drops it on the deny ACL entry, but only where
+					-- that took; the nft drop alone stops future traffic and
 					-- doesn't tear down an existing association.
 					M._firewall.deauth(mac, M._bss_ifnames())
 				end
@@ -4046,6 +4050,8 @@ function M._sync_blocked_stas(st, raw)
 	if not changed then return false end
 	st.blocked_stas = list
 	M._firewall.reconcile(list)
+	M._deny_pending = true
+	pcall(M._block_resync, st)
 	local ifnames
 	for _, m in ipairs(list) do
 		if not have[m] then
@@ -4053,6 +4059,18 @@ function M._sync_blocked_stas(st, raw)
 			M._firewall.deauth(m, ifnames)
 		end
 	end
+	return true
+end
+
+-- A block's refusal in hostapd (firewall.deny_sync): repaired every tick
+-- while anything is blocked, since a hostapd restart or a BSS reload loses
+-- it, and until a pass finds nothing left to clean once the list is empty.
+-- Pending at startup, so entries from before a restart get looked at.
+M._deny_pending = true
+function M._block_resync(st)
+	local list = st and st.blocked_stas or {}
+	if #list == 0 and not M._deny_pending then return false end
+	M._deny_pending = M._firewall.deny_sync(list, M._bss_ifnames())
 	return true
 end
 
@@ -4266,6 +4284,7 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	st.mac, st.ip, st.hostname = mac, ip, hostname
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	M._firewall.reconcile(st.blocked_stas)
+	M._deny_pending = true
 	if was_adopted and not st.adopted then M._forget_controller() end
 	return mtime
 end
@@ -4852,6 +4871,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._guest_resync, st)
 	pcall(M._hairpin_resync)
 	pcall(M._usteer_filter_resync)
+	pcall(M._block_resync, st)
 
 	-- Reported as spectrum_scanning = true by this inform; swept below.
 	local spectrum_due = M._spectrum_pending

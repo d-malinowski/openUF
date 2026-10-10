@@ -607,6 +607,61 @@ netdevs folded into their BSS). Until 2026-10 the block deauth went to
 `get_ifname_for_radio`, which is the first interface of each radio only. On the Archer C5,
 radio1 carries `phy1-ap0` and `phy1-ap1`, so a client on the second SSID was never kicked.
 
+#### A block refuses association (hostapd deny ACL, 2026-10-10)
+
+What the firmware does (`/usr/etc/syswrapper.sh` `block-sta`/`unblock-sta`/`apply-blocked-sta`
+and `/usr/etc/platdep_funcs.sh`, firmware-confirmed for 3.9.27 to 4.0.15):
+- `block-sta` runs `driver_kick_block_sta`: on every VAP that `is_vap_user_or_guest` (no
+  mesh uplink/downlink), `iwpriv $ath addmac_blksta <mac>` and then `kickmac`. The MAC goes into
+  `/etc/persistent/cfg/blocked_sta`.
+- `unblock-sta` removes it from that file, then `delmac_blksta` on the same VAPs.
+- `apply-blocked-sta` (and `-ifup` for one VAP coming up) clears the driver list
+  (`maccmd_blksta 3`) and adds every MAC in the file again. The driver list doesn't survive
+  a VAP going down, so the firmware rebuilds it.
+- No ebtables or iptables rule is involved. The block is the driver refusing the station.
+
+Before this, openUF only dropped the client's frames in nft and deauthed it once. The client
+could associate again at once, complete EAPOL, and sit on the SSID with no traffic.
+
+openUF now also puts every blocked MAC into hostapd's **deny ACL** on every AP-mode BSS
+(`firewall.deny_sync`, `hostapd_cli -i <bss> deny_acl ADD_MAC|DEL_MAC`). hostapd rejects
+authentication and association from a MAC on that list, and it disassociates a station that
+is already connected when its MAC is added.
+- **Re-applied every tick.** The runtime list lives only in hostapd. Per hostapd's source,
+  a restart or a BSS reload resets it to the BSS's config file. So while anything is blocked,
+  every inform tick reads each BSS's list (`deny_acl SHOW`) and adds what's missing. Once
+  the list is empty, it keeps checking until a pass finds nothing left to remove, and it
+  checks once at startup.
+- **Stateless.** Any runtime entry the BSS's own `deny_mac_file` doesn't list is taken to be
+  openUF's and is removed on unblock. The file is the controller's MAC filter in deny mode
+  (`macfilter=deny`, `/var/run/hostapd-<bss>.maclist`). Its entries stay, so unblocking a
+  MAC that the filter also denies doesn't open that SSID to it. Nothing else on OpenWrt adds
+  deny ACL entries at runtime: usteer and DAWN ban through ubus.
+- **nft stays as the backstop.** hostapd checks its accept list before its deny list. A MAC
+  filter in allow mode that lists a blocked MAC still lets it associate. The nft drop then
+  keeps it off the network, as before.
+- `hostapd_cli` exits 0 when hostapd answers `FAIL` and 255 when the BSS has no control
+  socket. Both count as "unknown", so no command is sent and the next tick tries again.
+
+Verified:
+- **Unit tests.** 18 mutants across `firewall.lua` and `inform.lua` (add, remove, keep the
+  file's entries, `bss=` sections, FAIL, no output, MAC and name validation, the tick hook,
+  startup pending, reset and reload) all failed a test.
+- **Lab** (10.4.57, no hostapd). REST `block-sta`/`unblock-sta` of `00:00:5e:00:53:01` put
+  it into the ledger and nft and took it out again. 0 `handle_response failed`.
+- **Hardware**, both APs (OpenWrt 25.12.5, wpad). The deployed `firewall.lua` was run
+  against live hostapd with the documentation MAC `00:00:5e:00:53:01`:
+
+  | Step | What happened |
+  |---|---|
+  | add | The MAC appeared on every BSS: `phy0-ap0 phy1-ap0 phy1-ap1` on the Archer C5, `phy0-ap0 phy0-ap1 phy1-ap0` on the AX3000T, each as `… VLAN_ID=0` |
+  | again | Nothing to do |
+  | `DEL_MAC` by hand on `phy1-ap1` | The next pass put it back |
+  | unblock | Removed from every BSS |
+
+  One pass took 0.15 s on the Archer, including loading the modules.
+- **Not seen on hardware.** A real blocked client being refused. That needs a named device.
+
 #### Every `cmd` the controller can queue to a device (10.4.57 audit, 2026-10-09)
 
 I found these by decompiling every `com.ubnt.service` class that references `"cmd"` and
@@ -3211,7 +3266,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 16 | Set Replacement Device / Load Configuration | **None** — controller-side Mongo document clone (`commonDeviceCloneConfigService`), then an ordinary adopt + `setparam` | ✅ Both confirmed live; zero product code needed. Replacement auto-adopts the target ~50 s after the source goes away. |
 | 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port. Extended 2026-09-12: each socket is asked about its OWN bridge, a socket whose MAC learning is off is served by the `bridge openuf_learn` nft tap, and rows carry `vlan` (+ a tap-harvested `ip`) — which is what puts the client on the right **network**, not just the right port. See [`mac_table[].vlan`](#mac_tablevlan--how-a-wired-client-gets-its-network) |
 | 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
-| 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"`, plus `setparam` `blocked_sta` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). The `blocked_sta` list (2026-10-09) is newline-separated and site-wide; `""` clears it (see Response `_type`s) |
+| 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"`, plus `setparam` `blocked_sta` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. Since 2026-10-10 a block also puts the MAC into hostapd's deny ACL on every BSS, so the client is refused rather than let back on with no traffic; the list is confirmed in live hostapd on both APs, but a refused real client has not been observed (see [A block refuses association](#a-block-refuses-association-hostapd-deny-acl-2026-10-10)). The `blocked_sta` list (2026-10-09) is newline-separated and site-wide; `""` clears it (see Response `_type`s) |
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` (+ 802.11k `rrm_beacon_req`) | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls), and ✅ **confirmed rendering** in the live Environment tab 2026-09-02 (AX3000T): the 30-minute window listed exactly the BSSes in that AP's own scan cache, with matching signals, and the spectrum chart drew them alongside `This AP`. Note what the `scan dump` source can and cannot see: the cache is filled **passively, from beacons the radio overhears on the channel it is already parked on**, so the list is neighbours on/adjacent to the operating channel and nothing else — 6 entries on a 2.4 GHz radio on ch 11, exactly 1 on a 5 GHz radio on ch 44. That is the deliberate trade for never dwelling off-channel. ✅ Closed 2026-09-02 with 802.11k client-assisted enrichment (`openuf/rrmscan.lua`) -- Ubiquiti's own Channel AI mechanism -- which took a 5 GHz radio's list from **0 neighbours to 4** without the AP leaving its channel; see [the section above](#enriching-it-without-scanning--80211k-beacon-reports). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |
 | 22 | Radios tab Avg. Signal / Interference / Airtime / MIMO | `vap_table.avg_client_signal`; `radio_table.athstats`; `radio_table.radio_caps` | ✅ All four confirmed live on a fresh reset (`-64`/`-50 dBm`, `3%`, `7%`, `2x2`), with bidirectional filter behavior verified |

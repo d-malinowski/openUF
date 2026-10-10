@@ -14,6 +14,36 @@ local function with_capture(fn)
 	firewall._exec = orig
 end
 
+-- A hostapd for deny_sync: per BSS, what `deny_acl SHOW` prints (absent =
+-- no control socket, so hostapd_cli fails), the grep of the hostapd
+-- configs, and the deny files. Captures the script read and every exec.
+local function fake_hostapd(shows, confs, files)
+	local r = {execs = {}, script = ""}
+	local orig = {firewall._read, firewall._exec, firewall._read_file}
+	firewall._read = function(cmd)
+		r.script = cmd
+		local out = {}
+		for b in cmd:gmatch("echo '@ ([^']+)'") do
+			out[#out + 1] = "@ " .. b
+			out[#out + 1] = shows[b] or "FAIL"
+		end
+		out[#out + 1] = "@"
+		out[#out + 1] = confs or ""
+		return table.concat(out, "\n")
+	end
+	firewall._exec = function(cmd) r.execs[#r.execs + 1] = cmd; return true end
+	firewall._read_file = function(path) return (files or {})[path] end
+	function r.restore() firewall._read, firewall._exec, firewall._read_file = orig[1], orig[2], orig[3] end
+	function r.cmds()
+		local out = {}
+		for _, e in ipairs(r.execs) do
+			for c in e:gmatch("hostapd_cli [^;}]-%x%x:%x%x:%x%x:%x%x:%x%x:%x%x") do out[#out + 1] = c end
+		end
+		return out
+	end
+	return r
+end
+
 return {
 	{
 		name = "firewall: reconcile with an empty list still (re)creates the table/set/chain",
@@ -110,6 +140,88 @@ return {
 			assert_true(all:find("hostapd_cli") == nil, "deauth refuses a non-MAC outright")
 			assert_false(ok_deauth, "and says so")
 			assert_true(table.concat(logged):find("malformed") ~= nil, "each drop is logged")
+		end
+	},
+	{
+		name = "firewall: deny_sync adds each blocked MAC to every BSS's hostapd deny list",
+		fn = function()
+			local r = fake_hostapd({["phy0-ap0"] = "", ["phy1-ap0"] = "aa:bb:cc:dd:ee:01 VLAN_ID=0\n"})
+			local again = firewall.deny_sync({"AA:BB:CC:DD:EE:01", "aa:bb:cc:dd:ee:02", "junk"},
+				{"phy0-ap0", "phy1-ap0"})
+			r.restore()
+			assert_eq(#r.execs, 1, "every change in one shell")
+			local cmds = r.cmds()
+			assert_eq(table.concat(cmds, "\n"), table.concat({
+				"hostapd_cli -i phy0-ap0 deny_acl ADD_MAC aa:bb:cc:dd:ee:01",
+				"hostapd_cli -i phy0-ap0 deny_acl ADD_MAC aa:bb:cc:dd:ee:02",
+				"hostapd_cli -i phy1-ap0 deny_acl ADD_MAC aa:bb:cc:dd:ee:02",
+			}, "\n"), "lowercased; only what each BSS lacks")
+			assert_true(r.execs[1]:find("junk", 1, true) == nil, "the junk entry never reaches the shell")
+			assert_true(again, "a change was made: look again next time")
+		end
+	},
+	{
+		name = "firewall: deny_sync changes nothing when hostapd already has the list",
+		fn = function()
+			local r = fake_hostapd({["phy0-ap0"] = "aa:bb:cc:dd:ee:01 VLAN_ID=0\n"})
+			local again = firewall.deny_sync({"aa:bb:cc:dd:ee:01"}, {"phy0-ap0"})
+			r.restore()
+			assert_eq(#r.execs, 0, "nothing to run")
+			assert_false(again, "nothing to look at again")
+		end
+	},
+	{
+		name = "firewall: deny_sync removes an unblocked MAC but keeps the BSS's own MAC filter entries",
+		fn = function()
+			-- phy0-ap0 runs the controller's MAC filter in deny mode: its
+			-- file lists :03, which an unblock must not take off. phy1-ap0
+			-- has no deny file, so its :03 is openUF's and goes. The file
+			-- of another BSS protects nothing here.
+			local r = fake_hostapd({
+				["phy0-ap0"] = "aa:bb:cc:dd:ee:01 VLAN_ID=0\naa:bb:cc:dd:ee:03 VLAN_ID=0\n",
+				["phy1-ap0"] = "aa:bb:cc:dd:ee:01 VLAN_ID=0\naa:bb:cc:dd:ee:03 VLAN_ID=0\n",
+			}, "interface=phy0-ap0\ndeny_mac_file=/var/run/hostapd-phy0-ap0.maclist\n"
+				.. "interface=phy1-ap0\nbss=phy1-ap1\ndeny_mac_file=/var/run/hostapd-phy1-ap1.maclist\n",
+				{["/var/run/hostapd-phy0-ap0.maclist"] = "AA:BB:CC:DD:EE:03\n",
+				 ["/var/run/hostapd-phy1-ap1.maclist"] = "aa:bb:cc:dd:ee:03\n"})
+			local again = firewall.deny_sync({}, {"phy0-ap0", "phy1-ap0"})
+			r.restore()
+			assert_eq(table.concat(r.cmds(), "\n"), table.concat({
+				"hostapd_cli -i phy0-ap0 deny_acl DEL_MAC aa:bb:cc:dd:ee:01",
+				"hostapd_cli -i phy1-ap0 deny_acl DEL_MAC aa:bb:cc:dd:ee:01",
+				"hostapd_cli -i phy1-ap0 deny_acl DEL_MAC aa:bb:cc:dd:ee:03",
+			}, "\n"), "only runtime entries the BSS's own config file doesn't list")
+			assert_true(again, "read back next time")
+		end
+	},
+	{
+		name = "firewall: deny_sync skips a BSS hostapd doesn't answer for and asks to be called again",
+		fn = function()
+			local r = fake_hostapd({["phy0-ap0"] = "FAIL\n"})
+			local again = firewall.deny_sync({"aa:bb:cc:dd:ee:01"}, {"phy0-ap0", "phy1-ap0"})
+			r.restore()
+			assert_eq(#r.execs, 0, "no command for a BSS whose list is unknown")
+			assert_true(again, "try again later")
+			local r2 = fake_hostapd({})
+			firewall._read = function() return "" end
+			assert_true(firewall.deny_sync({"aa:bb:cc:dd:ee:01"}, {"phy0-ap0"}),
+				"no output at all (the shell never ran): again, and no error")
+			assert_eq(#r2.execs, 0, "and nothing run blind")
+			assert_false(firewall.deny_sync({}, {}), "no BSS and nothing blocked: done")
+			assert_true(firewall.deny_sync({"aa:bb:cc:dd:ee:01"}, {}), "no BSS yet but something blocked: again")
+			r2.restore()
+		end
+	},
+	{
+		name = "firewall: deny_sync never splices a bad BSS name into the shell",
+		fn = function()
+			local r = fake_hostapd({["phy0-ap0"] = ""})
+			firewall.deny_sync({"aa:bb:cc:dd:ee:01"}, {"phy0-ap0", "x; reboot", "$(id)"})
+			r.restore()
+			local all = r.script .. table.concat(r.execs, "\n")
+			assert_true(all:find("reboot", 1, true) == nil, "the injected name is dropped")
+			assert_true(all:find("$(id)", 1, true) == nil, "and so is the substitution")
+			assert_contains(all, "-i phy0-ap0 deny_acl ADD_MAC", "the real BSS is still synced")
 		end
 	},
 }

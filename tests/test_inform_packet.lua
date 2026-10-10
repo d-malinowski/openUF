@@ -17,6 +17,7 @@ inform._state._state_file = "/tmp/openuf_test_inform.json"
 inform._firewall = {
 	reconcile = function() end,
 	deauth = function() end,
+	deny_sync = function() return false end,
 }
 -- Same for the controller's L2 hardening (nft) and system settings (UCI
 -- system, root's crontab); the tests that exercise them stub their own.
@@ -2762,12 +2763,20 @@ return {
 		name = "inform packet: handle_response cmd block-sta adds the MAC, persists, reconciles, and deauths",
 		fn = function()
 			local st = sample_state()
-			local reconciled, deauthed
+			local reconciled, deauthed, denied
+			local order = {}
 			inform._firewall = {
 				reconcile = function(macs) reconciled = macs end,
-				deauth = function(mac, ifnames) deauthed = {mac = mac, ifnames = ifnames} end,
+				deauth = function(mac, ifnames)
+					deauthed = {mac = mac, ifnames = ifnames}; order[#order + 1] = "deauth"
+				end,
+				deny_sync = function(macs, bsses)
+					denied = {macs = macs, bsses = bsses}; order[#order + 1] = "deny"
+					return false
+				end,
 			}
 			inform._ucihelper = bss_mock()
+			inform._deny_pending = false
 			local result = inform.handle_response(
 				'{"_type":"cmd","cmd":"block-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
 			inform._firewall = { reconcile = function() end, deauth = function() end }
@@ -2781,6 +2790,11 @@ return {
 			-- the home SSID, and its VLAN netdev folds into its own BSS.
 			assert_eq(table.concat(deauthed.ifnames, ","), "phy0-ap0,phy0-ap1,phy1-ap0",
 				"deauth issued on every BSS, VLAN netdevs folded into theirs")
+			-- The refusal goes into hostapd before the deauth, so the client
+			-- has no gap to reassociate in.
+			assert_eq(table.concat(denied.macs, ","), "aa:bb:cc:dd:ee:01", "hostapd's deny list gets the MAC")
+			assert_eq(table.concat(denied.bsses, ","), "phy0-ap0,phy0-ap1,phy1-ap0", "on every BSS")
+			assert_eq(table.concat(order, ","), "deny,deauth", "refused before it is kicked")
 			assert_true(result, "re-inform immediately after executing a command")
 		end
 	},
@@ -2798,14 +2812,20 @@ return {
 		name = "inform packet: handle_response cmd unblock-sta removes the MAC and reconciles",
 		fn = function()
 			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}})
-			local reconciled
+			local reconciled, denied
 			inform._firewall = {
 				reconcile = function(macs) reconciled = macs end,
 				deauth = function() end,
+				deny_sync = function(macs) denied = macs; return true end,
 			}
+			inform._deny_pending = false
 			local result = inform.handle_response(
 				'{"_type":"cmd","cmd":"unblock-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
 			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_eq(table.concat(denied or {}, ","), "aa:bb:cc:dd:ee:02",
+				"hostapd's deny list is synced to what is still blocked")
+			assert_true(inform._deny_pending, "and looked at again next tick, as deny_sync asked")
+			inform._deny_pending = false
 			assert_eq(#st.blocked_stas, 1, "one MAC remains")
 			assert_eq(st.blocked_stas[1], "aa:bb:cc:dd:ee:02", "the other MAC is untouched")
 			assert_eq(#reconciled, 1, "reconcile called with the updated (shorter) list")
@@ -2989,14 +3009,17 @@ return {
 			-- The wire form captured from 10.4.57: the site's blocked
 			-- clients joined with "\n", beside system_cfg/mgmt_cfg.
 			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:09"}})
-			local reconciled, deauthed = nil, {}
+			local reconciled, deauthed, denied = nil, {}, nil
 			inform._firewall = {
 				reconcile = function(macs) reconciled = macs end,
 				deauth = function(mac, ifnames) deauthed[#deauthed + 1] = mac .. "@" .. table.concat(ifnames, ",") end,
+				deny_sync = function(macs) denied = table.concat(macs, ","); return false end,
 			}
 			inform._ucihelper = bss_mock()
+			inform._deny_pending = false
 			local result = inform.handle_response(cjson.encode({_type = "setparam",
 				blocked_sta = "aa:bb:cc:dd:ee:01\nAA:BB:CC:DD:EE:02"}), st)
+			assert_eq(denied, "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02", "hostapd's deny list follows the new list")
 			inform._firewall = { reconcile = function() end, deauth = function() end }
 			inform._ucihelper = nil
 			assert_eq(table.concat(st.blocked_stas, ","), "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02",
@@ -3006,6 +3029,46 @@ return {
 			assert_eq(table.concat(deauthed, " "), "aa:bb:cc:dd:ee:02@phy0-ap0,phy0-ap1,phy1-ap0",
 				"only the newly blocked MAC is deauthed, on every BSS")
 			assert_false(result, "a plain setparam does not re-inform")
+		end
+	},
+	{
+		name = "inform packet: a fresh start looks at hostapd's deny lists once even with nothing blocked",
+		fn = function()
+			-- An unblock that happened while openUF was down (state.json
+			-- edited, a reset) leaves hostapd refusing the MAC: the first
+			-- tick cleans it up.
+			local fresh = dofile("openuf/inform.lua")
+			assert_true(fresh._deny_pending, "pending from the start")
+		end
+	},
+	{
+		name = "inform packet: _block_resync repairs hostapd every tick while anything is blocked",
+		fn = function()
+			-- hostapd's deny list is runtime-only: a hostapd restart or a BSS
+			-- reload empties it, so it is read back and repaired every tick
+			-- while the ledger is non-empty, and until a pass finds nothing
+			-- left to clean once it is empty.
+			local calls, answer = {}, false
+			inform._firewall = {reconcile = function() end, deauth = function() end,
+				deny_sync = function(macs, bsses)
+					calls[#calls + 1] = table.concat(macs, ",") .. "@" .. table.concat(bsses, ",")
+					return answer
+				end}
+			inform._ucihelper = bss_mock()
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
+			inform._deny_pending = false
+			assert_true(inform._block_resync(st), "a blocked MAC: synced")
+			answer = true
+			assert_true(inform._block_resync(st), "and again next tick, though nothing was pending")
+			assert_eq(calls[1], "aa:bb:cc:dd:ee:01@phy0-ap0,phy0-ap1,phy1-ap0", "on every BSS")
+			st.blocked_stas = {}
+			assert_true(inform._block_resync(st), "empty but pending from the last pass: synced")
+			answer = false
+			assert_true(inform._block_resync(st), "still pending (that pass changed something): synced")
+			assert_false(inform._block_resync(st), "a clean pass: nothing more to do")
+			assert_eq(#calls, 4, "no call once clean")
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
 		end
 	},
 	{
@@ -3704,6 +3767,11 @@ return {
 			inform.parse_packet = function() return table.remove(responses, 1) end
 			inform._run_spectrum_scan = function() events[#events + 1] = "sweep" end
 			inform._spectrum_pending = false
+			-- Startup leaves hostapd's deny lists to look at; the tick does it.
+			local orig_fw = inform._firewall
+			inform._firewall = {reconcile = function() end, deauth = function() end,
+				deny_sync = function() events[#events + 1] = "deny"; return false end}
+			inform._deny_pending = true
 
 			local ctx = {interval = 10, backoff = 10}
 			local st = {inform_url = "http://unifi:8080/inform"}
@@ -3718,7 +3786,10 @@ return {
 				orig.build_json, orig.build_packet, orig.http_post, orig.parse_packet,
 				orig.handle_response, orig.scan, orig.reload, orig.rrm
 			inform._spectrum_pending = false
+			inform._firewall = orig_fw
 			if not ok then error(err, 0) end
+			assert_eq(events[1], "deny", "the tick syncs hostapd's deny lists before informing")
+			table.remove(events, 1)
 			assert_eq(table.concat(events, ", "),
 				"inform scanning=false, inform scanning=true, sweep, inform scanning=false",
 				"true is reported before the sweep, false after it")
@@ -4138,10 +4209,13 @@ return {
 
 			-- 1. The controller's setdefault.
 			inform._controller_interval = 300
+			inform._deny_pending = false
 			local ok, err = pcall(inform.handle_response, '{"_type":"setdefault"}',
 				sample_state({adopted = true, l2guard = {bpdu = true, tagdrop = true, ifnames = {"x"}}}),
 				{config = {}})
 			local interval_after_setdefault = inform._controller_interval
+			local deny_after_setdefault = inform._deny_pending
+			inform._deny_pending = false
 
 			-- 2. An out-of-process reset-inform, seen through the state-file reload.
 			inform._controller_interval = 300
@@ -4150,6 +4224,8 @@ return {
 			local st = sample_state({adopted = true, l2guard = {bpdu = true, tagdrop = true, ifnames = {"x"}}})
 			inform._reload_if_changed(st, {config = {}}, "before")
 			local interval_after_reset = inform._controller_interval
+			local deny_after_reset = inform._deny_pending
+			inform._deny_pending = false
 			-- 3. A reload that stays adopted forgets nothing.
 			inform._controller_interval = 300
 			inform._state.load = function() return {adopted = true} end
@@ -4170,6 +4246,8 @@ return {
 			assert_nil(interval_after_setdefault, "the controller's interval is forgotten")
 			assert_nil(interval_after_reset, "on both paths")
 			assert_eq(interval_kept, 300, "a reload that stays adopted keeps it")
+			assert_true(deny_after_setdefault, "the block ledger is gone: hostapd's deny lists get cleaned")
+			assert_true(deny_after_reset, "on both paths")
 		end
 	},
 	{
