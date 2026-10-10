@@ -618,7 +618,7 @@ meaning on an AP:
 
 | Relevant to an AP | Not for an AP / correctly ignored |
 |---|---|
-| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest` (handled: guest ledger + portal enforcement, lab-validated only) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update` (`ul_max`, `ul_min`, `dl_max`, `dl_min`; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `dl_max`; handled: guest ledger + portal enforcement + per-guest limit, lab-validated only; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update`'s `ul_min`, `dl_min` (a 64 kbps floor, not applied) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 
@@ -852,6 +852,32 @@ VAP's bridge.
 | `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above (openUF: into `st.guest_authorized`). A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
 | `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above |
 | `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per authorization (`qos_policy_applied` latch), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's user group rate is sent instead (same sender) |
+
+**`rate-update`, openUF's answer (C3, lab-validated only, 2026-10-10).** A REST
+`authorize-guest` with `"up":2048,"down":4096` for a mock station brought, on the next
+inform, `authorize-guest` and then
+`{"cmd":"rate-update","mac":"de:ad:be:ef:00:02","ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}`,
+in that order. The values are the REST `up`/`down` unchanged, so they are kbps.
+openUF keeps `ul_max`/`dl_max` in `st.guest_rates` for an authorized MAC only (dropped
+on `unauthorize-guest`; `-1` = no limit that way). It polices them in `bridge
+openuf_guest`: `rate_up` (`ether saddr <mac> limit rate over <kbps×125> bytes/second … drop`)
+is jumped before `guestin`, and `rate_down` (`ether daddr`) before `guestout`. They are
+not queued, because the VAP's tc root qdisc belongs to the per-WLAN speed limit (`shaper.lua`).
+Lab:
+- Full loop with `up:1024, down:3072`: the ledger got the limits and both chains got the rules.
+  They were rebuilt from `state.json` after an inform restart, and removed by the next
+  `unauthorize-guest`.
+- Data path, with the fake guest above limited to 2048 / 4096 kbps, using iperf3 through the
+  bridge to the fake gateway:
+
+  | Test | Limit | Result |
+  |---|---|---|
+  | TCP upload, 20 s | 2048 kbps | 2097 kbps |
+  | TCP download, 20 s | 4096 kbps | 4246 kbps |
+  | UDP flood, 10 Mbit/s offered | 2048 kbps | 2448 kbps passed (75 % dropped) |
+  | Rules flushed (baseline) | none | ~33 Gbit/s |
+
+`ul_min`/`dl_min` (64 kbps guaranteed) are not applied, since policing cannot guarantee a minimum.
 
 `mgmt_cfg` carries `selfrun_guest_mode=pass` in **every** push, guest WLAN or not. Its
 source is the site property `config.selfrun_guest_mode`, and any value other than `pass`

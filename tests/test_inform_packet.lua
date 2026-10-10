@@ -4688,8 +4688,8 @@ return {
 			inform._guestportal = {
 				parse = real.parse, is_guest_rule = real.is_guest_rule, PORT = real.PORT,
 				bridge_mac = function(ifname) return ifname == "phy0-ap1" and "02:00:00:00:00:aa" or nil end,
-				reconcile = function(spec, vaps, macs)
-					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs}
+				reconcile = function(spec, vaps, macs, rates)
+					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs, rates = rates}
 					return 1
 				end,
 				listen = function()
@@ -4713,7 +4713,8 @@ return {
 					st, {net = {lan_cpueth = "eth0"}})
 			end
 			local ok, err = pcall(function()
-				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1},
+					guest_rates = {["de:ad:be:ef:00:02"] = {up = 2048}, ["de:ad:be:ef:00:09"] = {up = 1}}})
 				push(st, "enabled")
 				assert_true(st.guest_portal and st.guest_portal.enabled, "the portal's facts kept")
 				assert_eq(st.guest_portal.unknown, nil, "the report is not persisted")
@@ -4724,6 +4725,8 @@ return {
 				assert_eq(#r.vaps, 2, "both guest netdevs")
 				assert_eq(r.vaps[1].bridge_mac, "02:00:00:00:00:aa", "with their bridge MAC")
 				assert_eq(table.concat(r.macs, ","), "de:ad:be:ef:00:02", "and the ledger")
+				assert_eq(#r.rates, 1, "and the rate limits of authorized guests only")
+				assert_eq(r.rates[1].up, 2048, "kbps as received")
 				assert_eq(calls.listen, 1, "listening")
 				assert_eq(inform._guest_ctx.url, "http://192.0.2.2:8880/guest/s/default/", "the answer's target")
 				local token = st.guest_token
@@ -4761,6 +4764,51 @@ return {
 					"the whole ledger, sorted")
 				inform.handle_response('{"_type":"cmd","cmd":"unauthorize-guest","mac":"de:ad:be:ef:00:02"}', st)
 				assert_eq(table.concat(filled, ","), "de:ad:be:ef:00:03,de:ad:be:ef:00:04", "and on unauthorize")
+			end)
+			inform._guestportal, inform._state.save, inform._guest_built = real, save, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: rate-update keeps a per-guest limit while the guest is authorized",
+		fn = function()
+			local real = inform._guestportal
+			local rates
+			inform._guestportal = {set_authorized = function() end, set_rates = function(r) rates = r end}
+			local save, saves = inform._state.save, 0
+			inform._state.save = function() saves = saves + 1 end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				local function upd(mac, ul, dl)
+					inform.handle_response(cjson.encode({_type = "cmd", cmd = "rate-update", mac = mac,
+						ul_max = ul, ul_min = 64, dl_max = dl, dl_min = 64}), st)
+				end
+				inform._guest_built = "phy0-ap1=x"
+				upd("DE:AD:BE:EF:00:02", 2048, 4096)
+				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].up, 2048, "upload kbps")
+				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].down, 4096, "download kbps")
+				assert_eq(saves, 1, "persisted: sent once per authorization")
+				assert_eq(#rates, 1, "applied")
+				assert_eq(rates[1].mac, "de:ad:be:ef:00:02", "to that guest")
+				upd("de:ad:be:ef:00:02", 2048, 4096)
+				assert_eq(saves, 1, "a repeat changes nothing")
+				upd("de:ad:be:ef:00:02", -1, 4096)
+				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].up, nil, "-1: no upload limit")
+				upd("de:ad:be:ef:00:03", 2048, 4096)
+				assert_eq(st.guest_rates["de:ad:be:ef:00:03"], nil, "not authorized: not kept")
+				upd("x;reboot", 1, 1)
+				inform.handle_response('{"_type":"cmd","cmd":"unauthorize-guest","mac":"de:ad:be:ef:00:02"}', st)
+				assert_eq(next(st.guest_rates), nil, "leaves with the authorization")
+				assert_eq(#rates, 0, "and from the kernel")
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"de:ad:be:ef:00:02"}', st)
+				upd("de:ad:be:ef:00:02", 512, 512)
+				upd("de:ad:be:ef:00:02", -1, -1)
+				assert_eq(next(st.guest_rates), nil, "-1 both ways: no limit at all")
+				inform._guest_built = nil
+				rates = nil
+				upd("de:ad:be:ef:00:02", 512, 512)
+				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].down, 512, "no portal built: the ledger only")
+				assert_eq(rates, nil, "nothing to apply it to")
 			end)
 			inform._guestportal, inform._state.save, inform._guest_built = real, save, nil
 			if not ok then error(err, 0) end

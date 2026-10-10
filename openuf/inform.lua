@@ -3699,6 +3699,18 @@ function M.handle_response(json_str, st, cfg)
 			M._state.save(st)
 			if M._guest_built then
 				pcall(M._guestportal.set_authorized, M._guest_macs(st))
+				pcall(M._guestportal.set_rates, M._guest_rate_list(st))
+			end
+		elseif cmd == "rate-update" then
+			-- Guest portal: {"cmd":"rate-update","mac":...,"ul_max":kbps,
+			-- "dl_max":kbps,...}, right after authorize-guest when the
+			-- guest has a rate limit (PROTOCOL-VALIDATION.md, "Guest
+			-- portal (Hotspot)"). Sent once per authorization.
+			if M._guest_rate(st, resp) then
+				M._state.save(st)
+				if M._guest_built then
+					pcall(M._guestportal.set_rates, M._guest_rate_list(st))
+				end
 			end
 		elseif cmd == "scan" or cmd == "scan_band" then
 			M._handle_scan_cmd(resp, cfg)
@@ -3842,6 +3854,7 @@ function M._guest_authorize(st, mac, authorized)
 	st.guest_authorized = st.guest_authorized or {}
 	if not authorized then
 		st.guest_authorized[mac] = nil
+		if st.guest_rates then st.guest_rates[mac] = nil end
 		return
 	end
 	st.guest_authorized[mac] = os.time()
@@ -3850,7 +3863,46 @@ function M._guest_authorize(st, mac, authorized)
 		n = n + 1
 		if not oldest_t or t < oldest_t then oldest, oldest_t = m, t end
 	end
-	if n > M.GUEST_LEDGER_MAX then st.guest_authorized[oldest] = nil end
+	if n > M.GUEST_LEDGER_MAX then
+		st.guest_authorized[oldest] = nil
+		if st.guest_rates then st.guest_rates[oldest] = nil end
+	end
+end
+
+-- A rate-update into st.guest_rates ({mac = {up=kbps, down=kbps}}). Only for
+-- an authorized guest, so the ledger stays as small as the authorizations
+-- and leaves with them; -1 (the controller's "no limit") either way drops
+-- the entry. Returns true when the ledger changed.
+function M._guest_rate(st, resp)
+	local mac = type(resp.mac) == "string"
+		and resp.mac:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+	if not (mac and (st.guest_authorized or {})[mac]) then return false end
+	local function kbps(v)
+		v = tonumber(v)
+		return v and v > 0 and math.floor(v) or nil
+	end
+	local up, down = kbps(resp.ul_max), kbps(resp.dl_max)
+	st.guest_rates = st.guest_rates or {}
+	local cur = st.guest_rates[mac]
+	if not up and not down then
+		st.guest_rates[mac] = nil
+		return cur ~= nil
+	end
+	if cur and cur.up == up and cur.down == down then return false end
+	st.guest_rates[mac] = {up = up, down = down}
+	return true
+end
+
+-- The rate ledger as a sorted list, for guestportal.set_rates.
+function M._guest_rate_list(st)
+	local out = {}
+	for mac, r in pairs(st.guest_rates or {}) do
+		if (st.guest_authorized or {})[mac] and type(r) == "table" then
+			out[#out + 1] = {mac = mac, up = r.up, down = r.down}
+		end
+	end
+	table.sort(out, function(a, b) return a.mac < b.mac end)
+	return out
 end
 
 -- The `authorized` a station on this vap reports: the ledger's word on a
@@ -3913,7 +3965,7 @@ function M._guest_enforce(st, vaps)
 		M._state.save(st)
 	end
 	vaps = vaps or M._guest_vaps(st)
-	local n = gp.reconcile(spec, vaps, M._guest_macs(st))
+	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_rate_list(st))
 	M._guest_built = guest_vaps_key(vaps)
 	M._guest_ctx = {url = spec.url, ap = st.mac, vaps = vaps}
 	if not M._guest_server then
