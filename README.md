@@ -114,6 +114,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Set Replacement Device / Load Configuration | ✅ Working — both are controller-side clones; no device-side protocol involved |
 | Power / PoE reporting | Not applicable — the flagged UI field belongs to the upstream parent device, not the AP |
 | Speed test | Not applicable — gateway-only feature in current UniFi Network |
+| SSIDs on uplink loss | Matches UniFi firmware for this config. A UniFi AP takes its SSIDs down when it loses the gateway, but only when the controller sends `connectivity.status=enabled`. The controller does that only for devices that claim wireless-uplink (vwire) support, which openUF cannot do, so it sends `disabled`, and a UniFi AP would keep its SSIDs up too. Confirmed on a UCG Ultra and the 10.4.57 lab. See PROTOCOL-VALIDATION.md § `connectivity.*` |
 | USG / USW emulation | Not implemented, not planned |
 
 ## Supported hardware

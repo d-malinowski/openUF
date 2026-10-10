@@ -1587,6 +1587,57 @@ the AP's own crond at 04:00 device-local time. That is why the timezone matters.
 § 6 for what `sysconf.lua` does with each block. `cron.<n>.user` is deliberately left
 unrecognized, so it shows in the dropped-key report.
 
+### `connectivity.*`: SSIDs on uplink loss (nothing to do, 2026-10-10)
+
+**Question.** A UniFi AP that loses its uplink takes its SSIDs down, so clients roam to an
+AP that still reaches the gateway. openUF keeps beaconing. Is that a gap?
+
+**What the firmware does** (firmware-confirmed for 3.9.27 to 4.0.15: `ubntbox`, `mcad`,
+`syswrapper.sh`):
+- `ubntbox` starts `uplink-monitor` (part of `mcad`) only when `system_cfg` says
+  `connectivity.status=enabled` and `wireless.status=enabled`. Otherwise it starts nothing,
+  or on some boards `uplink-monitor -p`. In `-p` mode `update()` returns before it calls
+  `syswrapper.sh state_reload`, so the VAPs are never touched.
+- When it is enabled:
+  - **Target:** the gateway, or the host in `connectivity.uplink`.
+  - **Interval:** every 15 s with a wired uplink (5 s in `init`, 10 s in `up`).
+  - **Probe:** `arping -q -c 1 -I br0` twice if the target is in the subnet, otherwise
+    `ping -q -c 1 -I br0 -W 2` twice.
+  - **Shortcuts:** the target counts as alive without a probe if its MAC was seen in the
+    bridge FDB less than 15 s ago. A failed probe still counts as up if that FDB age is
+    under 90 s.
+  - **Going down:** losing carrier is "down" at once. Any other "down" needs 5 verdicts
+    in a row (about 60 s).
+  - **Recovery:** immediate.
+- "down" leads to `configure_vap up down down`, which takes every user and guest VAP down.
+  `/var/run/system.isolated_wlan_on`, which would have kept them up, has no writer in these
+  builds.
+- After 1800 s isolated while in selfrun, the AP runs `soft-restart`.
+- **Inform:** the firmware sends `isolated`. Current controllers (10.4.57 and 10.6) ignore
+  it and set the device's `isolated` from the inform's top-level `uplink == "down"`, which
+  defaults to `"eth0"`.
+
+**What the controller sends.** The `connectivity` block (CFR, `eWivisHeQsnaqDtx`):
+- `connectivity.status=enabled` only when `device.supportVwire()` (`wifi_caps` bit `0x1`)
+  **and** the site's `connectivity` setting is `enabled`.
+- With it come `connectivity.uplink=<host>` (`uplink_type=custom`) or
+  `connectivity.uplink_gateway=<ip>`, plus `uplink_eth`/`uplink_wds`/`uplink_bridge`.
+- In every other case: `connectivity.status=disabled`.
+
+openUF does not claim `wifi_caps` `0x1`; that bit is vwire/wireless uplink, which it cannot
+do (see [Capability bitmasks](#capability-bitmasks)). Both controllers it runs under push
+`disabled`:
+- the UCG Ultra (debug dump on the Archer C5, 9 of 9 pushes);
+- the 10.4.57 lab, whose site `connectivity` setting is `enabled: true` (dump: 2 of 2 pushes).
+
+**Conclusion.** A UniFi AP given this config keeps its SSIDs up when the uplink goes away.
+openUF already does the same, so nothing is implemented. Claiming `0x1` only to switch the
+monitor on would also make the controller offer wireless uplink and meshing to a device that
+cannot do either. This should be revisited only if openUF ever does vwire.
+
+On the APs (read-only, 2026-10-10): OpenWrt 25.12 ships no `arping`. `bridge -s fdb` shows a
+`used <tx>/<rx>` age for the gateway's MAC, which would serve as the FDB shortcut.
+
 ---
 
 ## The first DSA / 802.11ax board
@@ -2289,7 +2340,8 @@ Gated, and not to be claimed:
   - `radio_caps2` `0x4`: WPA3-Enterprise-192.
   - `radio_caps2` `0x400` and `wifi_caps2` `0x1`/`0x4000`/`0x8000`: MLO and Mesh-MLO.
   - `radio_caps` `0x20000`: `radio.<n>.hard_noisefloor.*` / sensitivity level, a QCA RX-sensitivity setting.
-  - `wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`: vwire, mesh, meshv3, multi-vport and Element.
+  - `wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`: vwire, mesh, meshv3, multi-vport and Element. `0x1` also gates
+    `connectivity.status=enabled`, the firmware's uplink monitor (see [`connectivity.*`](#connectivity-ssids-on-uplink-loss-nothing-to-do-2026-10-10)).
   - `wifi_caps` `0x2000` "open hostapd", `0x40` `bga_filter`, `0x4000000` low-performance mode.
   - `wifi_caps2` `0x4` Green AP, `0x10` ACS-DFS, `0x80` quick scan, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear).
   - `fw_caps` `0x800000` Hotspot 2.0 (such a WLAN is skipped without it) and `0x20000000` RADIUS `filter_id`.
