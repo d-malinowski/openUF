@@ -683,7 +683,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: satisfaction is aggregated to the vap and the device",
+		name = "inform json: satisfaction is rolled up to the vap, its radio and the device",
 		fn = function()
 			-- The controller does not derive these from the per-client scores
 			-- it already holds: without them the Devices list showed
@@ -691,28 +691,45 @@ return {
 			-- connected clients, each individually scored in the Clients view.
 			local d = build({with_uci = true, with_clients = true})
 			local vap = d.vap_table[1]
-			assert_not_nil(vap.satisfaction, "vap carries a satisfaction score")
-			assert_true(vap.satisfaction >= 0 and vap.satisfaction <= 100,
-				"and it is a percentage")
-			assert_not_nil(d.satisfaction, "device carries one too")
-			-- Both are means of the same per-client scores, and this fixture
-			-- has a single vap, so they must agree.
-			assert_eq(d.satisfaction, vap.satisfaction,
-				"device mean matches the only vap's mean")
 			local sum, n = 0, 0
 			for _, s in ipairs(vap.sta_table) do sum, n = sum + s.satisfaction, n + 1 end
-			assert_eq(vap.satisfaction, math.floor(sum / n + 0.5),
-				"and equals the mean of the clients actually reported")
+			assert_eq(n, 2, "two clients scored")
+			assert_eq(vap.satisfaction, math.floor(sum / n),
+				"the vap's score is the clients' mean, truncated as the firmware does")
+			assert_eq(d.satisfaction, vap.satisfaction,
+				"one vap: the device's score is the vap's")
+			local radio
+			for _, r in ipairs(d.radio_table) do
+				if r.name == d.vap_table[1].radio_name then radio = r end
+			end
+			assert_not_nil(radio, "the vap's radio is reported")
+			assert_eq(radio.athstats.satisfaction, vap.satisfaction,
+				"its radio carries the same score in athstats")
+			local reasons, anomalies = 0, 0
+			for _, v in pairs(vap.reasons_bar_chart) do reasons = reasons + v end
+			for _, v in pairs(vap.anomalies_bar_chart) do anomalies = anomalies + v end
+			assert_eq(reasons, 2, "each client limited by one term is counted once")
+			assert_eq(vap.reasons_bar_chart.phy_rate, 2, "both by their phy rate")
+			assert_eq(anomalies, 0, "no anomalies on these clients")
+			assert_eq(vap.anomalies_bar_chart.weak_signal, 0, "every anomaly key is sent")
 		end
 	},
 	{
-		name = "inform json: satisfaction is omitted, not zero, when nothing is connected",
+		name = "inform json: satisfaction is -1, not absent or zero, when nothing is connected",
 		fn = function()
-			-- 0 would read as "terrible experience"; absent lets the UI say
-			-- "No Clients", which is what is actually true.
+			-- 0 would read as "terrible experience". The firmware sends -1,
+			-- which the controller's stat archiver skips; absent would leave
+			-- the device's last score standing (it copies the field only
+			-- when present).
 			local d = build({with_uci = true, with_clients = false})
-			assert_true(d.vap_table[1].satisfaction == nil, "no vap score without clients")
-			assert_true(d.satisfaction == nil, "no device score either")
+			assert_eq(d.vap_table[1].satisfaction, -1, "no vap score without clients")
+			assert_eq(d.satisfaction, -1, "no device score either")
+			for _, r in ipairs(d.radio_table) do
+				if r.athstats then
+					assert_eq(r.athstats.satisfaction, -1, "nor a radio score")
+				end
+			end
+			assert_eq(d.vap_table[1].reasons_bar_chart.signal, 0, "the charts are sent, all zero")
 		end
 	},
 	{
@@ -827,11 +844,14 @@ return {
 			-- so compare with a tolerance rather than bit-for-bit equality
 			assert_true(math.abs(sta_table[1].wifi_tx_retries_percentage - 4 * 100 / 291) < 1e-10,
 				"wifi_tx_retries_percentage = retries as % of attempts")
-			-- satisfaction/satisfaction_now: no hostapd caps in this fixture,
-			-- so the rate term is skipped and -62 dBm is inside the coverage
-			-- edge: the signal floor alone gives 100.
-			assert_eq(sta_table[1].satisfaction, 100, "satisfaction from the signal floor alone")
-			assert_eq(sta_table[1].satisfaction_now, 100, "satisfaction_now matches satisfaction")
+			-- satisfaction (satisfaction.lua): signal avg -63 dBm is far
+			-- above the noise floor (100), the mean of 144.4 and 72.2
+			-- Mbit/s is 108300 kbps (90), and the retry window has no
+			-- minute yet (100).
+			assert_eq(sta_table[1].satisfaction, 90, "the phy rate binds")
+			assert_eq(sta_table[1].satisfaction_now, 90, "satisfaction_now matches satisfaction")
+			assert_eq(sta_table[1].satisfaction_reason, 2, "reason: phy_rate")
+			assert_eq(sta_table[1].anomalies, 0, "no anomalies")
 		end
 	},
 	{
@@ -927,11 +947,10 @@ return {
 		end
 	},
 	{
-		name = "inform json: satisfaction scores the tx rate against the client's ceiling",
+		name = "inform json: satisfaction follows the firmware's terms through real counters",
 		fn = function()
-			-- Seen on hardware: a 1SS HT20 client at MCS 7 of 7 with no
-			-- retries read Poor at -61 dBm, because signal was the score.
 			inform._sta_stats_cache = {}
+			inform._sysinfo._driver_cache = {}
 			local orig_time = inform._time
 			local t = 1000
 			inform._time = function() return t end
@@ -940,141 +959,28 @@ return {
 				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
 				ip = "192.168.1.100", hostname = "testap",
 			}
-			-- signal, the iw tx bitrate line, hostapd's all_sta record (nil:
-			-- hostapd knows nothing), the AP's live channel width and its
-			-- spatial streams.
-			local function score(signal, bitrate, sta_rec, ap_width, ap_nss)
+			-- One inform, ten seconds after the last: c = {signal, avg,
+			-- noise, tx/rx rate, lifetime tx packets/retries/failed, driver}.
+			local function inform_once(c)
 				inject_ucihelper()
 				inform._sysinfo._phy_info_cache = {}
 				inform._sysinfo._run_cmd = function(cmd)
 					if cmd:find("station dump") then
 						return "Station 00:00:5e:00:53:01 (on wlan0)\n" ..
-							"\tsignal:  \t" .. signal .. " dBm\n" ..
-							"\ttx bitrate:\t" .. bitrate .. "\n"
+							"\ttx packets:\t" .. c.packets .. "\n" ..
+							"\ttx retries:\t" .. c.retries .. "\n" ..
+							"\ttx failed:\t" .. c.failed .. "\n" ..
+							"\tsignal:  \t" .. c.signal .. " [-60, -61] dBm\n" ..
+							(c.avg and ("\tsignal avg:\t" .. c.avg .. " [-60, -61] dBm\n") or "") ..
+							"\ttx bitrate:\t" .. c.tx .. "\n" ..
+							"\trx bitrate:\t" .. c.rx .. "\n"
 					end
-					if cmd:find("all_sta", 1, true) then
-						return sta_rec and ("00:00:5e:00:53:01\n" .. sta_rec) or ""
+					if cmd:find("survey dump") then
+						return "Survey data from wlan0\n\tfrequency:\t5180 MHz [in use]\n" ..
+							"\tnoise:\t" .. c.noise .. " dBm\n"
 					end
-					if cmd:find("dev wlan0 info") then
-						return fixture("iw_dev_info.txt"):gsub("width: 20", "width: " .. (ap_width or 20))
-					end
-					if cmd:find("phy phy0 info") then
-						return (fixture("iw_phy_info_5g.txt"):gsub("Max spatial streams: 2",
-							"Max spatial streams: " .. (ap_nss or 2)))
-					end
-					return ""
-				end
-				t = t + 10
-				local d = cjson.decode(inform.build_json(st, nil, ufhw))
-				assert_true(d.radio_table[1].width == nil, "the live width is not a wire field")
-				return d.vap_table[1].sta_table[1].satisfaction
-			end
-			-- hostapd all_sta records, as captured on both APs.
-			local HT20_1SS = "flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT]\n" ..
-				"ht_mcs_bitmask=ff000000000000000000\nht_caps_info=0x0020\n"
-			local HT40_2SS = "flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT]\n" ..
-				"ht_mcs_bitmask=ffff0000000000000000\nht_caps_info=0x006e\n"
-			local VHT80_1SS = "flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT][VHT]\n" ..
-				"rx_vht_mcs_map=fffe\nht_mcs_bitmask=ff000000010000000000\n" ..
-				"vht_caps_info=0x33c07030\nht_caps_info=0x006e\n"
-			local function fresh() inform._sta_stats_cache = {} end
-
-			fresh()
-			assert_eq(score(-61, "65.0 MBit/s MCS 7", HT20_1SS), 100,
-				"a client at its own ceiling is Excellent at -61 dBm")
-			fresh()
-			assert_eq(score(-61, "58.5 MBit/s MCS 6", HT20_1SS), 100,
-				"one MCS below the top counts as the ceiling: rate control probes the top")
-			fresh()
-			assert_eq(score(-36, "52.0 MBit/s MCS 5", HT20_1SS), 88,
-				"MCS 5 against the MCS 6 ceiling: 52/58.5")
-			fresh()
-			assert_true(score(-65, "19.5 MBit/s MCS 2", HT20_1SS) < 70,
-				"a slow client at -65 dBm reads Poor")
-			fresh()
-			assert_eq(score(-80, "65.0 MBit/s MCS 7", HT20_1SS), 60,
-				"near the coverage edge SNR wins: 15 dB over the assumed -95 floor")
-			fresh()
-			assert_eq(score(-80, "54.0 MBit/s", HT20_1SS), 60,
-				"a legacy rate has no MCS to compare: SNR only")
-			fresh()
-			assert_eq(score(-50, "65.0 MBit/s MCS 7", nil), 100,
-				"no hostapd record: rate term skipped")
-			fresh()
-			assert_eq(score(-50, "390.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 1", VHT80_1SS, 80), 100,
-				"VHT MCS 8 of 9 on 80 MHz is at the ceiling")
-			fresh()
-			assert_eq(score(-61, "292.5 MBit/s VHT-MCS 6 80MHz short GI VHT-NSS 1", VHT80_1SS, 80), 75,
-				"VHT MCS 6 on 80 MHz: 58.5/78")
-			fresh()
-			assert_eq(score(-50, "200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1", VHT80_1SS, 40), 100,
-				"an 80 MHz client on a 40 MHz channel is at its ceiling at 40 MHz")
-			fresh()
-			assert_eq(score(-50, "86.7 MBit/s VHT-MCS 9 short GI VHT-NSS 1", VHT80_1SS, 80), 24,
-				"the same client at 20 MHz on an 80 MHz channel is not")
-			fresh()
-			assert_eq(score(-50, "65.0 MBit/s MCS 7", HT40_2SS, 20), 55,
-				"one stream of two, the 40 MHz client capped by the 20 MHz channel")
-			fresh()
-			assert_eq(score(-50, "130.0 MBit/s MCS 15", HT40_2SS, 20), 100,
-				"HT MCS 15 is MCS 7 on two streams")
-			fresh()
-			assert_eq(score(-50, "78.0 MBit/s MCS 12", HT40_2SS, 20), 66,
-				"HT MCS 12 is MCS 4 on two streams: 39/58.5")
-			fresh()
-			assert_eq(score(-50, "65.0 MBit/s MCS 7", HT40_2SS, 20, 1), 100,
-				"a two-stream client on a one-stream AP is at its ceiling on one")
-
-			-- Smoothing: one rate-control step moves the score a fifth of the
-			-- way, and a sample without a rate keeps the last value.
-			fresh()
-			assert_eq(score(-50, "65.0 MBit/s MCS 7", HT20_1SS), 100, "first sample is taken as is")
-			assert_eq(score(-50, "19.5 MBit/s MCS 2", HT20_1SS), 86, "100 + 0.2*(33.3-100) = 86.7")
-			assert_eq(score(-50, "54.0 MBit/s", HT20_1SS), 86, "a legacy-rate sample keeps it")
-
-			inform._time = orig_time
-			inform._sta_stats_cache = {}
-		end
-	},
-	{
-		name = "inform json: satisfaction takes the worse of downlink airtime and SNR",
-		fn = function()
-			-- Per-frame figures measured on hardware 2026-09-27 (office 2.4 GHz,
-			-- noise -83 dBm), replayed inform by inform through the counters.
-			inform._sta_stats_cache = {}
-			local orig_time = inform._time
-			local t = 1000
-			inform._time = function() return t end
-			local st = {
-				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
-				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
-				ip = "192.168.1.100", hostname = "testap",
-			}
-			local HT20_1SS = "00:00:5e:00:53:01\nflags=[AUTH][ASSOC][AUTHORIZED][WMM][HT]\n" ..
-				"ht_mcs_bitmask=ff000000000000000000\nht_caps_info=0x0020\n"
-			-- One inform: s = {signal, noise, tx/rx bitrate lines and the
-			-- lifetime counters (duration nil: the driver reports none)}.
-			local function inform_once(s)
-				inject_ucihelper()
-				inform._sysinfo._phy_info_cache = {}
-				inform._sysinfo._run_cmd = function(cmd)
-					if cmd:find("station dump") then
-						local out = "Station 00:00:5e:00:53:01 (on wlan0)\n" ..
-							"\tsignal:  \t" .. s.signal .. " dBm\n" ..
-							"\ttx packets:\t" .. s.tx_packets .. "\n" ..
-							"\ttx bytes:\t" .. s.tx_bytes .. "\n" ..
-							(s.tx_retries and ("\ttx retries:\t" .. s.tx_retries .. "\n") or "") ..
-							"\trx packets:\t" .. s.rx_packets .. "\n" ..
-							"\ttx bitrate:\t" .. (s.tx_rate or "65.0 MBit/s MCS 7") .. "\n"
-						if s.tx_duration then
-							out = out .. "\ttx duration:\t" .. s.tx_duration .. " us\n"
-						end
-						return out .. "\trx bitrate:\t" .. s.rx_rate .. "\n"
-					end
-					if cmd:find("all_sta", 1, true) then return HT20_1SS end
-					if cmd:find("survey dump") and s.noise then
-						return "Survey data from wlan0\n\tfrequency:\t2462 MHz [in use]\n" ..
-							"\tnoise:\t" .. s.noise .. " dBm\n"
+					if cmd:find("readlink", 1, true) and cmd:find("device/driver", 1, true) then
+						return "../../../bus/drivers/" .. c.driver .. "\n"
 					end
 					if cmd:find("dev wlan0 info") then return fixture("iw_dev_info.txt") end
 					if cmd:find("phy phy0 info") then return fixture("iw_phy_info_5g.txt") end
@@ -1082,216 +988,64 @@ return {
 				end
 				t = t + 10
 				local d = cjson.decode(inform.build_json(st, nil, ufhw))
-				return d.vap_table[1].sta_table[1].satisfaction
+				local sta = d.vap_table[1].sta_table[1]
+				return sta.satisfaction, sta.satisfaction_reason, sta.anomalies
 			end
-			-- A client sending pkts frames of bytes_per each costing us_per of
-			-- airtime per inform, resend re-sends per frame (the driver's tx
-			-- retries), answering at rx_rate; signal/noise fixed.
+			local VHT = "866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2"
 			local function client(o)
-				local c = {signal = o.signal, noise = o.noise, rx_rate = o.rx_rate,
-					tx_packets = o.start or 5000, tx_bytes = (o.start or 5000) * o.bytes_per,
-					tx_duration = (o.start or 5000) * o.us_per, rx_packets = 100,
-					tx_retries = 0}
-				return function(pkts)
-					c.tx_rate = o.tx_rate
-					local r = inform_once(c)
-					pkts = pkts or 34
-					c.tx_packets = c.tx_packets + pkts
-					c.tx_bytes = c.tx_bytes + pkts * o.bytes_per
-					c.tx_duration = c.tx_duration + pkts * o.us_per
-					c.tx_retries = c.tx_retries + math.floor(pkts * (o.resend or 0) + 0.5)
-					c.rx_packets = c.rx_packets + (o.rx_per or 25)
-					return r, c
-				end
+				local c = {signal = -60, noise = -90, tx = VHT, rx = VHT,
+					packets = 1000, retries = 0, failed = 0, driver = "ath9k"}
+				for k, v in pairs(o) do c[k] = v end
+				return c
 			end
-			local function fresh() inform._sta_stats_cache = {} end
-			local MCS3, MCS7 = "26.0 MBit/s MCS 3", "65.0 MBit/s MCS 7"
-
-			-- The dishwasher: MCS 7 on tx, but 503 us per 97-byte frame (4x
-			-- its neighbours) and 8-18 % ping loss. a73aa3b scored it 93.
-			fresh()
-			local dishwasher = client{signal = -71, noise = -83, rx_rate = MCS3,
-				bytes_per = 97, us_per = 503, resend = 0.888}
-			assert_eq(dishwasher(), 42, "first inform: no window yet, SNR 12 dB -> 42")
-			assert_eq(dishwasher(), 24, "airtime (110 + 97*8/58.5) / 503 = 24 %: Poor")
-
-			fresh()
-			local roomba = client{signal = -62, noise = -83, rx_rate = MCS3,
-				bytes_per = 97, us_per = 127, resend = 0.015}
-			roomba()
-			assert_eq(roomba(), 92, "the Roomba: clean airtime, SNR 21 binds; its uplink MCS 3 isn't scored")
-
-			fresh()
-			local clean = client{signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 953, us_per = 222, resend = 0.004}
-			clean()
-			assert_eq(clean(), 94, "a clean client at -61 dBm: only SNR 22 dB costs anything")
-
-			fresh()
-			local mini = client{signal = -36, noise = -83, rx_rate = MCS7,
-				bytes_per = 129, us_per = 171, resend = 0.477}
-			mini()
-			assert_eq(mini(), 74, "power-save re-sends cost airtime: (110 + 17.6) / 171")
-
-			-- Each sample is its own window: a link that degrades shows at once.
-			fresh()
-			local o = {signal = -61, noise = -83, rx_rate = MCS7, bytes_per = 953, us_per = 222}
-			local degrading = client(o)
-			degrading()
-			assert_eq(degrading(), 94, "clean")
-			o.us_per, o.resend = 503, 0.888
-			degrading()
-			assert_eq(degrading(), 89, "one bad window: 100 + 0.2*(240.3/503*100 - 100)")
-
-			-- A quiet client's window carries over until it holds 20 frames.
-			fresh()
-			dishwasher = client{signal = -71, noise = -83, rx_rate = MCS7,
-				bytes_per = 97, us_per = 503, resend = 0.888}
-			dishwasher(10)
-			assert_eq(dishwasher(10), 42, "10 frames: no airtime sample yet")
-			assert_eq(dishwasher(10), 24, "20 frames: sampled")
-
-			-- A new association restarts the window from the new counters.
-			fresh()
-			local c = client{signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 953, us_per = 222, start = 100000}
-			c()
-			assert_eq(c(), 94, "clean before the reassociation")
-			local bad = client{signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 97, us_per = 503, resend = 0.888, start = 1}
-			bad()
-			assert_eq(bad(), 84, "the reset window samples at once: 100 + 0.2*(24.5-100)")
-
-			-- A window on a clean link is not judged: its airtime is fixed
-			-- per-frame cost and counter artefacts. Hardware 2026-10-08: an
-			-- HT sensor at 255 us per 180-byte frame, 7 % re-sends, 0 % ping
-			-- loss, scored 46 when it was judged.
-			fresh()
-			local sensor = {signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 180, us_per = 255, resend = 0.07}
-			local light = client(sensor)
-			for _ = 1, 5 do light(40) end
-			assert_eq(light(40), 94, "light and clean: not judged, SNR 22 binds")
-			-- Nor when busy: mt76 charged a clean VHT laptop more tx
-			-- airtime than its radio spent transmitting.
-			fresh()
-			local busy = client(sensor)
-			busy(4000)
-			assert_eq(busy(4000), 94, "busy and clean: not judged either")
-			-- Re-sending (20 per 100 frames): judged.
-			fresh()
-			sensor.resend = 0.2
-			local resending = client(sensor)
-			resending(40)
-			assert_eq(resending(40), 52, "20 % re-sends: (110 + 180*8/58.5) / 255 = 52 %")
-			fresh()
-			sensor.resend = 0.18
-			local below = client(sensor)
-			below(40)
-			assert_eq(below(40), 94, "18 % re-sends: not judged")
-
-			-- A clean window counts as 100, so a link that recovers climbs
-			-- back through the same smoothing.
-			fresh()
-			local o2 = {signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 97, us_per = 503, resend = 0.888}
-			local recovers = client(o2)
-			recovers()
-			assert_eq(recovers(), 24, "lossy window judged")
-			-- The frames sent after that inform are still lossy: judged at
-			-- the next one.
-			o2.us_per, o2.resend = 127, 0.015
-			recovers()
-			assert_eq(recovers(), 39, "first clean window: 24.5 + 0.2*(100 - 24.5)")
-			for _ = 1, 8 do recovers() end
-			assert_eq(recovers(), 91, "ten clean windows: 100 - 75.5*0.8^10")
-
-			-- A clean window at a low tx rate isn't marked down: the rate
-			-- only stands in until the first window (hardware: ath10k
-			-- reports no re-sends, and a speaker at 263 of 351 Mbit/s fell
-			-- from 100 to 75 when clean windows counted as the rate).
-			fresh()
-			local slow = {signal = -61, noise = -83, rx_rate = MCS7, bytes_per = 180,
-				us_per = 255, resend = 0, tx_rate = "19.5 MBit/s MCS 2"}
-			local slowc = client(slow)
-			assert_eq(slowc(), 33, "no window yet: MCS 2 of 6 stands in")
-			assert_eq(slowc(), 94, "a clean window: 100, so SNR 22 binds")
-
-			-- A re-sending window is judged against the station's own clean
-			-- cost per frame. Hardware 2026-10-09: a 2.4 GHz IoT client at
-			-- MCS 7 took ~330 us per ~100-byte frame with no re-sends, and
-			-- its windows that crossed the gate by chance scored 30-50.
-			fresh()
-			local iot = {signal = -50, noise = -83, rx_rate = MCS7,
-				bytes_per = 100, us_per = 330, resend = 0}
-			local slowclean = client(iot)
-			for _ = 1, 6 do slowclean() end
-			iot.us_per, iot.resend = 440, 0.25
-			slowclean()
-			assert_eq(slowclean(), 95, "baseline 330 - 13.7: (316.3 + 13.7) / 440 = 75 %, smoothed: 95")
-			-- One odd clean window doesn't move the baseline (median of 5).
-			fresh()
-			iot.us_per, iot.resend = 330, 0
-			local odd = client(iot)
-			for i = 1, 6 do
-				iot.us_per = (i == 6) and 3300 or 330
-				odd()
+			local function step(c, pkts, retries, failed)
+				c.packets, c.retries, c.failed =
+					c.packets + pkts, c.retries + retries, c.failed + failed
 			end
-			iot.us_per, iot.resend = 440, 0.25
-			odd()
-			assert_eq(odd(), 95, "the latest clean window took 3300 us per frame: same verdict")
-			-- A cheap clean link doesn't excuse a lossy one: the dishwasher's
-			-- clean frames cost ~127 us, its lossy ones 503.
-			fresh()
-			local dw = {signal = -50, noise = -83, rx_rate = MCS7,
-				bytes_per = 97, us_per = 127, resend = 0}
-			local lossy = client(dw)
-			for _ = 1, 6 do lossy() end
-			dw.us_per, dw.resend = 503, 0.888
-			for _ = 1, 10 do lossy() end
-			assert_eq(lossy(), 33, "baseline 113.7: (113.7 + 13.3) / 503 = 25 %; 10 windows: 25.2 + 74.8*0.8^10")
-			-- The baseline is the last 5 clean windows, so an expensive past
-			-- (here 8 windows at 330 us) doesn't excuse today's losses.
-			fresh()
-			dw.us_per, dw.resend = 330, 0
-			local moved = client(dw)
-			for _ = 1, 8 do moved() end
-			dw.us_per = 127
-			for _ = 1, 6 do moved() end
-			dw.us_per, dw.resend = 503, 0.888
-			for _ = 1, 10 do moved() end
-			assert_eq(moved(), 33, "only the 5 latest clean windows (127 us) count")
 
-			-- No airtime from the driver: the tx rate against the ceiling stands in.
-			fresh()
-			local noair = {signal = -50, noise = -83, rx_rate = MCS7, tx_packets = 10,
-				tx_bytes = 1000, rx_packets = 10, tx_rate = "19.5 MBit/s MCS 2"}
-			assert_eq(inform_once(noair), 33, "no tx duration: MCS 2 of 6 = 19.5/58.5")
+			-- Retries: judged over the last completed minute, and only then.
+			inform._sta_stats_cache = {}
+			local c = client{}
+			assert_eq(inform_once(c), 100, "a clean VHT client at 30 dB SNR")
+			for _ = 1, 5 do
+				step(c, 100, 40, 5)
+				assert_eq(inform_once(c), 100, "40 % retries: no minute completed yet")
+			end
+			step(c, 100, 40, 5)
+			local score, reason, anomalies = inform_once(c)
+			assert_eq(score, 50, "the minute: 40 % retries -> 80, less 30 drops")
+			assert_eq(reason, 16, "reason: wifi_retries")
+			assert_eq(anomalies, 0, "50 is not yet an anomaly")
+			step(c, 100, 0, 0)
+			assert_eq(inform_once(c), 50, "the minute's score holds until the next one")
 
-			-- Noise: implausible floors are raised to -95, a missing one assumed.
-			fresh()
-			local n = {signal = -80, noise = -106, rx_rate = MCS7, tx_packets = 10,
-				tx_bytes = 1000, rx_packets = 10}
-			assert_eq(inform_once(n), 60, "-106 dBm noise is taken as -95: SNR 15")
-			fresh()
-			n.noise = nil
-			assert_eq(inform_once(n), 60, "no survey: -95 assumed")
+			-- mt76's tx failed counts failed attempts, not drops.
+			inform._sta_stats_cache = {}
+			inform._sysinfo._driver_cache = {}
+			c = client{driver = "mt798x-wmac"}
+			inform_once(c)
+			for _ = 1, 6 do step(c, 100, 40, 40) end
+			t = t + 50
+			assert_eq(inform_once(c), 80, "mt76: retries judged, failed attempts not counted as drops")
+			inform._sysinfo._driver_cache = {}
 
-			-- The uplink rate isn't scored. Hardware 2026-10-09: a phone on a
-			-- clean link sent at a low MCS, busily, and scored Poor on it.
-			fresh()
-			local phone = client{signal = -50, noise = -83, rx_rate = "19.5 MBit/s MCS 2",
-				bytes_per = 953, us_per = 222, rx_per = 200}
-			for _ = 1, 5 do phone() end
-			assert_eq(phone(), 100, "uplink MCS 2 of 6, 200 frames per inform: not scored")
+			-- SNR: the averaged signal over a noise floor taken as no lower than -96.
+			inform._sta_stats_cache = {}
+			assert_eq(inform_once(client{signal = -80, noise = -107}), 91,
+				"ath9k's -107 floor is taken as -96: SNR 16")
+			inform._sta_stats_cache = {}
+			assert_eq(inform_once(client{signal = -50, avg = -84, noise = -94}), 65,
+				"the running average, not the last frame: SNR 10")
+			inform._sta_stats_cache = {}
+			score, reason, anomalies = inform_once(client{signal = -90, noise = -94})
+			assert_eq(score, 0, "SNR 4: no signal")
+			assert_eq(anomalies, 1, "weak_signal")
 
-			-- SNR is smoothed: one 2 dB dip doesn't drop an Excellent client.
-			fresh()
-			local jitter = {signal = -62, noise = -83, rx_rate = MCS7, tx_packets = 10,
-				tx_bytes = 1000, rx_packets = 10}
-			assert_eq(inform_once(jitter), 92, "SNR 21")
-			jitter.signal = -64
-			assert_eq(inform_once(jitter), 91, "one reading at 19 dB: smoothed to 20.6")
+			-- PHY: the mean of the two rates, in absolute steps.
+			inform._sta_stats_cache = {}
+			score, reason = inform_once(client{tx = "65.0 MBit/s MCS 7", rx = "72.2 MBit/s MCS 7 short GI"})
+			assert_eq(score, 85, "a 2.4 GHz single-stream client at its top rate")
+			assert_eq(reason, 2, "reason: phy_rate")
 
 			inform._time = orig_time
 			inform._sta_stats_cache = {}

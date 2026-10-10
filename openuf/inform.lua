@@ -66,6 +66,7 @@ local l2guard   = _require_sibling("l2guard")
 local airtime   = _require_sibling("airtime")
 local assoctrack = _require_sibling("assoctrack")
 local guestportal = _require_sibling("guestportal")
+local satisfaction = _require_sibling("satisfaction")
 
 local M = {}
 
@@ -91,6 +92,7 @@ M._sysconf    = sysconf
 M._l2guard    = l2guard
 M._assoctrack = assoctrack
 M._guestportal = guestportal
+M._satisfaction = satisfaction
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -155,40 +157,10 @@ M._spectrum_cache = {}
 -- used to delta-sample a throughput estimate the same way M._sysinfo's
 -- cpu_percent() delta-samples /proc/stat between calls (first sample for a
 -- given MAC has no prior delta, so throughput is reported as 0 that time).
--- It also carries the per-station state behind satisfaction (smoothed
--- terms and the airtime window base): see estimate_satisfaction().
+-- It also carries each station's WiFi Experience window (satisfaction.lua).
 M._sta_stats_cache = {}
 -- ...and how long an unseen station stays in it. See the sweep in build_json.
 M.STA_STATS_FORGET_AFTER = 600
--- Weight of each new sample in the satisfaction terms' EWMAs.
-M.RATE_EWMA_ALPHA = 0.2
--- Satisfaction tunables (see estimate_satisfaction()). Judgements, not
--- calibrated against a real UniFi AP:
--- * the downlink airtime term is sampled once a window holds this many
---   frames, so a quiet client's few frames aren't a verdict;
-M.SAT_AIRTIME_MIN_PKTS = 20
--- * ...and its airtime is judged only when the driver re-sent at least
---   this many frames per 100 in it; a cleaner window counts as 100 (SNR
---   still judges a weak link). On a clean link the
---   airtime is fixed per-frame
---   cost and counter artefacts: on hardware an HT sensor at 7 % re-sends
---   and 0 % ping loss took ~250 us per frame, and mt76 charged a VHT laptop
---   (0.5 % re-sends, 0 % loss) 711 ms of tx airtime in a minute in which
---   the whole radio sent for 478 ms. Both scored Poor;
-M.SAT_AIRTIME_RESEND_PCT = 20
--- * the ideal fixed cost of one frame on air (preamble, SIFS, ACK, backoff),
---   measured as ~110 us for small frames of clean 2.4 GHz clients. It is
---   the floor: a re-sending window is judged against the station's own
---   fixed cost per frame, the median of its last few clean windows. Some
---   clients cost far more on a clean link: on hardware a 2.4 GHz IoT client at
---   MCS 7 took 200-440 us per ~100-byte frame with 0-4 % re-sends (3300 us
---   in two windows, some frames at 1 Mbit/s), so its few windows that
---   crossed the re-send gate by chance scored 30-50 against 110 us;
-M.SAT_FRAME_OVERHEAD_US = 110
-M.SAT_BASELINE_WINDOWS = 5
--- * the noise floor is taken as at least this: drivers report floors no
---   receiver achieves (ath10k -106, ath9k -107), which would inflate SNR.
-M.SAT_NOISE_FLOOR_MIN = -95
 
 -- Injectable: override in tests to control elapsed time deterministically
 -- (used by the sta_table throughput delta-sample below).
@@ -515,121 +487,6 @@ function M.parse_packet(raw, st)
 	return payload, flags
 end
 
--- Best-effort proxy for the "WiFi Experience" score a real AP computes
--- on-device (proprietary/undocumented formula -- confirmed via decompiled
--- controller 10.4.57 that the controller itself does no computation: it
--- just reads "satisfaction" straight off the client doc, which is
--- populated verbatim from whatever the AP sent in that sta_table entry).
--- The UI buckets it >=90 Excellent, >=70 Good, else Poor.
---
--- It is the worse of two terms, after the split commercial controllers
--- use (Aruba/Aerohive client health, Mist's coverage/throughput SLEs):
---  * dl: downlink airtime efficiency -- the airtime this client's frames
---    would take at its ceiling rate (sta_ceiling_mbps()) plus its own
---    per-frame cost on a clean link (at least M.SAT_FRAME_OVERHEAD_US), as
---    a share of the airtime mac80211 says they took
---    (airtime_pct()). Every retry costs airtime whatever a driver calls it,
---    so this sees a failing link that rate control doesn't: on hardware a
---    -71 dBm client held MCS 7 while 89 % of attempts failed, lost 8-18 %
---    of pings and took 4x the airtime per frame of its neighbours. Only a
---    window in which frames are being re-sent is judged on airtime
---    (M.SAT_AIRTIME_RESEND_PCT), and a clean one counts as 100. Until a
---    station's first window (or on a driver without tx duration) the tx
---    rate against its ceiling stands in (rate_pct()).
---  * cov: SNR against the radio's noise floor, 5 dB -> 0, 20 dB -> 90,
---    25 dB -> 100 (Cisco's data-grade guideline is 20 dB; Meraki counts
---    <=15 dB as poor), smoothed per station so 1 dB of jitter doesn't flip
---    the bucket.
--- Power-save clients score lower on dl: frames sent while they doze are
--- re-sent, and that airtime is lost to everyone on the radio.
--- The iw retry/failed counters only gate dl and are never scored: they mean
--- different things per driver (mt76's tx failed counts failed attempts and
--- can exceed packets; ath10k's is always 0), and neither tracked ping loss
--- on hardware (see PROTOCOL-VALIDATION.md).
--- The uplink rate isn't scored. iw's rx bitrate is the last frame's (6 Mbit/s
--- legacy and 20 MHz frames turn up among a phone's 80 MHz ones), a weak
--- uplink already shows in the SNR (the signal is the client's, as heard by
--- the AP), and interference at the client shows in dl's re-sends. What it
--- alone saw on hardware was phones choosing low rates on clean links: a
--- Pixel at -62 dBm sent HE MCS 3 on two streams (288 Mbit/s) where a laptop
--- at -60 sent MCS 9, and scored Poor with SNR 30 and a clean downlink.
--- snr: dB (nil when signal is unknown), dl: 0-100 or nil (unknown: the
--- term is skipped). Returns an integer 0-100, or nil without snr.
-local function snr_score(snr)
-	if snr <= 5 then return 0 end
-	if snr <= 20 then return (snr - 5) * 6 end
-	if snr <= 25 then return 90 + (snr - 20) * 2 end
-	return 100
-end
-
-local function estimate_satisfaction(snr, dl)
-	if not snr then return nil end
-	local score = snr_score(snr)
-	if dl and dl < score then score = dl end
-	if score < 0 then score = 0 end
-	return math.floor(score)
-end
-
--- Relative data rate per spatial stream at 20 MHz, indexed by MCS + 1:
--- HT/VHT MCS 0-9 and HE MCS 0-11 (Mbit/s at long GI). Only ratios are used,
--- so GI cancels out.
-local VHT_MCS_RATE = {6.5, 13, 19.5, 26, 39, 52, 58.5, 65, 78, 86.7}
-local HE_MCS_RATE = {8.6, 17.2, 25.8, 34.4, 51.6, 68.8, 77.4, 86, 103.2, 114.7, 129, 143.4}
--- Data subcarriers per channel width, which is what a wider channel scales.
-local WIDTH_SUBCARRIERS = {[20] = 52, [40] = 108, [80] = 234, [160] = 468}
-
--- The station's ceiling in Mbit/s (long GI): its association caps
--- (sysinfo.hostapd_sta_caps) capped by the AP's own stream count and live
--- channel width, at one MCS below the top. Rate control only probes the top
--- MCS and keeps stepping between it and the next, so a ceiling at the top
--- made a -48 dBm client alternating VHT MCS 8/9 swing across the
--- Good/Excellent line on every sample. nil without caps.
-local function sta_ceiling_mbps(caps, ap_nss, ap_width)
-	if not caps then return nil end
-	local ceil = (caps.mode == "he" and HE_MCS_RATE or VHT_MCS_RATE)[caps.max_mcs]
-	local nss = caps.nss
-	if ap_nss and ap_nss < nss then nss = ap_nss end
-	local width = caps.width
-	if ap_width and ap_width < width then width = ap_width end
-	local sc = WIDTH_SUBCARRIERS[width]
-	if not (ceil and sc) then return nil end
-	return ceil * nss * sc / WIDTH_SUBCARRIERS[20]
-end
-
--- One direction's rate (sta_table's generation, MCS, NSS and width for tx
--- or rx) as a percentage of ceil_mbps. nil when either side is unknown: a
--- legacy rate, no ceiling, or an EHT rate (no table here).
-local function rate_pct(gen, mcs, nss, width, ceil_mbps)
-	if not (ceil_mbps and mcs) then return nil end
-	local rate
-	if gen == "ax" then
-		rate = HE_MCS_RATE[mcs + 1]
-	elseif gen == "ac" then
-		rate = VHT_MCS_RATE[mcs + 1]
-	elseif gen == "n" then
-		-- HT MCS indexes run on across streams: MCS 15 is MCS 7 on two.
-		rate = VHT_MCS_RATE[mcs % 8 + 1]
-	end
-	local sc = WIDTH_SUBCARRIERS[width or 20]
-	if not (rate and sc) then return nil end
-	local pct = rate * (nss or 1) * sc / WIDTH_SUBCARRIERS[20] * 100 / ceil_mbps
-	if pct > 100 then pct = 100 end
-	return pct
-end
-
--- Downlink airtime efficiency over one window of pkts frames and bytes
--- bytes that took dur_us of airtime: the ideal airtime (overhead_us per
--- frame plus the payload at ceil_mbps) as a percentage of the actual,
--- capped at 100. Aggregated traffic beats the per-frame cost and caps out,
--- so the term only bites on links that spend airtime they shouldn't.
-local function airtime_pct(pkts, bytes, dur_us, ceil_mbps, overhead_us)
-	if not ceil_mbps or dur_us <= 0 then return nil end
-	local ideal = pkts * overhead_us + bytes * 8 / ceil_mbps
-	local pct = ideal * 100 / dur_us
-	if pct > 100 then pct = 100 end
-	return pct
-end
-
 -- ─── JSON payload builder ────────────────────────────────────────────────────
 
 -- ISO 3166-1 alpha-2 -> numeric, for the payload's country_code field. The
@@ -809,9 +666,10 @@ function M.build_json(st, cfg, ufhw)
 	-- wireless client bridged into br-lan (and thus also visible in the
 	-- bridge FDB) is never double-reported as a wired client too.
 	local station_macs = {}
-	-- Device-level satisfaction accumulator, filled by the per-VAP station
-	-- loop further down and consumed at payload assembly.
-	local sat_sum_all, sat_count_all = 0, 0
+	-- WiFi Experience tallies, one per VAP, filled by the per-VAP station
+	-- loop further down: all of them for the device's score, and per radio
+	-- for that radio's (see satisfaction.lua).
+	local sat_tallies, sat_tallies_by_radio = {}, {}
 	-- The device's own MACs (its netdevs) -- excluded from port_table's
 	-- mac_table for the same reason: without this, the AP would report
 	-- itself as a wired client of its own switch.
@@ -872,8 +730,8 @@ function M.build_json(st, cfg, ufhw)
 		-- loop) so the enforcement check further down is a plain
 		-- sta.signal comparison.
 		local minrssi_threshold_by_radio = {}
-		-- Live channel width and noise floor per radio, for satisfaction.
-		local width_by_radio, noise_by_radio = {}, {}
+		-- Live noise floor per radio, for satisfaction.
+		local noise_by_radio = {}
 		for _, radio in ipairs(radio_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
@@ -885,7 +743,6 @@ function M.build_json(st, cfg, ufhw)
 				-- Radios tab excluded the device entirely.
 				local ok_caps, caps = pcall(M._sysinfo.radio_caps, ifname)
 				if ok_caps and caps then
-					width_by_radio[radio.name] = caps.width
 					caps.width = nil
 					for k, v in pairs(caps) do radio[k] = v end
 					-- The live negotiated channel is band-authoritative once
@@ -1272,22 +1129,12 @@ function M.build_json(st, cfg, ufhw)
 			-- and Roaming Assistant below. A private pre-shared key's VLAN
 			-- netdev lists its own stations but has no hostapd of its own,
 			-- so those go to the VAP's.
-			--
-			-- sta_caps: each station's association ceiling, read once per
-			-- hostapd BSS (a PPSK VLAN netdev's stations are its BSS's).
-			local stas, sta_ifname, sta_caps, caps_read = {}, {}, {}, {}
+			local stas, sta_ifname = {}, {}
 			for _, ifname in ipairs(ok_if and ifnames or {}) do
 				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
 				if ok_sta then
 					local bss = ufuci.bss_ifname and ufuci.bss_ifname(ifname) or ifname
 					if vap.name then M._vap_by_ifname[bss] = vap.name end
-					if not caps_read[bss] and M._sysinfo.hostapd_sta_caps then
-						caps_read[bss] = true
-						local ok_c, c = pcall(M._sysinfo.hostapd_sta_caps, bss)
-						if ok_c then
-							for mac, v in pairs(c) do sta_caps[mac] = v end
-						end
-					end
 					for _, sta in ipairs(rv2) do
 						stas[#stas + 1] = sta
 						sta_ifname[#stas] = bss
@@ -1302,17 +1149,24 @@ function M.build_json(st, cfg, ufhw)
 			-- summing each connected station's own counters (iw(8) doesn't
 			-- expose a single already-aggregated per-radio/per-VAP counter,
 			-- only per-station ones). rx_dropped/rx_errors/tx_errors/
-			-- satisfaction have no source data anywhere in iw's output (ARQ
-			-- retry/failure counters are inherently TX-side only) -- left
-			-- unset rather than invented, matching sta_table's existing
-			-- linkscore/multicast precedent.
+			-- have no source data anywhere in iw's output (ARQ retry/failure
+			-- counters are inherently TX-side only) -- left unset rather than
+			-- invented, matching sta_table's existing linkscore/multicast
+			-- precedent.
 			local vap_rx_bytes, vap_tx_bytes = 0, 0
 			local vap_rx_packets, vap_tx_packets = 0, 0
 			local vap_tx_retries, vap_tx_dropped = 0, 0
 			local signal_sum, signal_count = 0, 0
-			-- Per-VAP satisfaction accumulator; the device-level one lives
-			-- outside this loop (sat_sum_all/sat_count_all) -- see below.
-			local sat_sum, sat_count = 0, 0
+			-- This VAP's WiFi Experience tally (see sat_tallies above).
+			local sat = M._satisfaction
+			local tally = sat.tally()
+			sat_tallies[#sat_tallies + 1] = tally
+			sat_tallies_by_radio[vap.radio_name] = sat_tallies_by_radio[vap.radio_name] or {}
+			table.insert(sat_tallies_by_radio[vap.radio_name], tally)
+			-- tx failed counts dropped frames on most drivers but failed
+			-- attempts on mt76 (satisfaction.failed_is_dropped).
+			local failed_is_dropped = sat.failed_is_dropped(
+				M._sysinfo.wifi_driver and M._sysinfo.wifi_driver(ok_if and ifnames[1]))
 			local sta_table = {}
 			for sta_i, sta in ipairs(stas) do
 				local ifname = sta_ifname[sta_i]
@@ -1363,92 +1217,35 @@ function M.build_json(st, cfg, ufhw)
 				-- fraction of attempts. Confirmed real field names/semantics
 				-- via the decompiled wireless-client model
 				-- (com.ubnt.service.l.e.AQODNNoMmBlFpWXX) and unpoller/unifi's
-				-- REST client struct. Lifetime values; the satisfaction
-				-- estimate doesn't use them (see estimate_satisfaction()).
+				-- REST client struct. Lifetime values; WiFi Experience uses
+				-- its own per-minute window instead.
 				local wifi_tx_attempts = (sta.tx_packets or 0) + (sta.tx_retries or 0)
 				local wifi_tx_retries_pct = 0
 				if wifi_tx_attempts > 0 then
 					wifi_tx_retries_pct = (sta.tx_retries or 0) * 100 / wifi_tx_attempts
 				end
-				-- Satisfaction terms (see estimate_satisfaction()). Each is
-				-- smoothed, since one sample swings with each rate-control
-				-- step; a sample without data keeps the last value.
-				local function ewma(old, new)
-					if not new then return old end
-					return old and old + M.RATE_EWMA_ALPHA * (new - old) or new
-				end
-				local ceil_mbps = sta_ceiling_mbps(sta_caps[sta.mac:lower()],
-					live and live.nss, width_by_radio[vap.radio_name])
-				local rate_ewma = ewma(prev and prev.rate_ewma, rate_pct(sta.tx_generation,
-					sta.tx_mcs, sta.tx_nss, sta.tx_width, ceil_mbps))
-				-- Downlink airtime: a window from the base counters, closed
-				-- once it holds SAT_AIRTIME_MIN_PKTS frames: its airtime if
-				-- re-sending (see SAT_AIRTIME_RESEND_PCT), else 100.
-				-- A counter going backwards (a new association) restarts it.
-				-- Re-sends: the larger of the retry and failed deltas, since
-				-- mt76 counts failed attempts in both and ath9k in retries.
-				-- A re-sending window's ideal is the station's own fixed cost
-				-- per frame on a clean link (air_base: the last clean windows'
-				-- airtime less their payload, per frame, floored at
-				-- SAT_FRAME_OVERHEAD_US; their median, so one odd window
-				-- doesn't move it), so it is judged on what the re-sends cost.
-				local air_ewma = prev and prev.air_ewma
-				local air_base = prev and prev.air_base or {}
-				local air_pkts, air_bytes, air_dur = prev and prev.air_pkts,
-					prev and prev.air_bytes, prev and prev.air_dur
-				local air_resent = prev and prev.air_resent
-				local tp, tb, td = sta.tx_packets, sta.tx_bytes, sta.tx_duration
-				local resent = math.max(sta.tx_retries or 0, sta.tx_failed or 0)
-				if not (tp and tb and td) then
-					air_pkts, air_bytes, air_dur = nil, nil, nil
-				elseif not air_pkts or tp < air_pkts or tb < air_bytes or td < air_dur then
-					air_pkts, air_bytes, air_dur, air_resent = tp, tb, td, resent
-				elseif tp - air_pkts >= M.SAT_AIRTIME_MIN_PKTS then
-					local pkts, bytes, dur = tp - air_pkts, tb - air_bytes, td - air_dur
-					if (resent - air_resent) * 100 >= M.SAT_AIRTIME_RESEND_PCT * pkts then
-						local sorted = {}
-						for i, v in ipairs(air_base) do sorted[i] = v end
-						table.sort(sorted)
-						air_ewma = ewma(air_ewma, airtime_pct(pkts, bytes, dur, ceil_mbps,
-							sorted[math.floor((#sorted + 1) / 2)] or M.SAT_FRAME_OVERHEAD_US))
-					else
-						air_ewma = ewma(air_ewma, 100)
-						if ceil_mbps then
-							local ov = (dur - bytes * 8 / ceil_mbps) / pkts
-							if ov < M.SAT_FRAME_OVERHEAD_US then ov = M.SAT_FRAME_OVERHEAD_US end
-							local base = {ov}
-							for i = 1, math.min(#air_base, M.SAT_BASELINE_WINDOWS - 1) do
-								base[i + 1] = air_base[i]
-							end
-							air_base = base
-						end
-					end
-					air_pkts, air_bytes, air_dur, air_resent = tp, tb, td, resent
-				end
-				-- Coverage: SNR, noise floored at SAT_NOISE_FLOOR_MIN.
-				local noise = noise_by_radio[vap.radio_name]
-				if not noise or noise == 0 or noise < M.SAT_NOISE_FLOOR_MIN then
-					noise = M.SAT_NOISE_FLOOR_MIN
-				end
-				local snr_ewma = ewma(prev and prev.snr_ewma, sta.signal and sta.signal - noise)
+				-- WiFi Experience, the firmware's formula (satisfaction.lua):
+				-- SNR from the averaged signal, the last tx/rx rates, and the
+				-- retry term over the last completed minute.
+				local win = sat.window(prev and prev.sat_window, {
+					packets = sta.tx_packets, retries = sta.tx_retries,
+					dropped = failed_is_dropped and sta.tx_failed or 0,
+				}, now)
 				M._sta_stats_cache[sta.mac] = {
 					rx_bytes   = sta.rx_bytes or 0,
 					tx_bytes   = sta.tx_bytes or 0,
 					time       = now,
-					rate_ewma  = rate_ewma,
-					air_ewma   = air_ewma,
-					air_pkts   = air_pkts,
-					air_bytes  = air_bytes,
-					air_dur    = air_dur,
-					air_resent = air_resent,
-					air_base   = air_base,
-					snr_ewma   = snr_ewma,
+					sat_window = win,
 				}
-				local satisfaction_now = estimate_satisfaction(sta.signal and snr_ewma,
-					air_ewma or rate_ewma)
+				local mov = win.mov or {}
+				local satisfaction_now, satisfaction_reason, anomalies = sat.score{
+					snr = sat.snr(sta.signal_avg or sta.signal, noise_by_radio[vap.radio_name]),
+					tx_kbps = sta.tx_bitrate and math.floor(sta.tx_bitrate * 1000 + 0.5),
+					rx_kbps = sta.rx_bitrate and math.floor(sta.rx_bitrate * 1000 + 0.5),
+					tries = mov.tries, retries = mov.retries, dropped = mov.dropped,
+				}
 				if satisfaction_now then
-					sat_sum, sat_count = sat_sum + satisfaction_now, sat_count + 1
-					sat_sum_all, sat_count_all = sat_sum_all + satisfaction_now, sat_count_all + 1
+					tally.add(satisfaction_now, satisfaction_reason, anomalies)
 				end
 
 				sta_table[#sta_table + 1] = {
@@ -1527,16 +1324,15 @@ function M.build_json(st, cfg, ufhw)
 					nss         = sta.tx_nss or 1,
 					wifi_tx_attempts = wifi_tx_attempts,
 					wifi_tx_retries_percentage = wifi_tx_retries_pct,
-					-- satisfaction/satisfaction_now: see estimate_satisfaction()
-					-- above for the full provenance/caveat. The controller
-					-- does no computation of its own -- it only reads
-					-- "satisfaction" straight off whatever the AP sent here
-					-- (confirmed via decompile) and maintains a running
-					-- satisfaction_avg -- so a real device's on-device score
-					-- must be approximated here or the client's "WiFi
-					-- Experience" stays permanently blank.
-					satisfaction     = satisfaction_now,
-					satisfaction_now = satisfaction_now,
+					-- WiFi Experience (satisfaction.lua). The controller
+					-- computes none of it: it stores what the AP sends.
+					-- satisfaction_reason is the bit of the term that set the
+					-- score, anomalies the bitmask of every weak term; both
+					-- are on the controller's client model (getOptionalLong).
+					satisfaction        = satisfaction_now,
+					satisfaction_now    = satisfaction_now,
+					satisfaction_reason = satisfaction_reason,
+					anomalies           = anomalies,
 				}
 			end
 			vap.sta_table  = arr(sta_table)
@@ -1608,15 +1404,13 @@ function M.build_json(st, cfg, ufhw)
 			-- already has -- with this absent, the Devices list showed
 			-- "No Clients" in the Experience column on an AP with eight
 			-- connected clients, all of them individually scored (96, 82,
-			-- 93 ...) in the Clients view.
-			--
-			-- Omitted entirely, rather than sent as 0, when the VAP has no
-			-- clients: 0 would read as "terrible experience" where "nothing
-			-- to measure" is the truth, and "No Clients" is then the correct
-			-- thing for the UI to say.
-			if sat_count > 0 then
-				vap.satisfaction = math.floor(sat_sum / sat_count + 0.5)
-			end
+			-- 93 ...) in the Clients view. -1 with no clients, as the
+			-- firmware sends it; the controller's stat archiver skips -1.
+			-- The two bar charts count this VAP's clients per anomaly and
+			-- per limiting term (fill_wireless_info_full in the firmware).
+			vap.satisfaction = tally.mean()
+			vap.anomalies_bar_chart = tally.chart(sat.ANOMALY_KEYS)
+			vap.reasons_bar_chart = tally.chart(sat.REASON_KEYS)
 			-- cu_total/cu_self_rx/cu_self_tx/cu_interf: same per-radio channel-
 			-- utilization figures as radio_table_stats, duplicated onto each
 			-- VAP on that radio -- see radio_cu_stats above for why.
@@ -1632,6 +1426,16 @@ function M.build_json(st, cfg, ufhw)
 		if M._roamassist and #roam_obs > 0 then
 			pcall(M._roamassist.tick, roam_obs, now,
 				{diff_db = cfg and cfg.config and cfg.config.roam_assist_diff_db})
+		end
+		-- Each radio's WiFi Experience, beside its channel utilisation in
+		-- athstats: the controller builds radio_table_stats' satisfaction
+		-- from athstats.satisfaction (default -1, devmgr), and the firmware
+		-- fills it from the radio's VAPs (calc_radio_satisfaction).
+		for _, radio in ipairs(radio_table) do
+			if radio.athstats then
+				radio.athstats.satisfaction =
+					M._satisfaction.rollup(sat_tallies_by_radio[radio.name] or {})
+			end
 		end
 		-- Forget stations not seen for ten minutes. Each entry is tiny, but
 		-- the table is keyed by CLIENT MAC and was never emptied, so on a
@@ -1995,14 +1799,14 @@ function M.build_json(st, cfg, ufhw)
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
 		wifi_caps2       = 0x60,
 		-- Device-level (not per-radio -- see radio_table_stats above)
-		-- Device-level Experience: the mean of every connected client's own
-		-- satisfaction, across all VAPs. Same reasoning as the per-VAP copy
-		-- above -- the controller does not aggregate the per-client scores it
-		-- already holds, so without this the Devices list reads "No Clients"
-		-- however many are connected. nil (not 0) with no clients, so the
-		-- column says "No Clients" only when that is actually true.
-		satisfaction     = sat_count_all > 0
-			and math.floor(sat_sum_all / sat_count_all + 0.5) or nil,
+		-- Device-level Experience: the VAP scores weighted by their client
+		-- counts (calc_ap_satisfaction, see satisfaction.lua). The controller
+		-- does not aggregate the per-client scores it already holds, so
+		-- without this the Devices list reads "No Clients" however many are
+		-- connected. -1 with no clients, as the firmware sends it: the
+		-- controller copies this field only when present, so leaving it out
+		-- kept the last score on an AP whose clients had all left.
+		satisfaction     = M._satisfaction.rollup(sat_tallies),
 		-- True from the spectrum-scan cmd until its sweep has run (see
 		-- _tick). The controller refuses another scan while it is true.
 		-- (spectrum_scan_timestamp is not sent: the controller stamps it

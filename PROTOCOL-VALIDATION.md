@@ -2372,7 +2372,7 @@ Established 2026-10-10 on lab 10.4.57 (CFR decompile plus REST), and on UAP firm
 | **`radio_name`** | The UCI device name (`radio0`) — a separate, real field on the same DTO. This is what `get_ifname_for_radio()` needs. |
 | `encryption`, `disabled`, `bssid`, `channel`, `tx_power`, `usage` | `usage` is `"user"` |
 | `num_sta` | Coexists with the nested `sta_table` on the real DTO |
-| `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets`, `tx_retries`, `tx_dropped` | The UI's "Air Stats" panel. `iw` exposes these only per-station, so they're summed across connected stations while building `sta_table`. `rx_dropped`/`rx_errors`/`tx_errors`/`satisfaction` have no source in `iw` output at all — left unset rather than invented (802.11 ARQ retry/failure counters are inherently TX-side only). |
+| `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets`, `tx_retries`, `tx_dropped` | The UI's "Air Stats" panel. `iw` exposes these only per-station, so they're summed across connected stations while building `sta_table`. `rx_dropped`/`rx_errors`/`tx_errors` have no source in `iw` output at all — left unset rather than invented (802.11 ARQ retry/failure counters are inherently TX-side only). |
 | `avg_client_signal` | Mean `signal` of associated clients, dBm. Omitted entirely when the VAP has no clients. |
 | `cu_total`, `cu_self_rx`, `cu_self_tx`, `cu_interf` | Mirrored from the radio |
 | `sta_table[]` | Nested — see below |
@@ -2405,7 +2405,7 @@ Nested, **not** a flat top-level `user_table`.
 | `radio_proto` | Read only by the **disconnect-time** archive path (`TtZhv`) |
 | **`is_11n`, `is_11ac`, `is_11ax`, `is_11be`** | What the **live** display actually uses — see below |
 | `wifi_tx_attempts`, `wifi_tx_retries_percentage` | `attempts = tx_packets + tx_retries` |
-| `satisfaction`, `satisfaction_now` | Best-effort estimate — see below |
+| `satisfaction`, `satisfaction_now`, `satisfaction_reason`, `anomalies` | The firmware's own formula — see below |
 | `capacity`, `throughput`, `linkscore`, `multicast` | Best-effort / placeholders — see below |
 | `name` | Omitted — controller/admin-assigned, no local source |
 
@@ -2447,15 +2447,77 @@ Never `b` — real dual-band 11n+ hardware doesn't negotiate down to 802.11b-onl
 straight passthrough — `com.ubnt.service.l.e.AcrQJeJCScLn`:
 `wifi_experience_score = doc.getOptionalInt("satisfaction")`. The wireless-client model
 (`com.ubnt.service.l.e.AQODNNoMmBlFpWXX`) reads `satisfaction`, `satisfaction_now`,
-`satisfaction_real`, `satisfaction_reason`, `wifi_tx_attempts`, `wifi_tx_retries_percentage`,
-`tx_mcs`, `ccq`, `noise`, `nss` as **plain data**; the controller computes nothing itself beyond
-a running `satisfaction_avg` accumulator. Real AP firmware computes it on-device with a
-proprietary formula. Sending nothing renders as "No Experience", correctly.
+`satisfaction_real`, `satisfaction_reason`, `anomalies` (`getOptionalLong`),
+`wifi_tx_attempts`, `wifi_tx_retries_percentage`, `tx_mcs`, `ccq`, `noise`, `nss` as **plain
+data**; the controller computes nothing itself beyond a running `satisfaction_avg` accumulator.
+Sending nothing renders as "No Experience", correctly.
+
+**The formula is the firmware's (firmware-confirmed for 4.0.15, 2026-10-10).** UAP BZ2 4.0.15 is
+plaintext; `libubnt.so.1.0.0` exports `calc_sta_satisfaction`, `calc_vap_satisfaction`,
+`calc_radio_satisfaction`, `calc_ap_satisfaction` and `fill_stainfo_json` (offset → JSON key).
+3.9.27 has none of them. Decoded from the MIPS code, a client's score is the lowest of six
+integer terms:
+
+| Term (reason bit) | Input (`fill_stainfo_json` key) | Score | Anomaly bit when |
+|---|---|---|---|
+| signal (0x1) | `rssi` = SNR in dB; `signal` is emitted as `rssi + max(noise, −96)` | < 5 → 0; 5–14 → 5·snr + 15; ≥ 15 → min(snr + 75, 100) | < 50 |
+| phy_rate (0x2) | `tx_rate`, `rx_rate` (kbps): ⌊tx/2⌋ + ⌊rx/2⌋, or the non-zero one; both 0 → 100 | ≤ 6000 → 10, ≤ 12000 → 25, ≤ 18000 → 50, ≤ 24000 → 70, ≤ 36000 → 75, ≤ 54000 → 80, ≤ 100000 → 85, ≤ 200000 → 90, ≤ 400000 → 95, else 100 | ≤ 12000 |
+| tcp_packet_loss (0x4) | `rx_tcp_stats.stalls` + `tx_tcp_stats.stalls` ÷ an unexported u16 | 100 − 10·min(n, 10) | < 50 |
+| tcp_latency (0x8) | `rx_tcp_stats.lat_avg` + `tx_tcp_stats.lat_avg` = s | s < 100 → 100, else 100 − (min(s, 600) − 100)/5 | < 50 |
+| wifi_retries (0x10) | `tx_retries_mov` ÷ `tx_packets_mov` = p % (truncated) | retries > packets → 0; no packets → 100; p ≤ 25 → 100, else 100 − ⌊(100p − 2500)/75⌋; then − min(`tx_dropped_mov`, 100), ≥ 0 | < 50 (or retries > packets) |
+| wifi_latency (0x80) | `wifi_tx_latency_mov.avg` = a | 100 − min(a, 20000)/200 | a ≥ 10000 |
+
+`satisfaction_reason` is the bit of the term that set the score: 0x1 when signal < 100, else 0,
+and each later term takes it only when strictly lower. `anomalies` ORs every term's bit
+whichever won. 0x20 `poor_stream_eff` and 0x40 `sleepy_client` are chart keys the function never
+sets. The `_mov` counters come from the driver (`umac.ko`, not stripped): `sta_stat_iter`, run by
+a 60000 ms timer (`ubnt_sta_stat_timer_expired`), stores current − snapshot and re-snapshots, so
+they are the last completed minute. The TCP terms come from the driver's own TCP inspection
+(`ubnt_calc_tcp_stats`) and the latency term from `_ubnt_log_txtime`; mac80211 has neither, so
+openUF scores them 100, which is what the formula gives with no TCP seen.
+
+Roll-ups: a VAP's `satisfaction` is the truncated mean of its clients', capped at 100, **−1
+with none**. A radio's (`athstats.satisfaction`) and the device's are Σ(clients × VAP score) ÷
+Σ clients, truncated, −1 with none. `fill_wireless_info_full` also counts, per VAP, the clients
+with each anomaly bit (`anomalies_bar_chart`) and each reason bit (`reasons_bar_chart`), each a
+JSON object of the eight keys (`anomalies_bar_chart_keys`: weak_signal, low_phy_rate,
+high_tcp_packet_loss, high_tcp_latency, high_wifi_retries, poor_stream_eff, sleepy_client,
+high_wifi_latency; `reasons_bar_chart_keys`: signal, phy_rate, tcp_packet_loss, tcp_latency,
+wifi_retries, stream_eff, sleepy_client, wifi_latency). mcad sends `satisfaction`,
+`anomalies_bar_chart`, `reasons_bar_chart` and `avg_client_signal` per VAP,
+`athstats.satisfaction` per radio and `satisfaction` at the top level.
+
+Controller side (10.x jar, CFR): `devmgr/PGOcbDWlbnYQdFW` builds `radio_table_stats[].satisfaction`
+from `radio_table[].athstats.satisfaction`, default −1 (openUF never sent it before, so every
+radio read −1); the device doc copies top-level `satisfaction` only when present
+(`copyAttrsIfPresent`), so an absent value kept the last score; the stat archiver
+(`system/QDcGUYAmLvJwylXw`) treats a VAP's −1 as no data.
+
+openUF's sources: SNR from `iw`'s `signal avg` (the last frame's `signal` without it) over the
+radio's in-use survey noise; rates from `tx/rx bitrate` × 1000; the retry window from
+`tx packets`/`tx retries`/`tx failed` deltas over ≥ 60 s; `tx failed` as drops except on mt76
+(driver name `mt7*` from `/sys/class/net/<if>/device/driver`), where it counts failed attempts
+(table below).
+
+Verified 2026-10-10: ✅ lab (10.4.57) stores client `satisfaction`/`satisfaction_reason`/
+`anomalies`, both VAP charts, `radio_table_stats` satisfaction 85/100 and the device's 90 =
+(2·85 + 100)/3. ✅ Real controller (10.6.106), both APs: device 89/88, radios 98/83 and 84/100,
+a client-less VAP −1, each client's score and reason. ⚠️ 10.6.106 lists `anomalies: -1` for
+every client although the payload carries 0; 10.4.57 stores the 0. Not traced yet.
+
+Read-only side-by-side on both APs before the switch (40 samples, same `iw` reads): 5 GHz
+clients 95–100 both ways; 2.4 GHz clients 100 → 75–85, all bound by phy_rate. A single-stream
+HT20 client's top rate (72.2 Mbit/s) is ≤ 100000 kbps → 85, and an idle client's last rx frame
+is often a 6–12 Mbit/s legacy one, which lowers the mean.
+
+The estimator this replaced (min of downlink airtime efficiency and SNR, EWMA-smoothed; the
+history below) was openUF's own design, not UniFi's.
 
 **Per-driver tx counters (hardware, 2026-09-27).** `iw station dump`'s `tx retries` and
-`tx failed` don't mean the same thing on every driver, and neither tracks end-to-end loss, so the
-satisfaction estimate doesn't score them. Since 2026-10-08 the larger of the two only decides
-whether a window's airtime is judged (*Airtime on a clean link* below). Each check pinged a client from the AP 150 times (1/s) and
+`tx failed` don't mean the same thing on every driver, and neither tracks end-to-end loss. The
+firmware formula reads `tx retries` per frame (which mt76's failed-attempt count matches) and
+`tx failed` as frames dropped (which mt76's does not, so it is ignored there). Each check pinged
+a client from the AP 150 times (1/s) and
 diffed the station's counters across the run:
 
 | driver (`/sys/class/ieee80211/phyN/device/driver`) | Δ tx packets | Δ tx retries | Δ tx failed | ICMP lost |
@@ -2473,6 +2535,8 @@ diffed the station's counters across the run:
 - ath9k: `tx retries` counts every retry attempt, and can exceed tx packets. `tx failed` stayed
   small, but with no loss on the link it can't be shown to measure loss.
 - ath10k: `tx failed` is never reported (0).
+
+_History: the estimator before 2026-10-10. The four notes below explain the airtime terms it used._
 
 **Per-station airtime and the link it measures (hardware, 2026-09-27).** `iw station dump`'s
 `tx duration` (µs) is mac80211's per-station airtime, filled by drivers that call
@@ -2838,7 +2902,7 @@ them for measured values.
 | `sta_table[].capacity` | Negotiated `tx_bitrate` (Mbps, floored) as a proxy for "available bandwidth to this client" |
 | `sta_table[].throughput` | Delta-sampled byte rate (bytes/sec); `0` on first sample for a given MAC |
 | `sta_table[].linkscore`, `.multicast` | `0` placeholders — **no local source and no public reference found for either.** Neither `paultyng/go-unifi`'s `User` model nor `unpoller/unifi`'s `clients.go` has them at all. Still needs live-capture verification. |
-| `sta_table[].satisfaction` | `estimate_satisfaction()`: the worse of two terms, following the downlink/coverage split of commercial controllers (Aruba/Aerohive client health = ideal ÷ actual airtime; Mist coverage and throughput SLEs; Meraki/Cisco SNR thresholds). **Downlink** = the airtime this client's frames would take (its own fixed cost per frame on a clean link, at least 110 µs: see *A station's own clean cost per frame*, plus the payload at its ceiling rate) ÷ the `tx duration` they actually took, one window per ≥ 20 frames, capped at 100, judged only in a window in which the driver re-sent ≥ 20 frames per 100 (the larger of the `tx retries`/`tx failed` deltas). A cleaner window counts as 100: see *Airtime on a clean link*. The ceiling is the stream count, width and top MCS the client associated with (`hostapd_cli all_sta`: `ht_mcs_bitmask`, `rx_vht_mcs_map`, `ht_caps_info`/`vht_caps_info` width bits, `[HE]` flag), capped by the AP's own streams and live channel width, one MCS below the top. Until a first airtime window, or on a driver without `tx duration`, the tx rate ÷ that ceiling stands in. The uplink rate is not scored: see *The uplink rate is not scored* (it was 50 + half the rx rate ÷ the ceiling from c59dbe5 to 2026-10-09). **Coverage** = SNR against the radio's in-use survey noise (floored at −95 dBm: ath9k/ath10k report −107/−106), 5 dB → 0, 20 dB → 90, 25 dB → 100. Each term is smoothed (EWMA α 0.2). The constants are judgements, not UniFi calibration. Replaying the *Per-station airtime* table: dishwasher 24 (Poor; was 93), docked vacuum ~92 (its uplink is too sparse to judge while docked), laptop 94, Mini 74 (Good; was 97–99, since its power-save re-sends cost airtime — accepted). ath10k airtime semantics are ⚠️ unknown (see above). Before this, the score was the worse of the tx rate ÷ ceiling and signal (−85 → 0, −70 → 100), which missed the dishwasher. Signal alone was the score before (−85 → 0, −50 → 100): a 1SS HT20 client at MCS 7 of 7 with 0.8 % retries read Poor at −61 dBm. A retry ratio was scored next (ed8b12b) and removed here: see *Per-driver tx counters* below. Read-only replay of the new code on both APs (2026-09-27, 9 clients) scored every client at or above the deployed build; the ceiling one below the top stops a −48 dBm client alternating VHT MCS 8/9 from crossing the Good/Excellent line each sample. HE ceilings (MCS 0–11 assumed, streams/width from HT/VHT caps) are ⚠️ unconfirmed: no HE client was associated. `wifi_tx_attempts`/`wifi_tx_retries_percentage` stay the lifetime iw values. |
+| `sta_table[].satisfaction` | The firmware's formula (see *The formula is the firmware's*). Its TCP-loss, TCP-latency and WiFi-latency terms are always 100: mac80211 has no source for them |
 | `spectrum_table[].width` | Each 20 MHz reading is repeated once per width the band offers; the UI averages them over a bonded block. No live-scan source measures a bonded block directly |
 | `spectrum_table[].interference` | Noise-floor dBm passed through; `iw survey dump` has no interference metric of its own. Falls back to the pre-sweep reading for any frequency whose post-scan noise comes back `0` (see [the first real-hardware run](#the-first-real-hardware-run)) |
 | `radio_table[].builtin_antenna` = `true`, `.builtin_ant_gain` = `3` (dBi) | **Constants — no software source exists for either.** Not inert: the controller adds the gain to TX power to display EIRP, so a board with different antennas reports a wrong EIRP. Change them in `ucihelper.RADIO_DEFAULTS` if your hardware differs. |

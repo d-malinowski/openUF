@@ -126,9 +126,8 @@ return {
 				assert_eq(stas[2].rx_mcs, 5,                      "second client rx_mcs from 'MCS 5'")
 				assert_eq(stas[2].tx_generation, "n",            "second client is plain HT (bare MCS)")
 				assert_eq(stas[2].tx_nss, 1,                     "second client nss from MCS 6 -> floor(6/8)+1")
-				assert_eq(stas[1].tx_duration, 9835724,          "tx airtime in us")
-				assert_eq(stas[1].rx_duration, 14756520,         "rx airtime in us")
-				assert_eq(stas[2].tx_duration, nil,              "no airtime line: nil, not 0")
+				assert_eq(stas[1].signal_avg, -63,               "running average, its own line")
+				assert_eq(stas[2].signal_avg, -74,               "second client signal_avg")
 			end)
 		end
 	},
@@ -177,46 +176,23 @@ return {
 		end
 	},
 	{
-		name = "sysinfo: hostapd_sta_caps() reads each station's association ceiling",
+		name = "sysinfo: wifi_driver() reads the netdev's driver once",
 		fn = function()
-			-- `hostapd_cli all_sta`, trimmed, as captured on an ath10k VHT
-			-- BSS, an mt76 2.4 GHz BSS, and a legacy-only station.
-			local out = "00:00:5e:00:53:01\n"
-				.. "flags=[AUTH][ASSOC][AUTHORIZED][SHORT_PREAMBLE][WMM][HT][VHT]\n"
-				.. "aid=1\ncapability=0x31\n"
-				.. "rx_vht_mcs_map=fffe\ntx_vht_mcs_map=fffe\n"
-				.. "ht_mcs_bitmask=ff000000010000000000\n"
-				.. "vht_caps_info=0x33c07030\nvht_capab=3070c033feff8601feff8601\n"
-				.. "ht_caps_info=0x006e\next_capab=0000000020000040\n"
-				.. "00:00:5E:00:53:02\n"
-				.. "flags=[AUTH][ASSOC][AUTHORIZED][SHORT_PREAMBLE][WMM][MFP][HT]\n"
-				.. "ht_mcs_bitmask=ff000000000000000000\nht_caps_info=0x0020\n"
-				.. "00:00:5e:00:53:03\n"
-				.. "flags=[AUTH][ASSOC][AUTHORIZED][WMM]\n"
-				.. "00:00:5e:00:53:04\n"
-				.. "flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT][VHT][HE]\n"
-				.. "rx_vht_mcs_map=fffa\nht_mcs_bitmask=ffff0000000000000000\n"
-				.. "vht_caps_info=0x0000000c\nht_caps_info=0x0002\n"
-			with_fixtures({}, {["all_sta"] = out}, function()
-				local c = sysinfo.hostapd_sta_caps("phy0-ap0")
-				local vht = c["00:00:5e:00:53:01"]
-				assert_eq(vht.mode, "vht", "[VHT] flag")
-				assert_eq(vht.nss, 1, "fffe: stream 1 at MCS 0-9, the rest unsupported")
-				assert_eq(vht.max_mcs, 9, "fffe: stream 1 value 2 -> MCS 9")
-				assert_eq(vht.width, 80, "vht_caps_info width set 0 -> 80 MHz")
-				local ht = c["00:00:5e:00:53:02"]
-				assert_not_nil(ht, "MAC keyed lower-case")
-				assert_eq(ht.mode, "ht", "[HT] only")
-				assert_eq(ht.nss, 1, "one ff byte in the HT bitmask")
-				assert_eq(ht.max_mcs, 7, "HT tops out at MCS 7 per stream")
-				assert_eq(ht.width, 20, "ht_caps_info 0x0020: 40 MHz bit clear")
-				assert_true(c["00:00:5e:00:53:03"] == nil, "no HT: no ceiling to compare against")
-				local he = c["00:00:5e:00:53:04"]
-				assert_eq(he.mode, "he", "[HE] flag")
-				assert_eq(he.max_mcs, 11, "HE is taken as MCS 0-11")
-				assert_eq(he.nss, 2, "fffa: two streams")
-				assert_eq(he.width, 160, "vht_caps_info width set 3 -> 160 MHz")
+			sysinfo._driver_cache = {}
+			local calls = 0
+			with_fixtures({}, {["readlink"] = "../../../../bus/platform/drivers/mt798x-wmac\n"}, function()
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd) calls = calls + 1; return orig(cmd) end
+				assert_eq(sysinfo.wifi_driver("phy1-ap0"), "mt798x-wmac", "basename of the link")
+				assert_eq(sysinfo.wifi_driver("phy1-ap0"), "mt798x-wmac", "cached")
+				sysinfo._run_cmd = orig
 			end)
+			assert_eq(calls, 1, "one readlink per netdev")
+			with_fixtures({}, {}, function()
+				assert_nil(sysinfo.wifi_driver("lo"), "no driver link: nil")
+			end)
+			assert_nil(sysinfo.wifi_driver(nil), "no netdev: nil")
+			sysinfo._driver_cache = {}
 		end
 	},
 	{
