@@ -600,7 +600,7 @@ Confirmed `cmd` strings:
 | `kick-sta` | Client → Reconnect | `{"cmd":"kick-sta","mac":"…"}`. Queued only to the AP in the client's `ap_mac`, with no capability gate (`devmgr/KlNisgrKpTMarFmxEJt`). One-shot deauth on every BSS. Lab: REST `cmd/stamgr` → `inform: cmd: kick-sta` on the next heartbeat |
 | `scan` | REST `cmd/devmgr` only (no UI action in 10.4.57) | `{"cmd":"scan","type":"active","mode":"sync"}`, plus `freq` and `radio_name` when given. See [`scan` and `scan_band`](#scan-and-scan_band-a-neighbour-sweep-on-request) |
 | `scan_band` | Radio AI full scan | `{"cmd":"scan_band","band":"na"}`, one per band. Same section |
-| `spectrum-scan` | Airtime Scan (frontend `SPECTRUM_SCAN`) | Handler implemented. The 10.4.57 frontend has the action, but its display gate is not traced, and the controller has never sent it to openUF. |
+| `spectrum-scan` | Airtime Scan ("Scan Now", frontend `SPECTRUM_SCAN`) | Handled since `wifi_caps` `0x10` is claimed (2026-10-10). Without that bit the controller refused the REST call (`api.err.InvalidTarget`) and `stat/spectrum-scan` skipped the AP, so the handler was unreachable. See [Airtime Scan](#airtime-scan-spectrum-scan). |
 
 The block-sta deauth and kick-sta both go to **every BSS** (`ucihelper.ap_ifnames`, VLAN
 netdevs folded into their BSS). Until 2026-10 the block deauth went to
@@ -618,7 +618,7 @@ meaning on an AP:
 
 | Relevant to an AP | Not for an AP / correctly ignored |
 |---|---|
-| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `dl_max`; handled: guest ledger + portal enforcement + per-guest limit, lab-validated only; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update`'s `ul_min`, `dl_min` (a 64 kbps floor, not applied) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
+| `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `dl_max`; handled: guest ledger + portal enforcement + per-guest limit, lab-validated only; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) · `spectrum-scan` (its `spectrum-cfg`, a scan-mode `system_cfg`, is ignored on purpose; see [Airtime Scan](#airtime-scan-spectrum-scan)) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update`'s `ul_min`, `dl_min` (a 64 kbps floor, not applied) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
 Since 2026-10-10 it is also logged by name with a per-name count since the daemon started
@@ -1843,7 +1843,7 @@ Everything openUF sends. Names were audited against the controller's own Device 
 | **`fw_caps`** | `0x110` — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps`** | `0xC`, plus `0x20` (Airtime Fairness) and `0x100000` (Private Pre-Shared Keys) where the device can do them — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps2`** | `0x60` — see [capability bitmasks](#capability-bitmasks) |
-| `spectrum_scanning`, `spectrum_scan_timestamp` | **Device-level**, not per-radio (the per-radio fields are `spectrum_table`/`spectrum_table_time`) |
+| `spectrum_scanning` | **Device-level**, not per-radio (the per-radio fields are `spectrum_table`/`spectrum_table_time`). `spectrum_scan_timestamp` is controller-owned: it stamps it itself (ms) from quick-scan results, and nothing reads it from an inform, so openUF does not send it |
 | `if_table[]` | `name`, `mac`, `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets`, `rx_errors`, `tx_errors` |
 | `radio_table[]`, `radio_table_stats[]`, `vap_table[]`, `scan_radio_table[]`, `port_table[]`, `lldp_table[]` | See below |
 
@@ -1871,11 +1871,12 @@ by the controller's own startup log: `firmware[U6IW] new version (6.8.2.15592) i
 |---|---|---|---|
 | `fw_caps` | `0x10` (16) | `Device.hasQCASwitch()` = `hasFirmwareCapability(16)` | The Ports view's projection of `port_table` into the device DTO doesn't happen. Wired-client *ingestion* is gated only on `isSwitch()` (a model-registry property), so clients still appear in the list — but the Ports view stays empty. |
 | `fw_caps` | `0x100` (256) | `Device.hasOWRTSwitch()` = `hasFirmwareCapability(256)` | Per-port VLAN assignment is rejected outright — see below. |
+| `wifi_caps` | `0x10` (16) | `Device.supportSpectrumScan()` = `hasWifiCapability(16)` | REST `cmd/devmgr spectrum-scan` is refused (`api.err.InvalidTarget`) and `stat/spectrum-scan` leaves the AP out, so Airtime Scan does nothing. Claimed since 2026-10-10. |
 | `wifi_caps2` | `0x40` (64) | `Device.supportAdvertisingDeviceNameInBeacon()` = `hasWifiCapability2(64)` | The controller never emits `wireless.<n>.advertise_ap_name` at all, and doesn't even re-push config on the toggle. |
 | `wifi_caps2` | `0x20` (32) | `Device.supportsAssistedRoaming()` = `hasWifiCapability2(32)` | The controller never emits a WLAN's Roaming Assistant (`wireless.<n>.btm_disassoc.*`). Confirmed live in the lab: set, the keys appear on the 5 GHz entry. |
 
 `wifi_caps2` is a **second, entirely separate** bitmask from `wifi_caps` (which gates
-`supportBandsteering()`/`supportZeroHandoff()`; openUF claims `0x4`/`0x8` and `0x20`, see below). Only bits `0x40` and
+`supportBandsteering()`/`supportZeroHandoff()`; openUF claims `0x4`/`0x8`, `0x10` and `0x20`, see below). Only bits `0x40` and
 `0x20` are claimed; the mask also gates Mesh MLO, quick/neighbour scan, roam topology stats,
 Green AP, ACS-DFS and the multicast suppressor, which openUF does not implement and must not
 claim.
@@ -2150,7 +2151,7 @@ Gated, and not to be claimed:
   - `radio_caps2` `0x400` and `wifi_caps2` `0x1`/`0x4000`/`0x8000`: MLO and Mesh-MLO.
   - `radio_caps` `0x20000`: `radio.<n>.hard_noisefloor.*` / sensitivity level, a QCA RX-sensitivity setting.
   - `wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`: vwire, mesh, meshv3, multi-vport and Element.
-  - `wifi_caps` `0x10` spectrum scan, `0x2000` "open hostapd", `0x40` `bga_filter`, `0x4000000` low-performance mode.
+  - `wifi_caps` `0x2000` "open hostapd", `0x40` `bga_filter`, `0x4000000` low-performance mode.
   - `wifi_caps2` `0x4` Green AP, `0x10` ACS-DFS, `0x80` quick scan, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear).
   - `fw_caps` `0x800000` Hotspot 2.0 (such a WLAN is skipped without it) and `0x20000000` RADIUS `filter_id`.
   - `fw2_caps` `0x80000` RadSec, `0x20` `port_table.mac_table_ipv6`, `0x80` device command retry.
@@ -2268,8 +2269,97 @@ this radio's own tx/rx.
 
 `spectrum_table[]` entries carry `channel`, `center_freq`, `width`, `utilization`,
 `interference` (field names recovered from two independent Lombok DTO constant pools).
-`channel`/`center_freq`/`utilization` come mechanically from survey dump; `width` and
-`interference` are best-effort — see [best-effort fields](#best-effort-and-unverified-fields).
+`channel`/`center_freq`/`utilization` come mechanically from survey dump; `interference` is
+best-effort — see [best-effort fields](#best-effort-and-unverified-fields). Layout and
+`spectrum_table_time` units: see [Airtime Scan](#airtime-scan-spectrum-scan).
+
+### Airtime Scan (`spectrum-scan`)
+
+Established 2026-10-10 on lab 10.4.57 (CFR decompile plus REST), and on UAP firmware
+(firmware-confirmed for 3.9.27 to 4.0.15).
+
+- **Gate.** REST `cmd/devmgr {"cmd":"spectrum-scan","mac":…}` (`devmgr/b/g/qxLeipRTLsKkMM`)
+  throws `api.err.InvalidTarget` unless `supportSpectrumScan()` (`wifi_caps` `0x10`) holds
+  and the AP is wired. `stat/spectrum-scan` (`stat/hhFgUVZPT`), which the UI reads results
+  from, skips any AP without the same bit.
+- **`spectrum_scanning`.** The controller sets it to `true` itself when it queues the cmd
+  and refuses another request while it stays true (`api.err.SpectrumScanInProgress`, UI:
+  "This device is already performing an Airtime Scan."). Every stats inform overwrites it
+  with the device's own value (`PGOcbDWlbnYQdFW`: `is("spectrum_scanning", false)`), the
+  inform that collects the cmd included, so it goes `false` before the AP has scanned
+  anything unless the AP says otherwise. openUF marks the scan pending, reports `true` in the
+  follow-up inform, sweeps once that inform is out, and informs again at once with the
+  results and `false`. Real UCG Ultra, Archer C5: the event websocket's `device:sync`
+  carried `true` for 11 s (the sweep, before the per-channel dwell below made it ~27 s),
+  then `false`.
+- **"Scanning..." stays until a reload.** The Environment tab's Airtime Scan panel holds
+  the AP object it loaded with (its `last_seen` stayed at page load while `device:sync`
+  delivered the AP every second), and Scan Now sets `spectrum_scanning: true` on that copy.
+  Nothing a device reports reaches it, so it shows "Scanning..." until the page is
+  reloaded, after which the results and "Scan Now" are back. Frontend behaviour, not openUF's.
+- **`spectrum-cfg` is a whole replacement `system_cfg`, ignored on purpose.** Captured: 278
+  lines in which every WLAN is replaced by one hidden open `vport-<serial>` SSID, and every
+  radio has `radio.N.rfscan=enabled` and `channel=auto`. The generator
+  (`config/eWivisHeQsnaqDtx`) sets `spectrum_enabled=true` on every radio unconditionally, so
+  the payload carries no scan parameter. UniFi firmware writes it to `/tmp/spectrum.cfg`,
+  restarts onto it (`rc stop; rc start spectrum.cfg`), runs `ubntrfclient` per radio, and
+  restores with `spectrum-scan-restore` (`platdep_funcs.sh`, `syswrapper.sh`): its clients
+  lose the AP for the scan. openUF keeps the WLANs up and scans off-channel instead; see
+  the next item for why, and what that costs.
+- **openUF does not do it the UniFi way, on purpose.** A UniFi AP (a) drops every client
+  for the scan, which the controller's own confirm dialog says can take over five minutes,
+  and (b) measures with `ubntrfclient`, Qualcomm's spectral analysis (FFT of the raw RF,
+  so non-WiFi interference counts). openUF can't match (b) across its boards: ath9k/ath10k
+  expose spectral scan through debugfs, mt76 (AX3000T) exposes nothing comparable. It
+  reads the radio's channel survey instead (`iw … survey dump`: active and busy time, noise
+  floor), which every driver has, and keeps clients on the AP. The cost is data quality:
+  `utilization` is busy/active time over a short listen per channel rather than minutes,
+  and `interference` is the noise floor, not a measured interferer. The chart reads right;
+  its numbers are coarser than a UniFi AP's.
+- **Dwell: one scan per channel, 200 TU, home in between.** Measured 2026-10-10 on both
+  APs as the survey's active time on an off-channel after one scan (each visit replaces
+  the previous value):
+
+  | Radio | default sweep | `passive` | `duration 200` | `duration 500` |
+  |---|---|---|---|---|
+  | Archer C5 ath9k (2.4 GHz) | 79 ms | 119 ms | 219 ms | 518 ms |
+  | Archer C5 ath10k (5 GHz) | 46–146 ms | 146 ms | 196 ms | 496 ms |
+  | AX3000T mt76 (2.4 GHz) | 79–130 ms | 112–159 ms | 213–259 ms | 512–569 ms |
+  | AX3000T mt76 (5 GHz) | 79–116 ms | 116–125 ms | 205–230 ms | 506–515 ms |
+
+  All three drivers honour `duration`, though only the ath10k phy lists `SET_SCAN_DWELL`.
+  `duration-mandatory` produced no dwell at all on ath9k; `passive` with `duration` is
+  refused by iw. A whole sweep never returns to the operating channel: 13 channels took
+  13 dwells end to end (1 s default, 7 s at 500 TU), so a long dwell in one sweep would
+  leave clients without the AP for 7–16 s. openUF therefore scans each channel on its own
+  (`iw … scan freq F duration 200 ap-force`), skips the operating channel (its survey
+  covers all the time the radio spends there), and spends 0.3 s back home between scans.
+  Client impact, pinged from the Archer C5 to a 2.4 GHz client during a real Scan Now: no
+  effect while the 5 GHz radio scanned (~20 s), then 12 round trips of 210–330 ms over ~7 s
+  while its own radio scanned, and 1 of ~150 pings lost; the client stayed associated. The
+  previous default sweep cost one ~1 s gap (1 ping lost). A full scan of the C5 takes ~27 s.
+- **The table travels in `radio_table`, not `radio_table_stats`.** The controller builds
+  its own `radio_table_stats` from the inform's `radio_table` entries and reads
+  `spectrum_table`/`spectrum_table_time` there, beside `athstats` and `scan_table`
+  (`PGOcbDWlbnYQdFW`, the radio-stats loop over `getList("radio_table")`). openUF sent them in
+  `radio_table_stats` until 2026-10-10; the controller dropped them, and `stat/spectrum-scan`
+  returned empty tables after a real scan.
+- **`spectrum_table_time` is an age, in seconds.** The controller stores
+  `now − spectrum_table_time` (`PGOcbDWlbnYQdFW`, both radio-stats paths, `now` in seconds),
+  and the UI shows the stored value as the scan's epoch ("N ago", `1e3 * t`). openUF sent the
+  epoch until 2026-10-10, which would have read as a 1970 scan.
+- **One entry per (channel, width).** The UI chart averages the entries whose `width` equals
+  the chart's width over each bonded block's 20 MHz channels. A third-party tool written
+  against real APs (jpav88/unifi-tools `unifi_spectrum.sh`) filters `width == 20` and reads
+  `interference` as dBm and `utilization` as a percentage, and also reads an optional
+  `interference_type` (radar). openUF lists each 20 MHz survey reading once per width the band
+  offers: 20/40 on 2.4 GHz, 20/40/80 elsewhere, and up to the configured width when wider. It
+  sends no `interference_type`.
+- **Confirmed on the real UCG Ultra (Network 10.5+), 2026-10-10.** Scan Now on the Archer C5
+  (AirView → Environment) delivered the cmd, the sweep ran, and `stat/spectrum-scan`
+  returned 81 entries on 5 GHz (27 channels × 20/40/80) and 26 on 2.4 GHz (13 × 20/40),
+  with `spectrum_table_time` back as the scan's epoch. The chart drew the 20/40/80 MHz rows
+  with per-channel utilization; the 160 MHz row stayed grey, as this radio tops out at 80.
 
 ### `vap_table[]` entry
 
@@ -2749,7 +2839,7 @@ them for measured values.
 | `sta_table[].throughput` | Delta-sampled byte rate (bytes/sec); `0` on first sample for a given MAC |
 | `sta_table[].linkscore`, `.multicast` | `0` placeholders — **no local source and no public reference found for either.** Neither `paultyng/go-unifi`'s `User` model nor `unpoller/unifi`'s `clients.go` has them at all. Still needs live-capture verification. |
 | `sta_table[].satisfaction` | `estimate_satisfaction()`: the worse of two terms, following the downlink/coverage split of commercial controllers (Aruba/Aerohive client health = ideal ÷ actual airtime; Mist coverage and throughput SLEs; Meraki/Cisco SNR thresholds). **Downlink** = the airtime this client's frames would take (its own fixed cost per frame on a clean link, at least 110 µs: see *A station's own clean cost per frame*, plus the payload at its ceiling rate) ÷ the `tx duration` they actually took, one window per ≥ 20 frames, capped at 100, judged only in a window in which the driver re-sent ≥ 20 frames per 100 (the larger of the `tx retries`/`tx failed` deltas). A cleaner window counts as 100: see *Airtime on a clean link*. The ceiling is the stream count, width and top MCS the client associated with (`hostapd_cli all_sta`: `ht_mcs_bitmask`, `rx_vht_mcs_map`, `ht_caps_info`/`vht_caps_info` width bits, `[HE]` flag), capped by the AP's own streams and live channel width, one MCS below the top. Until a first airtime window, or on a driver without `tx duration`, the tx rate ÷ that ceiling stands in. The uplink rate is not scored: see *The uplink rate is not scored* (it was 50 + half the rx rate ÷ the ceiling from c59dbe5 to 2026-10-09). **Coverage** = SNR against the radio's in-use survey noise (floored at −95 dBm: ath9k/ath10k report −107/−106), 5 dB → 0, 20 dB → 90, 25 dB → 100. Each term is smoothed (EWMA α 0.2). The constants are judgements, not UniFi calibration. Replaying the *Per-station airtime* table: dishwasher 24 (Poor; was 93), docked vacuum ~92 (its uplink is too sparse to judge while docked), laptop 94, Mini 74 (Good; was 97–99, since its power-save re-sends cost airtime — accepted). ath10k airtime semantics are ⚠️ unknown (see above). Before this, the score was the worse of the tx rate ÷ ceiling and signal (−85 → 0, −70 → 100), which missed the dishwasher. Signal alone was the score before (−85 → 0, −50 → 100): a 1SS HT20 client at MCS 7 of 7 with 0.8 % retries read Poor at −61 dBm. A retry ratio was scored next (ed8b12b) and removed here: see *Per-driver tx counters* below. Read-only replay of the new code on both APs (2026-09-27, 9 clients) scored every client at or above the deployed build; the ceiling one below the top stops a −48 dBm client alternating VHT MCS 8/9 from crossing the Good/Excellent line each sample. HE ceilings (MCS 0–11 assumed, streams/width from HT/VHT caps) are ⚠️ unconfirmed: no HE client was associated. `wifi_tx_attempts`/`wifi_tx_retries_percentage` stay the lifetime iw values. |
-| `spectrum_table[].width` | The radio's configured `htmode` (e.g. `HT40` → 40) as a uniform approximation — no live-scan source gives per-channel width |
+| `spectrum_table[].width` | Each 20 MHz reading is repeated once per width the band offers; the UI averages them over a bonded block. No live-scan source measures a bonded block directly |
 | `spectrum_table[].interference` | Noise-floor dBm passed through; `iw survey dump` has no interference metric of its own. Falls back to the pre-sweep reading for any frequency whose post-scan noise comes back `0` (see [the first real-hardware run](#the-first-real-hardware-run)) |
 | `radio_table[].builtin_antenna` = `true`, `.builtin_ant_gain` = `3` (dBi) | **Constants — no software source exists for either.** Not inert: the controller adds the gain to TX power to display EIRP, so a board with different antennas reports a wrong EIRP. Change them in `ucihelper.RADIO_DEFAULTS` if your hardware differs. |
 | `radio_caps().has_fccdfs` | Mirrors `has_dfs`; `iw` exposes no separate FCC-DFS indication |
@@ -2757,7 +2847,7 @@ them for measured values.
 | `port_table[].media` = `"GE"`, `.enable` = `true`, `.speed_caps` = `0`, `.port_poe` = `false`, `.poe_caps` = `0` | Constants. The PoE ones are honest for every target board (none source PoE); `media`/`speed_caps` are unmodelled. `speed`/`full_duplex`/`up` **are** measured — per physical socket via swconfig where the board has a switch, else from sysfs |
 | `port_table[].rx_packets`/`tx_packets`/`rx_errors`/`tx_errors` on a per-socket entry | `0`. swconfig's per-port MIB exposes byte counters only (`RxGoodByte`/`TxByte`), and the CPU netdev's packet/error totals belong to every socket at once. A downstream socket's `rx_bytes`/`tx_bytes` are likewise `0` on a driver with no MIB (AR8327 with polling off) rather than a share of the CPU total |
 | `serial` | Derived from the device MAC with the colons stripped — a real AP's serial is a separate factory value openUF has no equivalent of |
-| `spectrum_scanning` = `false` | Always false: scans are run synchronously inside the cmd handler, so the device is never "currently scanning" when a payload is built |
+| `spectrum_scanning` | `true` only in the inform between the spectrum-scan cmd and its sweep; see [Airtime Scan](#airtime-scan-spectrum-scan) |
 | `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
 | `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
 | `fw_caps` = `0x110`, `wifi_caps2` = `0x60` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
@@ -2989,7 +3079,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 5 | Fast Roaming (802.11r) | `aaa.<n>.ft.status` only | ✅ Confirmed by byte-for-byte `system_cfg` diff, both directions |
 | 6 | TX power / channel per radio | `radio.<n>.channel`/`.txpower`/`.txpower_mode` | ✅ Confirmed |
 | 7 | Locate | `cmd:"set-locate"` | ✅ Confirmed, including the **LED hardware effect on a real board** (Archer C5, `dev.conf.led = "green:system"`): `locate_start` writes `trigger=timer` + 250/250 ms, `locate_stop` restores `trigger=none`, and the Manage → LED toggle drives `brightness` 1/0 |
-| 8 | RF/spectrum scan trigger | `cmd:"spectrum-scan"` | ✅ Handler exercised **against real radios** — 27 channels on 5 GHz, 13 on 2.4 GHz, with genuine per-channel utilization and noise. Still **no manual trigger control exists anywhere in 10.4.57's UI** (AirView is passive), so it has never been fired *by the controller*; the handler was invoked directly on the device. That run used a plain `iw dev <if> scan`, and the sweep was real. On 2026-09-25 plain and `scan ap-force` returned identical off-channel results on both boards (Archer C5 ath9k/ath10k, AX3000T mt76; mac80211 6.18 backports), so these kernels do not refuse a scan on a beaconing AP. The handler now uses `ap-force` as a guard and judges success by iw's exit status. |
+| 8 | RF/spectrum scan trigger | `cmd:"spectrum-scan"` | ✅ Handler exercised **against real radios** — 27 channels on 5 GHz, 13 on 2.4 GHz, with genuine per-channel utilization and noise. The UI's trigger is Airtime Scan ("Scan Now"), which the controller only offers to an AP claiming `wifi_caps` `0x10`; openUF claims it since 2026-10-10 (see [Airtime Scan](#airtime-scan-spectrum-scan)). Before that the handler was only ever invoked directly on the device. That run used a plain `iw dev <if> scan`, and the sweep was real. On 2026-09-25 plain and `scan ap-force` returned identical off-channel results on both boards (Archer C5 ath9k/ath10k, AX3000T mt76; mac80211 6.18 backports), so these kernels do not refuse a scan on a beaconing AP. The handler now uses `ap-force` as a guard and judges success by iw's exit status. |
 | 9 | Firmware upgrade | `_type:"upgrade"` | ✅ Confirmed. openUF stores `upgrade_requested_version`/`_url` and logs — it never downloads, verifies, flashes, or reboots. Verified live: no side effects, device stayed Connected. The pushed `md5sum`/filename match Ubiquiti's real CDN artifact byte-for-byte. |
 | 10 | Forget device / factory reset | `_type:"setdefault"` | ⚠️ UI action and server-side deletion work, but **no `setdefault` was ever dispatched on the wire**; handler unverified. See [open questions](#open-questions). |
 | 11 | `fw.ver` acceptance | — | ✅ Accepted verbatim, no validation beyond storage |
@@ -3036,9 +3126,6 @@ through the real UI with the resulting wire payload captured or the effect verif
 - **`linkscore` and `multicast`** have no known source or reference; currently `0`. Needs a
   live capture from real hardware.
 - **`bootrom_version`** has no counterpart in the device schema. Probably ignored.
-- **The `spectrum-scan` cmd handler** has never received a real controller-issued command.
-  The frontend's Airtime Scan action sends it (`SPECTRUM_SCAN`, found 2026-10-09), but the
-  gate that decides whether that action is shown for openUF is not traced yet.
 - ~~**openUF's `usteer` config option names**~~ — ✅ resolved 2026-09-10, verified against the
   installed package; the option names and the named `local` section are both correct.
   The option openUF toggled was inert, though. See the corrected `USTEER_DEFAULTS` row: the

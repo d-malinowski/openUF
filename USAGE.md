@@ -938,8 +938,23 @@ the reports (hostapd delivers them as ubus *notifications*, so `ubus listen` sho
 — only `ubus subscribe` works), `logread | grep BEACON-REQ-TX-STATUS` shows requests going
 out, and `/tmp/openuf-rrm.jsonl` is the spool, drained on every inform.
 
-Use the controller's RF scan (`spectrum-scan`) when you want a real full sweep. The
-controller's `scan` command (REST `cmd/devmgr {"cmd":"scan","mac":…}`, optionally with
+Use the controller's Airtime Scan ("Scan Now", the `spectrum-scan` command) when you want
+a full sweep with per-channel utilization and noise. A UniFi AP takes its WLANs down for
+the scan (minutes, per the controller's warning) and uses Qualcomm spectral analysis.
+openUF keeps the WLANs up: it scans one channel at a time (`iw dev <if> scan freq <f>
+duration 200 ap-force`, about 200 ms away), goes back to its own channel for 0.3 s, and
+moves on. Clients see round trips of a few hundred ms during their band's part of the
+scan, but stay connected; a two-band AP takes about 30 s. The figures come from the
+radio's channel survey (busy time over that 200 ms listen, and the noise floor), so they
+are coarser than a UniFi AP's: good for spotting a busy channel, not for identifying an
+interferer. The log shows `inform: cmd: spectrum-scan`.
+It's in AirView → Environment → Airtime Scan. The AP reports the scan as running for the
+length of the sweep, and the controller refuses a second request until then.
+A refusal that lasts much longer means the AP isn't informing. The panel keeps showing
+"Scanning..." until you reload the page; the results are there after the reload. The
+controller's own scan settings in the payload (`spectrum-cfg`) are not applied.
+
+The controller's `scan` command (REST `cmd/devmgr {"cmd":"scan","mac":…}`, optionally with
 `radio_name` or `freq`) and Radio AI's full scan (`scan_band`) also sweep for real: openUF
 runs `iw dev <if> scan ap-force` on the requested radio or band before the next inform.
 Each request is logged, e.g. `inform: scan_band: scanned 1 of 1 radio(s)`, and an iw

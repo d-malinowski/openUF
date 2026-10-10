@@ -1098,17 +1098,19 @@ function M.build_json(st, cfg, ufhw)
 					}
 					-- Cached spectrum-scan result, if a "spectrum-scan" cmd
 					-- was handled for this radio (see cmd dispatch below).
-					-- NOTE: spectrum_scanning/spectrum_scan_timestamp are
-					-- device-level (top-level payload) fields, not per-radio
-					-- -- confirmed against the real controller's own device
-					-- schema, which has them at the top level while
-					-- spectrum_table/spectrum_table_time are the per-radio
-					-- fields (see PROTOCOL-VALIDATION.md's
-					-- radio_table_stats reference).
+					-- On the radio_table entry, beside athstats: the
+					-- controller builds its own radio_table_stats from the
+					-- inform's radio_table and reads spectrum_table from
+					-- there (devmgr PGOcbDWlbnYQdFW). Sent in
+					-- radio_table_stats, it was dropped.
+					-- spectrum_table_time is the scan's AGE in seconds: the
+					-- controller stores now - value and the UI shows that as
+					-- the scan's epoch ("scanned N ago"). An epoch here would
+					-- read as 1970.
 					local sscan = M._spectrum_cache[radio.name]
 					if sscan then
-						entry.spectrum_table      = sscan.table
-						entry.spectrum_table_time = sscan.table_time
+						radio.spectrum_table      = sscan.table
+						radio.spectrum_table_time = math.max(0, os.time() - sscan.table_time)
 					end
 					radio_table_stats[#radio_table_stats + 1] = entry
 					-- Keep the entry addressable so the VAP/station loop below
@@ -1900,17 +1902,6 @@ function M.build_json(st, cfg, ufhw)
 		}
 	end
 
-	-- Device-level spectrum-scan status, aggregated across all radios'
-	-- cached results (see radio_table_stats loop above for the per-radio
-	-- spectrum_table/spectrum_table_time fields).
-	local spectrum_scan_timestamp = nil
-	for _, sscan in pairs(M._spectrum_cache) do
-		if sscan.scan_timestamp and
-		   (not spectrum_scan_timestamp or sscan.scan_timestamp > spectrum_scan_timestamp) then
-			spectrum_scan_timestamp = sscan.scan_timestamp
-		end
-	end
-
 	local payload = {
 		_type            = "state",
 		["default"]      = not st.adopted,
@@ -1980,7 +1971,7 @@ function M.build_json(st, cfg, ufhw)
 		-- its own VLAN (sysinfo.ppsk_supported). The other bits gate features
 		-- openUF does not implement (PROTOCOL-VALIDATION.md, Capability
 		-- bitmasks).
-		wifi_caps        = 0xC + ((M._airtime and M._airtime.supported()) and 0x20 or 0)
+		wifi_caps        = 0x1C + ((M._airtime and M._airtime.supported()) and 0x20 or 0)
 			+ ((M._sysinfo.ppsk_supported and M._sysinfo.ppsk_supported()) and 0x100000 or 0),
 		-- Bit 0x40 (64): Device.supportAdvertisingDeviceNameInBeacon() in the
 		-- decompiled controller is exactly hasWifiCapability2(64) -- i.e. bit
@@ -2012,8 +2003,11 @@ function M.build_json(st, cfg, ufhw)
 		-- column says "No Clients" only when that is actually true.
 		satisfaction     = sat_count_all > 0
 			and math.floor(sat_sum_all / sat_count_all + 0.5) or nil,
-		spectrum_scanning       = false,
-		spectrum_scan_timestamp = spectrum_scan_timestamp,
+		-- True from the spectrum-scan cmd until its sweep has run (see
+		-- _tick). The controller refuses another scan while it is true.
+		-- (spectrum_scan_timestamp is not sent: the controller stamps it
+		-- itself, in ms, from quick-scan results.)
+		spectrum_scanning = M._spectrum_pending and true or false,
 		-- Guest portal: the controller refuses to authorize a guest on an AP
 		-- that reported no guest_token ("Missing Guest Token in AP[..]
 		-- during guest authorization"). Only while the portal is on.
@@ -2058,6 +2052,22 @@ local function _width_from_htmode(htmode)
 	if type(htmode) ~= "string" then return 20 end
 	local n = htmode:match("(%d+)")
 	return n and tonumber(n) or 20
+end
+
+-- The channel widths a spectrum_table lists for a radio: 20 and 40 MHz on
+-- 2.4 GHz, 20/40/80 elsewhere, and up to the radio's configured width when
+-- that is wider (160 or 320).
+function M._spectrum_widths(radio)
+	local widths = { 20, 40 }
+	local band = radio and radio.radio
+	if band ~= "ng" then widths[#widths + 1] = 80 end
+	local cfg = _width_from_htmode(radio and radio.ht)
+	local w = widths[#widths]
+	while w < cfg do
+		w = w * 2
+		widths[#widths + 1] = w
+	end
+	return widths
 end
 
 -- radio.<n>.ieee_mode: the controller's per-radio 802.11 mode + channel width,
@@ -3135,6 +3145,95 @@ function M._report_dropped_keys(label, raw, recognized)
 		:format(label, total, table.concat(parts, ", ")))
 end
 
+-- The Airtime Scan sweep (see the spectrum-scan cmd): per radio, sweep every
+-- channel, then read back per-channel survey data into a spectrum_table,
+-- cached for build_json. Run by _tick after the inform that reported
+-- spectrum_scanning = true.
+M._spectrum_pending = false
+function M._run_spectrum_scan()
+	local ufuci = M._ucihelper
+	if ufuci and ufuci.get_radio_table then
+		local ok_r, radios = pcall(ufuci.get_radio_table)
+		if ok_r then
+			local now = os.time()
+			for _, radio in ipairs(radios) do
+				local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+				if ok_if and ifname then
+					-- Survey counters are cumulative and exist
+					-- independently of the sweep, so sample them BEFORE
+					-- it as well: immediately after a scan the radio has
+					-- just come back from off-channel and the OPERATING
+					-- channel's noise reads as 0 -- confirmed on real
+					-- hardware, where the same channel reports 0 right
+					-- after the sweep and -106 dBm moments later. 0 dBm
+					-- is not a plausible noise floor, and this value is
+					-- reported to the controller as `interference`.
+					local pre_noise = {}
+					local ok_pre, pre_stats = pcall(M._sysinfo.radio_stats, ifname)
+					if ok_pre then
+						for _, s in ipairs(pre_stats) do
+							if s.freq and s.noise and s.noise ~= 0 then
+								pre_noise[s.freq] = s.noise
+							end
+						end
+					end
+					-- One scan per channel, back home in between (see
+					-- SPECTRUM_DWELL_TU). The operating channel is not
+					-- scanned: its survey covers all the time the radio
+					-- spends there. Without a survey to list the
+					-- channels, one default sweep. A refused scan still
+					-- leaves the operating channel's survey, so the
+					-- table is built either way.
+					local freqs = {}
+					for _, s in ipairs(ok_pre and pre_stats or {}) do
+						if s.freq and not s.in_use then freqs[#freqs + 1] = s.freq end
+					end
+					if #freqs == 0 then
+						M._force_scan(ufuci, ifname, "spectrum-scan")
+					else
+						local scanned = 0
+						for i, f in ipairs(freqs) do
+							if M._force_scan(ufuci, ifname, "spectrum-scan",
+									{ freqs = { f }, duration = M.SPECTRUM_DWELL_TU, quiet = true }) then
+								scanned = scanned + 1
+							end
+							if i < #freqs then M._sleep(M.SPECTRUM_HOME_S) end
+						end
+						if scanned == 0 then
+							io.stderr:write("inform: spectrum-scan: iw refused to scan " .. ifname .. "\n")
+						end
+					end
+					local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
+					if ok_rs then
+						local widths = M._spectrum_widths(radio)
+						local table_entries = {}
+						for _, s in ipairs(stats) do
+							local total = s.channel_time or 0
+							local busy  = s.channel_time_busy or 0
+							for _, width in ipairs(widths) do
+								table_entries[#table_entries + 1] = {
+									channel     = M._sysinfo.channel_from_freq(s.freq),
+									center_freq = s.freq,
+									width       = width,
+									utilization = total > 0 and math.floor(busy * 100 / total) or 0,
+									-- Post-sweep 0 falls back to the
+									-- pre-sweep reading for that frequency.
+									interference = (s.noise ~= 0 and s.noise)
+										or pre_noise[s.freq] or 0,
+								}
+							end
+						end
+						M._spectrum_cache[radio.name] = {
+							table      = table_entries,
+							table_time = now,
+						}
+					end
+				end
+			end
+		end
+	end
+end
+
 -- Requests the dispatcher has no handler for, counted per name since the
 -- daemon started. The controller's request set grows with each release, and
 -- before this an unknown cmd left only the generic "cmd: X" line, the same as
@@ -3742,79 +3841,31 @@ function M.handle_response(json_str, st, cfg)
 		elseif cmd == "scan" or cmd == "scan_band" then
 			M._handle_scan_cmd(resp, cfg)
 		elseif cmd == "spectrum-scan" then
-			-- Trigger a scan per radio (sweeps every channel), then read back
-			-- per-channel survey data and build a spectrum_table entry per
-			-- radio, cached for the next build_json() call.
+			-- Airtime Scan ("Scan Now"). Sent only to a device claiming
+			-- wifi_caps 0x10. Only marked pending here: the follow-up inform
+			-- reports spectrum_scanning = true, and _tick runs the sweep
+			-- (M._run_spectrum_scan) once that inform is out, then informs
+			-- again with the results and false. The inform that brought this
+			-- cmd already reset the controller's flag to false, so sweeping
+			-- here would never show the scan as running; UniFi firmware
+			-- reports true for the whole scan.
 			--
-			-- Field names (spectrum_table/spectrum_table_time/
-			-- spectrum_scan_timestamp/channel/center_freq/width/utilization/
-			-- interference) are confirmed against the real UniFi Network
-			-- Application's own Java bytecode (10.4.57's ace.jar/
-			-- internal-dependencies.jar constant pool -- see
-			-- PROTOCOL-VALIDATION.md's radio_table_stats reference), not
-			-- guessed. The exact numeric semantics of `width` and
-			-- `interference` are still a best-effort approximation (radio's
-			-- configured htmode, and raw noise-floor dBm, respectively) --
-			-- verify against a live controller capture before trusting the
-			-- values, not just the key names.
-			local ufuci = M._ucihelper
-			if ufuci and ufuci.get_radio_table then
-				local ok_r, radios = pcall(ufuci.get_radio_table)
-				if ok_r then
-					local now = os.time()
-					for _, radio in ipairs(radios) do
-						local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-						if ok_if and ifname then
-							-- Survey counters are cumulative and exist
-							-- independently of the sweep, so sample them BEFORE
-							-- it as well: immediately after a scan the radio has
-							-- just come back from off-channel and the OPERATING
-							-- channel's noise reads as 0 -- confirmed on real
-							-- hardware, where the same channel reports 0 right
-							-- after the sweep and -106 dBm moments later. 0 dBm
-							-- is not a plausible noise floor, and this value is
-							-- reported to the controller as `interference`.
-							local pre_noise = {}
-							local ok_pre, pre_stats = pcall(M._sysinfo.radio_stats, ifname)
-							if ok_pre then
-								for _, s in ipairs(pre_stats) do
-									if s.freq and s.noise and s.noise ~= 0 then
-										pre_noise[s.freq] = s.noise
-									end
-								end
-							end
-							-- A refused sweep still leaves the operating
-							-- channel's survey, so the table is built either
-							-- way; _force_scan has logged the refusal.
-							M._force_scan(ufuci, ifname, "spectrum-scan")
-							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
-							if ok_rs then
-								local width = _width_from_htmode(radio.ht)
-								local table_entries = {}
-								for _, s in ipairs(stats) do
-									local total = s.channel_time or 0
-									local busy  = s.channel_time_busy or 0
-									table_entries[#table_entries + 1] = {
-										channel     = M._sysinfo.channel_from_freq(s.freq),
-										center_freq = s.freq,
-										width       = width,
-										utilization = total > 0 and math.floor(busy * 100 / total) or 0,
-										-- Post-sweep 0 falls back to the
-										-- pre-sweep reading for that frequency.
-										interference = (s.noise ~= 0 and s.noise)
-											or pre_noise[s.freq] or 0,
-									}
-								end
-								M._spectrum_cache[radio.name] = {
-									table          = table_entries,
-									table_time     = now,
-									scan_timestamp = now,
-								}
-							end
-						end
-					end
-				end
-			end
+			-- The payload's "spectrum-cfg" is ignored on purpose. It is a
+			-- whole replacement system_cfg (every WLAN replaced by one hidden
+			-- "vport-<serial>" SSID, every radio rfscan=enabled): UniFi
+			-- firmware restarts onto it for the scan, taking clients off
+			-- the AP, and restores afterwards (firmware-confirmed for
+			-- 3.9.27 to 4.0.15, platdep_funcs.sh spectrum_scan). The
+			-- controller marks every radio rfscan=enabled, so it carries no
+			-- scan parameter either. openUF sweeps off-channel and keeps
+			-- the WLANs up.
+			--
+			-- Entries follow real UAPs: one per (channel, width), utilization
+			-- in percent, interference as noise-floor dBm. The UI averages
+			-- the entries whose width equals the chart's width over each
+			-- bonded block's 20 MHz channels, so each 20 MHz measurement is
+			-- listed once per width the band offers (_spectrum_widths).
+			M._spectrum_pending = true
 		else
 			-- Anything else (other device classes' cmds, the WebRTC console,
 			-- crash-log requests; PROTOCOL-VALIDATION.md lists them) is a
@@ -4817,20 +4868,39 @@ M.SCAN_REQUEST_MAX_AGE = 600
 -- discarded (callers read the kernel's caches: `scan dump`, `survey dump`).
 -- Returns true when the sweep ran; logs and returns false when iw refused.
 -- opts (optional): freqs = {MHz...} narrows the sweep, passive = true listens
--- only. iw's grammar puts freq before the flags and passive last.
+-- only, duration = TU per channel, quiet = true leaves the refusal to the
+-- caller. iw's grammar puts freq, then duration, before the flags and passive
+-- last.
 function M._force_scan(ufuci, ifname, who, opts)
 	local args = ""
 	if opts and opts.freqs and #opts.freqs > 0 then
 		args = " freq " .. table.concat(opts.freqs, " ")
 	end
+	if opts and opts.duration then args = args .. " duration " .. opts.duration end
 	args = args .. " ap-force"
 	if opts and opts.passive then args = args .. " passive" end
 	local out = ufuci._popen("iw dev " .. ifname
 		.. " scan" .. args .. " >/dev/null 2>&1 && echo scan-ok")
 	if out:find("scan-ok", 1, true) then return true end
-	io.stderr:write("inform: " .. who .. ": iw refused to scan " .. ifname .. "\n")
+	if not (opts and opts.quiet) then
+		io.stderr:write("inform: " .. who .. ": iw refused to scan " .. ifname .. "\n")
+	end
 	return false
 end
+
+-- Airtime Scan dwell: per channel, SPECTRUM_DWELL_TU (1 TU = 1.024 ms) off
+-- the AP's own channel, then SPECTRUM_HOME_S back on it before the next.
+-- A default sweep listens 46-146 ms per channel, too short for a steady
+-- utilization figure, and one sweep never returns to the operating channel:
+-- measured on both boards (2026-10-10), a 13-channel sweep takes 13 dwells
+-- end to end, so a long dwell in one sweep would leave clients without
+-- their AP for 7-16 s. ath9k, ath10k and mt76 all honour `duration` (dwell
+-- measured as the survey's active time: 213-259 ms for 200 TU), whether or
+-- not the phy lists SET_SCAN_DWELL. 200 TU is about two beacon intervals:
+-- clients see a hiccup, not a beacon loss.
+M.SPECTRUM_DWELL_TU = 200
+M.SPECTRUM_HOME_S   = 0.3
+M._sleep = function(seconds) require("socket").select(nil, nil, seconds) end
 
 -- A forced sweep on every reported radio (the modelmap's hwassign, as
 -- build_json uses). Blocking, a few seconds per radio -- which is the point:
@@ -4985,6 +5055,8 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._hairpin_resync)
 	pcall(M._usteer_filter_resync)
 
+	-- Reported as spectrum_scanning = true by this inform; swept below.
+	local spectrum_due = M._spectrum_pending
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
 	-- return; an error skips that close, and a stale pass would then feed
@@ -5033,6 +5105,18 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- heard from this AP, and a notif from a device it considers lost is
 	-- discarded anyway.
 	if M._assoc_enabled(st, cfg) then pcall(M._send_notifs, st) end
+	-- The controller has now seen spectrum_scanning = true: sweep, and
+	-- inform again at once with the results and false.
+	if spectrum_due then
+		local ok_s, err_s = pcall(M._run_spectrum_scan)
+		if not ok_s then
+			io.stderr:write("inform: spectrum-scan failed: " .. tostring(err_s) .. "\n")
+		end
+		M._spectrum_pending = false
+		ctx.interval = M._controller_interval or ctx.base_interval
+		ctx.backoff  = ctx.interval
+		return 0
+	end
 	-- The controller's requested cadence, or the device's own when the last
 	-- noop named none. The backoff was reset to the old cadence above, before
 	-- this response could move it; follow it here too, or the first failure

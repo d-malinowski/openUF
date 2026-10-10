@@ -1738,36 +1738,45 @@ return {
 		end
 	},
 	{
-		name = "inform json: radio_table_stats includes spectrum_table when cached from a prior spectrum-scan cmd",
+		name = "inform json: radio_table carries spectrum_table when cached from a prior spectrum-scan cmd",
 		fn = function()
 			inform._spectrum_cache = {
 				radio0 = {
 					table = { { channel = 6, center_freq = 2437, width = 20, utilization = 37, interference = -95 } },
-					table_time = 111,
-					scan_timestamp = 222,
+					table_time = os.time() - 90,
 				},
 			}
 			local d = build({with_uci = true, with_clients = true})
-			local rts = d.radio_table_stats[1]
-			-- spectrum_scanning/spectrum_scan_timestamp are device-level
-			-- (top-level payload) fields, not per-radio.
+			-- On radio_table, beside athstats: the controller builds its own
+			-- radio_table_stats from radio_table and drops it anywhere else.
+			local rts = d.radio_table[1]
+			assert_eq(rts.name, "radio0", "radio_table entry for the cached radio")
+			assert_true(d.radio_table_stats[1].spectrum_table == nil, "not in radio_table_stats")
+			-- spectrum_scanning is device-level, not per-radio. The
+			-- controller sets it on queuing the scan and clears it from this.
 			assert_eq(d.spectrum_scanning, false, "spectrum_scanning false once results are cached")
-			assert_eq(d.spectrum_scan_timestamp, 222, "spectrum_scan_timestamp from cache")
-			assert_eq(rts.spectrum_table_time, 111, "spectrum_table_time from cache")
+			inform._spectrum_pending = true
+			local d_pending = build({with_uci = true, with_clients = true})
+			inform._spectrum_pending = false
+			assert_eq(d_pending.spectrum_scanning, true, "true while a scan is pending")
+			assert_true(d.spectrum_scan_timestamp == nil,
+				"spectrum_scan_timestamp is the controller's own (ms, quick-scan)")
+			-- The controller stores now - spectrum_table_time and the UI
+			-- reads that as the scan's epoch: the AP sends the AGE.
+			assert_true(rts.spectrum_table_time >= 90 and rts.spectrum_table_time <= 92,
+				"spectrum_table_time is the age in seconds, got " .. tostring(rts.spectrum_table_time))
 			assert_eq(#rts.spectrum_table, 1, "one spectrum_table entry")
 			assert_eq(rts.spectrum_table[1].channel, 6, "spectrum_table entry channel")
 			inform._spectrum_cache = {}
 		end
 	},
 	{
-		name = "inform json: radio_table_stats omits spectrum_table without a prior spectrum-scan cmd",
+		name = "inform json: radio_table omits spectrum_table without a prior spectrum-scan cmd",
 		fn = function()
 			inform._spectrum_cache = {}
 			local d = build({with_uci = true, with_clients = true})
-			assert_true(d.radio_table_stats[1].spectrum_table == nil,
+			assert_true(d.radio_table[1].spectrum_table == nil and d.radio_table[1].spectrum_table_time == nil,
 				"no spectrum_table until a spectrum-scan cmd has run")
-			assert_true(d.spectrum_scan_timestamp == nil,
-				"no spectrum_scan_timestamp until a spectrum-scan cmd has run")
 		end
 	},
 	{
@@ -2059,7 +2068,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: wifi_caps claims band steering (0x4), per-VAP pairs (0x8), ATF (0x20), PPSK (0x100000)",
+		name = "inform json: wifi_caps claims band steering (0x4), per-VAP pairs (0x8), spectrum scan (0x10), ATF (0x20), PPSK (0x100000)",
 		fn = function()
 			-- Device.supportBandsteering() is hasWifiCapability(4): without it
 			-- the device-level bandsteering.* block is never emitted.
@@ -2079,13 +2088,15 @@ return {
 			local d4 = build()
 			inform._airtime.supported = o
 			inform._sysinfo._ppsk_supported_cache = o_ppsk
-			assert_eq(d.wifi_caps, 0xC, "wifi_caps is exactly 0x4|0x8")
+			-- supportSpectrumScan() is hasWifiCapability(16): without it the
+			-- controller refuses spectrum-scan and stat/spectrum-scan skips the AP.
+			assert_eq(d.wifi_caps, 0x1C, "wifi_caps is exactly 0x4|0x8|0x10")
 			-- supportATFConfig() is hasWifiCapability(32): the atf.* block.
-			assert_eq(d2.wifi_caps, 0x2C, "plus 0x20 where airtime_flags can be switched")
+			assert_eq(d2.wifi_caps, 0x3C, "plus 0x20 where airtime_flags can be switched")
 			-- supportWpaPpsk() is hasWifiCapability(0x100000): without it a
 			-- WLAN with Private Pre-Shared Keys is skipped entirely.
-			assert_eq(d3.wifi_caps, 0x10002C, "plus 0x100000 where hostapd can do per-key VLANs")
-			assert_eq(d4.wifi_caps, 0x10000C, "PPSK does not depend on airtime")
+			assert_eq(d3.wifi_caps, 0x10003C, "plus 0x100000 where hostapd can do per-key VLANs")
+			assert_eq(d4.wifi_caps, 0x10001C, "PPSK does not depend on airtime")
 		end
 	},
 	{

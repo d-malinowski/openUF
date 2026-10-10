@@ -3091,7 +3091,7 @@ return {
 			local popens = {}
 			inform._ucihelper = {
 				get_radio_table = function()
-					return { { name = "radio0", channel = "6", ht = "HT40" } }
+					return { { name = "radio0", radio = "ng", channel = "6", ht = "HT40" } }
 				end,
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function(cmd) popens[#popens + 1] = cmd; return "scan-ok\n" end,
@@ -3100,27 +3100,48 @@ return {
 				return {
 					{ freq = 2437, noise = -95, channel_time = 5000, channel_time_busy = 1850 },
 					{ freq = 2412, noise = -90, channel_time = 100,  channel_time_busy = 12 },
+					{ freq = 2462, noise = -96, channel_time = 9000, channel_time_busy = 900, in_use = true },
 				}
 			end
+			local orig_sleep, sleeps = inform._sleep, {}
+			inform._sleep = function(sec) sleeps[#sleeps + 1] = sec end
 
 			local ok, err = pcall(function()
-				local result = inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+				-- The real payload carries a whole scan-mode system_cfg in
+				-- spectrum-cfg (captured on 10.4.57); it must not be applied.
+				local result = inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan",'
+					.. '"spectrum-cfg":"wireless.1.ssid=vport-x\\nradio.1.rfscan=enabled\\n"}', st)
 				assert_true(result, "re-inform immediately after executing a command")
+				assert_eq(#popens, 0, "the cmd only marks the scan pending")
+				assert_true(inform._spectrum_pending, "pending until _tick sweeps")
+				inform._spectrum_pending = false
+				inform._run_spectrum_scan()
 
 				local cached = inform._spectrum_cache.radio0
 				assert_true(cached ~= nil, "spectrum-scan cmd populates _spectrum_cache for the radio")
-				assert_true(#cached.table == 2, "one spectrum_table entry per survey-dump frequency")
+				-- One entry per (frequency, width): the UI filters on the
+				-- chart's width and averages each bonded block's channels.
+				assert_eq(#cached.table, 6, "3 frequencies x widths 20/40 on 2.4 GHz")
+				assert_eq(cached.table[1].width, 20, "20 MHz entry")
+				assert_eq(cached.table[2].width, 40, "40 MHz entry")
+				assert_eq(cached.table[2].utilization, cached.table[1].utilization, "same measurement per width")
 				assert_true(cached.table[1].channel == 6, "channel derived from 2437MHz")
 				assert_true(cached.table[1].center_freq == 2437, "center_freq passed through from survey dump")
-				assert_true(cached.table[1].width == 40, "width derived from radio's HT40 htmode")
+				assert_eq(cached.table[3].center_freq, 2412, "next frequency after its widths")
 				assert_true(cached.table[1].utilization == 37, "utilization = channel_time_busy/channel_time * 100")
 				assert_true(cached.table[1].interference == -95, "interference is best-effort noise-floor passthrough")
-				-- One sweep, forced: ap-force guards against a driver that
-				-- refuses to scan on a beaconing AP (ours do not; see
-				-- inform._force_scan), and its exit status is what is judged.
-				assert_eq(#popens, 1, "one sweep")
-				assert_contains(popens[1], "iw dev wlan0 scan ap-force", "forced")
+				-- One scan per channel with a longer dwell, back on the
+				-- operating channel in between (a whole sweep never returns
+				-- to it); the operating channel itself is not scanned.
+				-- ap-force guards against a driver that refuses to scan on a
+				-- beaconing AP (ours do not; see inform._force_scan).
+				assert_eq(#popens, 2, "one scan per off-channel frequency")
+				assert_contains(popens[1], "iw dev wlan0 scan freq 2437 duration 200 ap-force", "first channel, 200 TU")
+				assert_contains(popens[2], "iw dev wlan0 scan freq 2412 duration 200 ap-force", "second channel")
+				assert_eq(#sleeps, 1, "home between the two scans, not after the last")
+				assert_eq(sleeps[1], 0.3, "0.3 s on the operating channel")
 			end)
+			inform._sleep = orig_sleep
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
 			inform._spectrum_cache = orig_cache
 			if not ok then error(err, 0) end
@@ -3138,21 +3159,52 @@ return {
 				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
 			end}
 			inform._ucihelper = {
-				get_radio_table = function() return { { name = "radio0", channel = "6", ht = "HT20" } } end,
+				get_radio_table = function() return { { name = "radio0", radio = "ng", channel = "6", ht = "HT20" } } end,
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function() return "" end,   -- iw failed: no scan-ok
 			}
 			inform._sysinfo.radio_stats = function()
-				return { { freq = 2437, noise = -95, channel_time = 100, channel_time_busy = 10 } }
+				return { { freq = 2437, noise = -95, channel_time = 100, channel_time_busy = 10 },
+				         { freq = 2412, noise = -95, channel_time = 100, channel_time_busy = 10 } }
 			end
-			local ok, err = pcall(inform.handle_response, '{"_type":"cmd","cmd":"spectrum-scan"}', st)
+			local orig_sleep = inform._sleep
+			inform._sleep = function() end
+			local ok, err = pcall(inform._run_spectrum_scan)
+			inform._sleep = orig_sleep
 			local cached = inform._spectrum_cache.radio0
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
 			inform._spectrum_cache, io.stderr = orig_cache, orig_stderr
 			assert_true(ok, tostring(err))
 			assert_contains(table.concat(logged), "spectrum-scan: iw refused to scan wlan0",
 				"the refusal is visible, not silent")
-			assert_true(cached ~= nil and #cached.table == 1, "the operating channel is still reported")
+			local n = select(2, table.concat(logged):gsub("iw refused", ""))
+			assert_eq(n, 1, "one refusal line per radio, not one per channel")
+			assert_true(cached ~= nil and #cached.table == 4, "the survey is still reported (2 channels x 20/40)")
+		end
+	},
+	{
+		name = "inform packet: the spectrum-scan home sleep needs only luasocket",
+		fn = function()
+			-- Found on the APs: _sleep went through M._socket, a seam only
+			-- the guest-portal build defines, and the sweep died after its
+			-- first channel ("attempt to call field '_socket'").
+			local orig = inform._socket
+			inform._socket = nil
+			local ok, err = pcall(inform._sleep, 0)
+			inform._socket = orig
+			assert_true(ok, "sleeps without M._socket: " .. tostring(err))
+		end
+	},
+	{
+		name = "inform packet: spectrum_table widths follow the band and the configured width",
+		fn = function()
+			local w = inform._spectrum_widths
+			assert_eq(table.concat(w({ radio = "ng", ht = "HT20" }), ","), "20,40", "2.4 GHz")
+			assert_eq(table.concat(w({ radio = "ng", ht = "HE40" }), ","), "20,40", "2.4 GHz at 40")
+			assert_eq(table.concat(w({ radio = "na", ht = "VHT40" }), ","), "20,40,80", "5 GHz")
+			assert_eq(table.concat(w({ radio = "na", ht = "HE160" }), ","), "20,40,80,160", "5 GHz at 160")
+			assert_eq(table.concat(w({ radio = "6e", ht = "EHT320" }), ","), "20,40,80,160,320", "6 GHz at 320")
+			assert_eq(table.concat(w({ radio = "na" }), ","), "20,40,80", "no htmode")
 		end
 	},
 	{
@@ -3170,7 +3222,7 @@ return {
 			local scanned = false
 			inform._ucihelper = {
 				get_radio_table = function()
-					return { { name = "radio0", channel = "36", ht = "HT40" } }
+					return { { name = "radio0", radio = "na", channel = "36", ht = "HT40" } }
 				end,
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function(cmd)
@@ -3182,7 +3234,7 @@ return {
 				if not scanned then
 					-- pre-sweep: the operating channel has a real noise floor
 					return {
-						{ freq = 5180, noise = -106, channel_time = 1000, channel_time_busy = 10 },
+						{ freq = 5180, noise = -106, channel_time = 1000, channel_time_busy = 10, in_use = true },
 						{ freq = 5200, noise = -105, channel_time = 46, channel_time_busy = 0 },
 					}
 				end
@@ -3194,13 +3246,14 @@ return {
 			end
 
 			local ok, err = pcall(function()
-				inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+				inform._run_spectrum_scan()
 				local t = inform._spectrum_cache.radio0.table
 				assert_eq(t[1].interference, -106,
 					"operating channel keeps its pre-sweep noise floor, not 0")
 				assert_eq(t[1].utilization, 10,
 					"utilization still comes from the fresh post-sweep counters")
-				assert_eq(t[2].interference, -104,
+				-- t[1..3] are the first frequency at 20/40/80 MHz.
+				assert_eq(t[4].interference, -104,
 					"a valid post-sweep reading always wins over the pre-sweep one")
 			end)
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
@@ -3614,6 +3667,54 @@ return {
 			assert_eq(#calls, 1, "bootstrap account synced")
 			assert_contains(calls[1], "passwd -l",
 				"locked since reloaded state is adopted")
+		end
+	},
+	{
+		name = "inform: spectrum-scan reports scanning, sweeps after that inform, then informs again",
+		fn = function()
+			-- The inform that brings the cmd resets the controller's flag to
+			-- false. Sweeping inside the handler never showed the scan as
+			-- running; the real UCG now shows true for the sweep (11 s).
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response, scan = inform._run_spectrum_scan,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+			}
+			local events = {}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function()
+				events[#events + 1] = "inform scanning=" .. tostring(inform._spectrum_pending and true or false)
+				return "{}"
+			end
+			inform.build_packet = function() return "pkt" end
+			inform.http_post = function() return "body" end
+			local responses = {
+				'{"_type":"cmd","cmd":"spectrum-scan"}',
+				'{"_type":"noop"}', '{"_type":"noop"}',
+			}
+			inform.parse_packet = function() return table.remove(responses, 1) end
+			inform._run_spectrum_scan = function() events[#events + 1] = "sweep" end
+			inform._spectrum_pending = false
+
+			local ctx = {interval = 10, backoff = 10}
+			local st = {inform_url = "http://unifi:8080/inform"}
+			local ok, err = pcall(function()
+				assert_eq(inform._tick(st, nil, nil, ctx), 0, "the cmd gets its immediate follow-up")
+				assert_eq(inform._tick(st, nil, nil, ctx), 0, "the sweep gets its immediate follow-up")
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "then the normal cadence")
+			end)
+			inform.build_json, inform.build_packet, inform.http_post, inform.parse_packet,
+				inform.handle_response, inform._run_spectrum_scan,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post, orig.parse_packet,
+				orig.handle_response, orig.scan, orig.reload, orig.rrm
+			inform._spectrum_pending = false
+			if not ok then error(err, 0) end
+			assert_eq(table.concat(events, ", "),
+				"inform scanning=false, inform scanning=true, sweep, inform scanning=false",
+				"true is reported before the sweep, false after it")
 		end
 	},
 	{
