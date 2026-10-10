@@ -96,6 +96,9 @@ M.FIELDS = {
 	-- mgmt_cfg's capability list asked for STA_ASSOC_TRACKER notifs. Only
 	-- carried by setparam, so it has to outlive a restart.
 	notif_assoc_stat          = "boolean",
+	-- mgmt_cfg's stun_url, the controller's STUN server (stun.lua). Only
+	-- carried by setparam, likewise.
+	stun_url                  = "string",
 	locating                  = "boolean",
 	locate_prev_trigger       = "string",
 	-- The per-port VLAN reversibility ledger: the stock `ports` strings of

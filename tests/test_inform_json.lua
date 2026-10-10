@@ -551,6 +551,30 @@ return {
 		end
 	},
 	{
+		name = "inform json: connect_request_ip/port are the STUN mapping, as strings, only while it runs",
+		fn = function()
+			local real = inform._stun_c
+			inform._stun_c = nil
+			local d = build()
+			assert_eq(d.connect_request_ip, nil, "no STUN client: no ip")
+			assert_eq(d.connect_request_port, nil, "no STUN client: no port")
+			-- A running client without a response yet.
+			inform._stun_c = {sock = {}}
+			d = build()
+			assert_eq(d.connect_request_port, nil, "no mapping yet")
+			inform._stun_c = {sock = {}, mapped_ip = "192.0.2.3", mapped_port = 41234}
+			local ok, err = pcall(function()
+				d = build()
+				assert_eq(d.connect_request_ip, "192.0.2.3", "ip")
+				-- The firmware sends both as JSON strings; the controller
+				-- parses either (getInt).
+				assert_eq(d.connect_request_port, "41234", "port, a string")
+			end)
+			inform._stun_c = real
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: a second WLAN on the same radio does not inherit the first's clients",
 		fn = function()
 			-- The live bug: with "Home LAN" and a brand-new "Home IoT" both on

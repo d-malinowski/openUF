@@ -43,6 +43,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Zero-touch bootstrap adoption | ✅ Optional (`install.sh install --bootstrap-adopt`) — a locked-down, non-root SSH account auto-disabled after adoption |
 | Forget device / factory reset | ✅ Working (`syswrapper.sh reset-inform`) |
 | Restart / reboot command | ✅ Working |
+| Immediate commands and config changes (STUN wake-up) | ✅ Working — **live on 10.6**. As UniFi firmware does, openUF keeps a UDP socket open to the controller's STUN server (`stun_url`, port 3478). It sends a Binding Request every 30 s and reports the mapped address as `connect_request_ip`/`connect_request_port`. When the controller queues a command or a config change, it sends a connection request to that address, and openUF informs at once instead of at the next heartbeat: 0.2 s after the request on the AX3000T, 1.5 s on the Archer C5 (most of that is building the payload). Runs only while adopted and the controller answers. After upgrading, it starts with the next config push (Force Provision once) |
 | Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |
 
 ### WiFi provisioning

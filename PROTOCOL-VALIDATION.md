@@ -2031,6 +2031,7 @@ Everything openUF sends. Names were audited against the controller's own Device 
 | `mem_total`, **`mem_used`** | Bytes. `mem_used = total − free`; the schema has `mem_used`, not `mem_free`. |
 | **`system-stats`** | Hyphenated key, `{cpu, mem, uptime}` — all three **strings**, cpu/mem as percentages. `cpu` is `0` on the very first inform (delta-sampling `/proc/stat` has no prior sample). |
 | **`sys_stats`** | Sent beside `system-stats`, as UniFi firmware does: `loadavg_1/5/15` as `/proc/loadavg`'s strings, `mem_total`, `mem_used` (total − free), `mem_buffer` in bytes. The UI's **Load Average**. See [VAP, device and radio fields](#vap-device-and-radio-fields-2026-10-10). |
+| `connect_request_ip`, `connect_request_port` | Both **strings**, as the firmware sends them (the UCG's own record carries the port as a string too): the mapped address of the AP's STUN socket. Sent only while STUN runs and once a Binding Response has come back. See [STUN wake-up](#stun-wake-up-2026-10-10). |
 | **`fw_caps`** | `0x110` — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps`** | `0xC`, plus `0x20` (Airtime Fairness) and `0x100000` (Private Pre-Shared Keys) where the device can do them — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps2`** | `0x60` — see [capability bitmasks](#capability-bitmasks) |
@@ -2607,6 +2608,84 @@ The Living room AP's panel shows **Load Average 0.09 / 0.13 / 0.17**, matching `
 `radio_table_stats[].extchannel` reads `1` on both 5 GHz radios (channel 36 and 100, 80 MHz)
 and `0` on the 20 MHz 2.4 GHz radios. A 40 MHz 2.4 GHz channel was not tried live: the site
 runs 20 MHz there.
+
+### STUN wake-up (2026-10-10)
+
+How the controller makes a managed AP inform at once when it has something for it, instead
+of waiting for the next heartbeat. openUF used to drop `stun_url`, so every command and
+config change waited up to one inform interval.
+
+**Controller (10.6.106 jar, CFR).**
+- The `stunService` bean is chosen by `stun.type`, default `local`. That is a STUN server on
+  UDP 3478 (jstun, classic RFC 3489). It accepts only attributes 2 (RESPONSE-ADDRESS) and 3
+  (CHANGE-REQUEST), and it rejects a Binding Request that has no CHANGE-REQUEST. The
+  Binding Response carries MAPPED-ADDRESS (the request's source), CHANGED-ADDRESS and
+  SOURCE-ADDRESS, 56 bytes in all.
+- mgmt_cfg is built whole by one builder, and that builder always appends `stun_url`
+  (`stun://<host>:3478/`). A `mgmt_cfg` without it therefore means no STUN.
+- The connection request is sent from the device manager whenever it queues a command
+  for a device in state CONNECTED, and whenever a config change bumps `cfgversion`. It
+  needs `connect_request_ip` present and `connect_request_port` > 0 (`getInt`, which
+  also parses a string); otherwise the debug log says "does not have STUN capability". The
+  STUN socket then sends 20 bytes to that address: type `0x8888`, length 0, the rest zero.
+  The simulator variant puts a MAC at offset 4.
+
+**Firmware (mcad `stun_init`/`stun_send`/`stun_recv`, firmware-confirmed for 4.0.15).**
+- `stun_init` opens one UDP socket with SO_REUSEADDR, bound to `0.0.0.0:0`, with a
+  persistent read event.
+- `stun_send` runs on a timer. It sends only when `/var/run/ipready.br0` exists, mcad's
+  state is 2 (managed) and a `stun_url` is set. The packet is 28 bytes: type 1, length 8,
+  an all-zero transaction id, then CHANGE-REQUEST (3), length 4, value 0. After a full send
+  the next one is due in 30 s; after a failure, a partial send or a not-ready state, in 5 s.
+- `stun_recv`:
+  - A `0x8888` packet of at least 20 bytes is logged as `stun_connection_request` and
+    triggers an inform 10 ms later (reason `stun`), unless an inform is already running.
+  - A `0x0101` Binding Response is walked attribute by attribute. A MAPPED-ADDRESS with
+    family 1 (IPv4; family 2, IPv6, is also accepted) is compared with the stored address.
+    If it changed, it is logged as "stun info changed", stored, and an inform is triggered
+    at once.
+  - A receive error re-initialises the socket.
+  - Nothing checks the sender or the transaction id.
+- The inform carries `connect_request_ip` (`json_string`) and `connect_request_port`
+  (`sprintf "%d"`, then `json_string`) while the stored port is non-zero.
+
+**openUF (`openuf/stun.lua`).**
+- Sends the same request on the same timing.
+- Runs only while adopted and not in selfrun (fewer than 3 unanswered informs, the
+  firmware's state 3 boundary).
+- `stun_url` is persisted in `state.json`, because setparam is not re-sent after a restart.
+- The socket is read inside the inform loop's idle wait. A connection request, or a changed
+  mapping, ends the wait at once. A burst of queued packets is drained by one read, so it
+  produces one inform.
+- Difference: openUF ignores an IPv6 mapping, because its socket is IPv4-only.
+
+**Lab (10.4.57).**
+- After a Force Provision, `state.json` held `stun_url stun://172.19.0.4:3478/`, and
+  `stat/device` showed `connect_request_ip 172.19.0.2`, `connect_request_port 50182`, the
+  AP's socket.
+- The six `set-locate`/`unset-locate` commands, landed at different points of the 10 s
+  cycle, each put a `0x8888` on the AP within 0.14–0.17 s of the REST call. Each was
+  followed by an inform SYN in the same 50 ms nft-counter sample.
+- Binding Requests went out every 30 s. `handle_response failed` count: 0.
+
+**Live (UCG Ultra, 10.6.106, both APs).**
+- Before any push, the firmware's 28-byte request sent from .3 to `192.0.2.1:3478` was
+  answered with 56 bytes, MAPPED-ADDRESS `192.0.2.3:<the probe's port>`.
+- After a Force Provision of each AP, `stun_url stun://192.0.2.1:3478/` landed, and the
+  controller recorded `connect_request_ip` 192.0.2.3 / 192.0.2.4, with ports matching each
+  AP's `netstat` socket, stored as strings.
+- On-device counters, with the controller's heartbeat at about 15 s:
+
+| AP | command | `0x8888` arrived | inform SYN |
+|---|---|---|---|
+| Living room (.3) | `set-locate` at 108.05 | 108.22 | 109.78 |
+| Living room (.3) | `unset-locate` at 113.06 | 113.24 | 114.58 |
+| Office (.4) | `set-locate` at 121.05 | 121.25 | 121.48 |
+| Office (.4) | `unset-locate` at 125.05 | 125.17 | 125.40 |
+
+  Times are seconds of one minute; the command times come from the browser, the others
+  from the AP. On the Archer C5, the 1.3–1.6 s between wake and SYN is the time the slow
+  ath79 takes to build the payload before it POSTs.
 
 ### `sta_table[]` entry (nested inside each `vap_table` entry)
 

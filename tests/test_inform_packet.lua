@@ -4796,6 +4796,116 @@ return {
 		end
 	},
 	{
+		-- The controller builds mgmt_cfg whole and always appends stun_url
+		-- (com.ubnt.service.config mgmt builder, 10.6).
+		name = "inform: mgmt_cfg stun_url is recorded, persisted, and cleared by its absence",
+		fn = function()
+			local st = sample_state()
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"cfgversion=2\\nstun_url=stun://192.0.2.4:3478/\\ninform_url=http://192.0.2.4:8080/inform\\n"}', st)
+			assert_eq(st.stun_url, "stun://192.0.2.4:3478/", "recorded")
+			assert_eq(state.FIELDS.stun_url, "string", "survives a restart (setparam is not resent)")
+			inform.handle_response('{"_type":"noop","interval":10}', st)
+			assert_eq(st.stun_url, "stun://192.0.2.4:3478/", "a noop leaves it")
+			inform.handle_response('{"_type":"setparam","system_cfg":"netconf.1.ip=192.0.2.3\\n"}', st)
+			assert_eq(st.stun_url, "stun://192.0.2.4:3478/", "a setparam without mgmt_cfg leaves it")
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"cfgversion=3\\nstun_url=\\n"}', st)
+			assert_eq(st.stun_url, nil, "empty: no STUN")
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"cfgversion=4\\nstun_url=stun://192.0.2.4:3478/\\n"}', st)
+			inform.handle_response('{"_type":"setparam","mgmt_cfg":"cfgversion=5\\n"}', st)
+			assert_eq(st.stun_url, nil, "a mgmt_cfg without it: no STUN")
+		end
+	},
+	{
+		name = "inform: the STUN client runs only while managed and a server is named",
+		fn = function()
+			local sent, opened, closed = {}, 0, 0
+			local fake = {dns = {toip = function(h) return h end}}
+			fake.udp = function()
+				opened = opened + 1
+				return {
+					setsockname = function() return 1 end,
+					settimeout = function() end,
+					sendto = function(_, data, ip, port) sent[#sent + 1] = ip .. ":" .. port; return #data end,
+					receive = function() return nil, "timeout" end,
+					close = function() closed = closed + 1 end,
+				}
+			end
+			local rs, rt, rf = inform._socket, inform._time, inform._inform_fails
+			local now = 1000
+			inform._socket = function() return fake end
+			inform._time = function() return now end
+			inform._stun_c, inform._inform_fails = nil, 0
+			local ok, err = pcall(function()
+				local st = sample_state({adopted = false, stun_url = "stun://192.0.2.4:3478/"})
+				inform._stun_tick(st)
+				assert_eq(opened, 0, "not adopted: no socket")
+				st.adopted = true
+				st.stun_url = nil
+				inform._stun_tick(st)
+				assert_eq(opened, 0, "no stun_url: no socket")
+				st.stun_url = "stun://192.0.2.4:3478/"
+				inform._stun_tick(st)
+				assert_eq(opened, 1, "managed with a server: opened")
+				assert_eq(sent[1], "192.0.2.4:3478", "and a Binding Request sent")
+				now = now + 10
+				inform._stun_tick(st)
+				assert_eq(#sent, 1, "not again within 30 s")
+				now = now + 20
+				inform._stun_tick(st)
+				assert_eq(#sent, 2, "again at 30 s")
+				-- Selfrun: GUEST_SELFRUN_FAILS informs unanswered.
+				inform._inform_fails = inform.GUEST_SELFRUN_FAILS
+				inform._stun_tick(st)
+				assert_eq(closed, 1, "selfrun: closed")
+				inform._inform_fails = inform.GUEST_SELFRUN_FAILS - 1
+				inform._stun_tick(st)
+				assert_eq(opened, 2, "managed again: reopened")
+			end)
+			inform._socket, inform._time, inform._inform_fails = rs, rt, rf
+			inform._stun_c = nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: _idle ends early on a STUN connection request, not on other packets",
+		fn = function()
+			local t = 0
+			local queue = {}
+			local stun_sock = {receive = function()
+				local p = table.remove(queue, 1)
+				if p then return p end
+				return nil, "timeout"
+			end}
+			local selects = {}
+			local sock = {
+				gettime = function() return t end,
+				select = function(r, _, timeout)
+					selects[#selects + 1] = #(r or {}) .. "@" .. timeout
+					-- A packet arrives 2 s in.
+					if #queue > 0 then t = t + 2; return {stun_sock} end
+					t = t + timeout
+					return {}
+				end,
+			}
+			local wake = string.char(0x88, 0x88) .. string.rep(string.char(0), 18)
+			local junk = string.char(0x01, 0x11) .. string.rep(string.char(0), 18)
+			inform._guest_server = nil
+			inform._stun_c = {sock = stun_sock}
+			local ok, err = pcall(function()
+				queue = {wake}
+				inform._idle(sock, 10)
+				assert_eq(t, 2, "woke at the request")
+				assert_eq(table.concat(selects, ","), "1@10", "one wait on the STUN socket")
+				t, selects, queue = 0, {}, {junk}
+				inform._idle(sock, 10)
+				assert_eq(t, 10, "an error response does not wake it")
+				assert_eq(table.concat(selects, ","), "1@10,1@8", "it keeps waiting for the rest")
+			end)
+			inform._stun_c = nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: connection tracking needs the controller's ask and no conf.lua veto",
 		fn = function()
 			assert_false(inform._assoc_enabled({}, {config = {}}), "not asked")

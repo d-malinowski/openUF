@@ -68,6 +68,7 @@ local assoctrack = _require_sibling("assoctrack")
 local guestportal = _require_sibling("guestportal")
 local satisfaction = _require_sibling("satisfaction")
 local minrssi   = _require_sibling("minrssi")
+local stun      = _require_sibling("stun")
 
 local M = {}
 
@@ -95,6 +96,7 @@ M._l2guard    = l2guard
 M._assoctrack = assoctrack
 M._guestportal = guestportal
 M._satisfaction = satisfaction
+M._stun      = stun
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -635,6 +637,7 @@ function M.build_json(st, cfg, ufhw)
 	local cpu_pct    = M._sysinfo.cpu_percent()
 	local load1, load5, load15
 	if M._sysinfo.loadavg then load1, load5, load15 = M._sysinfo.loadavg() end
+	local stun_ip, stun_port = M._stun.fields(M._stun_c)
 	local mem_pct    = meminfo.total_kb > 0
 	                    and math.floor((meminfo.total_kb - meminfo.free_kb) * 100 / meminfo.total_kb + 0.5)
 	                    or 0
@@ -1869,6 +1872,11 @@ function M.build_json(st, cfg, ufhw)
 			mem_used   = (meminfo.total_kb - meminfo.free_kb) * 1024,
 			mem_buffer = (meminfo.buffers_kb or 0) * 1024,
 		},
+		-- The address the controller sends its STUN connection request to
+		-- (stun.lua): the mapped address of the last Binding Response, both
+		-- strings as the firmware sends them, and only while STUN runs.
+		connect_request_ip   = stun_ip,
+		connect_request_port = stun_port,
 		["system-stats"] = {
 			cpu    = tostring(cpu_pct),
 			mem    = tostring(mem_pct),
@@ -2935,7 +2943,7 @@ local RECOGNIZED_SYSTEM_CFG = {
 
 local RECOGNIZED_MGMT_CFG = {
 	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
-	"^capability$", "^selfrun_guest_mode$",
+	"^capability$", "^selfrun_guest_mode$", "^stun_url$",
 }
 
 -- Set from handle_response when cfg.config.debug_dump_file is on -- the
@@ -3160,6 +3168,9 @@ function M.handle_response(json_str, st, cfg)
 		local mgmt_raw = resp.mgmt_cfg
 		local newly_adopted = false
 		if type(mgmt_raw) == "string" then
+			-- The controller builds mgmt_cfg whole and always appends
+			-- stun_url, so one without it means no STUN (stun.lua).
+			local stun_url
 			for line in (mgmt_raw .. "\n"):gmatch("([^\n]*)\n") do
 				local k, v = line:match("^([^=]+)=(.*)$")
 				if k and v then
@@ -3190,6 +3201,8 @@ function M.handle_response(json_str, st, cfg)
 						-- The controller sends "pass" or "off"; like the
 						-- firmware, only "off" is off.
 						st.guest_selfrun = (v == "off") and "off" or "pass"
+					elseif k == "stun_url" then
+						if v ~= "" then stun_url = v end
 					elseif k == "cfgversion" then
 						if v ~= "" then st.cfgversion = v end
 					elseif k == "led_enabled" then
@@ -3218,6 +3231,7 @@ function M.handle_response(json_str, st, cfg)
 					end
 				end
 			end
+			st.stun_url = stun_url
 		end
 
 		-- IP Settings (DHCP vs Static, in the real controller UI) arrive via
@@ -4069,24 +4083,65 @@ M._read_arp = function()
 	return s or ""
 end
 
--- Sleep for wait seconds; while the portal listens, answer guests meanwhile.
-function M._idle(socket, wait)
-	local server = M._guest_server
-	if not server then
-		socket.select(nil, nil, wait)
-		return
+-- The STUN client (stun.lua): opened while the AP is managed and the
+-- controller named a STUN server, closed otherwise. Once per tick, before
+-- the inform, so a Binding Request goes out every stun.INTERVAL seconds.
+M._stun_c = nil
+function M._stun_tick(st)
+	local c = M._stun_c
+	if not c then
+		c = M._stun.new(M._socket())
+		M._stun_c = c
 	end
+	-- The firmware runs STUN only while managed: not unadopted, and not in
+	-- selfrun (GUEST_SELFRUN_FAILS informs unanswered).
+	local active = st.adopted == true and M._inform_fails < M.GUEST_SELFRUN_FAILS
+	local ok, err = M._stun.sync(c, st.stun_url, active)
+	if ok then
+		local _, err2 = M._stun.send_due(c, M._time())
+		err = err2
+	end
+	-- Said once per distinct failure, not every retry.
+	if err and err ~= c.last_err then
+		io.stderr:write("inform: stun: " .. tostring(err) .. "\n")
+	end
+	c.last_err = err
+end
+
+-- Read the STUN socket. True when the controller asked for an inform, or
+-- the mapped address it should send that request to changed.
+function M._stun_wake()
+	local c = M._stun_c
+	if not c then return false end
+	local ok, wake = pcall(M._stun.receive, c)
+	return ok and wake == true
+end
+
+-- Sleep for wait seconds. Meanwhile answer guests while the portal listens,
+-- and end early when the STUN socket says to inform now.
+function M._idle(socket, wait)
 	local deadline = socket.gettime() + wait
+	local server_ok = true
 	while true do
 		local left = deadline - socket.gettime()
 		if left <= 0 then return end
-		server = M._guest_server
-		if not server then
+		local server = server_ok and M._guest_server or nil
+		local stun_sock = M._stun_c and M._stun_c.sock
+		if not server and not stun_sock then
 			socket.select(nil, nil, left)
 			return
 		end
-		local r = socket.select({server}, nil, left)
-		if r and r[1] then
+		local list = {}
+		if server then list[#list + 1] = server end
+		if stun_sock then list[#list + 1] = stun_sock end
+		local r = socket.select(list, nil, left)
+		local server_r, stun_r = false, false
+		for _, s in ipairs(r or {}) do
+			if s == stun_sock then stun_r = true
+			elseif s == server then server_r = true end
+		end
+		if stun_r and M._stun_wake() then return end
+		if server_r then
 			local ctx = M._guest_ctx or {}
 			local ok, served = pcall(M._guestportal.serve_one, server, {
 				url = ctx.url, ap = ctx.ap,
@@ -4094,10 +4149,7 @@ function M._idle(socket, wait)
 				arp = M._read_arp, now = M._time,
 			})
 			-- Readable but nothing to accept: do not spin on it.
-			if not (ok and served) then
-				socket.select(nil, nil, math.max(0, deadline - socket.gettime()))
-				return
-			end
+			if not (ok and served) then server_ok = false end
 		end
 	end
 end
@@ -4940,6 +4992,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	ctx.backoff  = ctx.backoff  or ctx.interval
 
 	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
+	pcall(M._stun_tick, st)
 	-- Before build_json, so anything a client reported since the last cycle
 	-- rides out on THIS inform rather than waiting for the next.
 	pcall(M._rrm_tick, cfg, st)
