@@ -34,9 +34,22 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 	-- the same, on the way in and out.)
 	inform._sysinfo._phy_info_cache = {}
 	inform._sysinfo._uplink_cache   = {}
+	inform._sysinfo._ps_phy_cache   = {}
 	inform._sysinfo.end_pass()
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
+		-- mac80211 debugfs: a radio that tracks power save itself (no
+		-- AP_LINK_PS), the first client dozing.
+		if with_clients and path == "/sys/class/net/wlan0/phy80211/name" then return "phy0\n" end
+		if with_clients and path == "/sys/kernel/debug/ieee80211/phy0/hwflags" then
+			return "SIGNAL_DBM\nAMPDU_AGGREGATION\nMFP_CAPABLE\n"
+		end
+		if with_clients and path == "/sys/kernel/debug/ieee80211/phy0/netdev:wlan0/stations/aa:bb:cc:dd:ee:ff/flags" then
+			return "AUTH\nASSOC\nPS_STA\nAUTHORIZED\n"
+		end
+		if with_clients and path == "/sys/kernel/debug/ieee80211/phy0/netdev:wlan0/stations/11:22:33:44:55:66/flags" then
+			return "AUTH\nASSOC\nAUTHORIZED\n"
+		end
 		if path:find("meminfo") then return fixture("proc_meminfo.txt") end
 		if path:find("net/dev") then return fixture("proc_net_dev.txt") end
 		if with_wired and path:find("net/arp")     then return fixture("proc_net_arp.txt") end
@@ -53,6 +66,11 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 			return fixture("iw_station_dump.txt")
 		end
 		if cmd:find("station dump") then return "" end
+		-- hostapd: the first client on FT-SAE, the second on plain PSK.
+		if with_clients and cmd:find("hostapd_cli -i $b all_sta", 1, true) and cmd:find(" wlan0", 1, true) then
+			return "aa:bb:cc:dd:ee:ff\nflags=[AUTH][ASSOC][AUTHORIZED]\nAKMSuiteSelector=00-0f-ac-9\n"
+				.. "11:22:33:44:55:66\nflags=[AUTH][ASSOC][AUTHORIZED]\nAKMSuiteSelector=00-0f-ac-2\n"
+		end
 		if with_clients and cmd:find("survey dump") then
 			return fixture("iw_survey_dump.txt")
 		end
@@ -795,7 +813,14 @@ return {
 			assert_eq(sta_table[1].radio, "ng", "radio from vap (the band, matching vap.radio)")
 			assert_true(sta_table[1].active, "active true for a station iw actually lists")
 			assert_eq(sta_table[1].signal, -62, "signal from station dump")
-			assert_eq(sta_table[1].rssi, -62, "rssi aliases signal (iw doesn't distinguish them)")
+			-- rssi is the SNR over the in-use survey noise, as the firmware
+			-- sends it; noise is that floor.
+			assert_eq(sta_table[1].rssi, 33, "rssi = signal - noise (-62 - -95)")
+			assert_eq(sta_table[1].noise, -95, "noise from the in-use survey entry")
+			assert_eq(sta_table[1].state, 0x10, "dozing station: state bit 0x10")
+			assert_eq(sta_table[2].state, 0, "awake station: state 0")
+			assert_eq(sta_table[1].is_11r, true, "FT-SAE AKM: is_11r")
+			assert_eq(sta_table[2].is_11r, nil, "PSK AKM: is_11r absent, as the firmware omits it")
 			assert_eq(sta_table[1].capacity, 144, "capacity from tx_bitrate floor(144.4)")
 			assert_eq(sta_table[1].throughput, 0, "throughput 0 on first sample (no prior delta)")
 			assert_eq(sta_table[1].linkscore, 0, "linkscore has no local source -- placeholder")
@@ -852,6 +877,28 @@ return {
 			assert_eq(sta_table[1].satisfaction_now, 90, "satisfaction_now matches satisfaction")
 			assert_eq(sta_table[1].satisfaction_reason, 2, "reason: phy_rate")
 			assert_eq(sta_table[1].anomalies, 0, "no anomalies")
+		end
+	},
+	{
+		name = "inform json: sta state, is_11r and noise are left out when nothing can say",
+		fn = function()
+			inform._sta_stats_cache = {}
+			local si = inform._sysinfo
+			local orig_ps, orig_akms, orig_rs = si.sta_powersave, si.sta_akms, si.radio_stats
+			-- A radio that tracks power save in the driver (AP_LINK_PS), no
+			-- hostapd_cli, and no survey reading.
+			si.sta_powersave = function() return nil end
+			si.sta_akms      = function() return {} end
+			si.radio_stats   = function() return {} end
+			local ok, err = pcall(function()
+				local s = build({with_uci = true, with_clients = true}).vap_table[1].sta_table[1]
+				assert_eq(s.state, nil, "no power-save reading: state absent, not 0")
+				assert_eq(s.is_11r, nil, "no AKM: is_11r absent")
+				assert_eq(s.noise, nil, "no survey: noise absent")
+				assert_eq(s.rssi, 34, "rssi over the -96 floor the firmware clamps to (-62 - -96)")
+			end)
+			si.sta_powersave, si.sta_akms, si.radio_stats = orig_ps, orig_akms, orig_rs
+			if not ok then error(err, 0) end
 		end
 	},
 	{

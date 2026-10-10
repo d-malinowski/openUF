@@ -2587,7 +2587,8 @@ Nested, **not** a flat top-level `user_table`.
 | Field | Notes |
 |---|---|
 | `active`, `mac`, `ap_mac`, `channel`, `radio` | `active` is always `true` — an entry only exists while `iw station dump` lists the station |
-| `signal`, `rssi` | Both the same value; `iw` exposes no separately-measured RSSI |
+| `signal`, `rssi`, `noise` | `signal` is `iw`'s dBm. `rssi` is the **SNR** in dB over the radio's in-use survey noise, floored at −96 as the firmware does (`signal = rssi + max(noise, −96)`); `noise` is that floor, absent with no survey reading. See "Station fields" below |
+| `state`, `is_11r` | `state` carries only bit 0x10 (dozing), and only where mac80211 tracks power save; `is_11r` only when true. See "Station fields" below |
 | `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets` | **Raw cumulative counters.** The vapInformProcessor computes its own `tx_bytes-d`/`rx_bytes-d`/`bytes-d`/`bytes-r` deltas server-side keyed by `time_delta` — never send a pre-computed rate here. |
 | `tx_rate`, `rx_rate` | **Kbps** (`iw` reports Mbit/s, so ×1000) |
 | `uptime`, `idletime` | `iw`'s "connected time" / "inactive time", both in seconds |
@@ -2693,8 +2694,8 @@ radio's in-use survey noise; rates from `tx/rx bitrate` × 1000; the retry windo
 Verified 2026-10-10: ✅ lab (10.4.57) stores client `satisfaction`/`satisfaction_reason`/
 `anomalies`, both VAP charts, `radio_table_stats` satisfaction 85/100 and the device's 90 =
 (2·85 + 100)/3. ✅ Real controller (10.6.106), both APs: device 89/88, radios 98/83 and 84/100,
-a client-less VAP −1, each client's score and reason. ⚠️ 10.6.106 lists `anomalies: -1` for
-every client although the payload carries 0; 10.4.57 stores the 0. Not traced yet.
+a client-less VAP −1, each client's score and reason. 10.6.106 lists `anomalies: -1` for
+clients although the payload carries 0: the gateway overwrites it, see "Station fields" below.
 
 Read-only side-by-side on both APs before the switch (40 samples, same `iw` reads): 5 GHz
 clients 95–100 both ways; 2.4 GHz clients 100 → 75–85, all bound by phy_rate. A single-stream
@@ -2703,6 +2704,56 @@ is often a 6–12 Mbit/s legacy one, which lowers the mean.
 
 The estimator this replaced (min of downlink airtime efficiency and SNR, EWMA-smoothed; the
 history below) was openUF's own design, not UniFi's.
+
+**Station fields (2026-10-10).** `fill_stainfo_json` (libubnt 4.0.15) emits, per station:
+`mac`, `state` (u16 node flags), `state_ht` (flags & 0x8), `state_pwrmgt` (flags & 0x10),
+`authorized`, `is_11b`/`is_11a`/`is_11n`/`is_11ac`, `is_11r` (only when its flag is set), `rssi`
+(u8 SNR), `noise` (s16 dBm, unclamped), `signal` (`rssi + max(noise, −96)`), `tx_rate`, `rx_rate`,
+`ccq`, `uptime`, `idletime`, `auth_time`, `dhcpstart_time`, `dhcpend_time`, `hostname` and `ip`
+(when known), `tx_power`, the rx/tx counters, `1x_identity` (when set), `vlan_id`, `satisfaction`,
+`satisfaction_reason`, `anomalies`, `wifi_tx_latency_mov`. Firmware-confirmed for 3.9.27 to 4.0.15.
+
+What the 10.6.106 controller does with them (CFR on `internal-dependencies.jar`; the AP station
+processor `devmgr/MwArZjlvuVhguZnuxGE` and the copy list in `devmgr/iceUMDuewFNFLMOqti`:
+`ack_rssi, anomalies, anon_client_id, ccq, dhcpend_time, idletime, noise, nss, rx_rate, rssi,
+satisfaction_now, satisfaction_real, satisfaction_reason, signal, tx_mcs, tx_power, tx_rate,
+tx_retry_burst_count`, each copied when present):
+
+| Field | Controller use | openUF |
+|---|---|---|
+| `rssi` | Read as SNR: mesh/uplink checks test `> 5`, the neighbour and uplink paths turn it into dBm with `rssi − 95`, the client-insight ranking (`wifi/k/rFCHnXVpfjjP`) uses it only when `> 0`, and the frontend falls back to a converted `rssi` where `signal` is missing | **Fixed**: was `signal` (negative dBm). Now SNR over the in-use survey noise, floored at −96 |
+| `noise` | Copied; legacy `stat/sta` only (the v2 client API drops it) | **Added**, from the in-use survey entry |
+| `state` | `powersave_enabled = (state & 0x10) != 0`, the only bit read; shown by the AI assistant's client summary | **Added**: 0x10 from mac80211 debugfs `stations/<mac>/flags` `PS_STA`, only on a radio whose `hwflags` lack `AP_LINK_PS`; absent elsewhere |
+| `is_11r` | Copied as a boolean (`is("is_11r", false)`); `stat/sta` only, no 10.6 UI reader | **Added**, true when hostapd's `AKMSuiteSelector` is an FT suite (00-0f-ac-3/4/9/13/19/25) |
+| `anomalies` | Copied, but see below | unchanged |
+| `ccq` | Copied; no UI reader | Not sent: mac80211 has no CCQ |
+| `dhcpend_time` | Copied; no UI reader | Not sent: no UI effect, and the firmware's unit (the struct field at 0x3c) is undecoded |
+| `tx_power` | Copied; the UI's `tx_power` readers are all per radio | Not sent: the per-station value's source is undecoded |
+| `1x_identity` | Client doc + `last_1x_identity` | n/a: openUF skips WPA-Enterprise WLANs |
+| `vlan_id` | Not read (the client's `vlan` comes from the network) | Not sent |
+| `ack_rssi`, `tx_retry_burst_count`, `channel_width` | Read by 10.x; not in 4.0.15's list | Not sent: no reference firmware to match (current builds are encrypted) |
+
+Power save by driver, read-only on both APs (2026-10-10): ath9k (no `AP_LINK_PS`) showed
+`PS_STA` on one of four stations in each of ten 1 s samples. ath10k and mt798x both set
+`AP_LINK_PS` and never showed it, 0 of 13 stations over 10 s on mt798x with IoT clients
+associated, so `false` there would be a guess and `state` is left out (the controller then reads
+`powersave_enabled: false` either way).
+
+**`anomalies: -1` on a UniFi-gateway site is the controller's.** Each client's record is written
+by every device that reports it, last writer wins (`URbVkSXx`, stamping `_last_seen_by_<type>`).
+The gateway's host pass (`ykWHwBYcfNAYxrjv` → `yChBbiXeSTK`) puts
+`anomalies = port.getInt("anomalies", -1)` on every host behind a port, with no −1 guard
+(`satisfaction` has one). The only hosts it skips are UniFi devices' own MACs and BSSIDs
+(`CNSMptQSEDMQtIKop`), not their clients, so a real UniFi AP's clients get the same −1. Live,
+10.6.106: 17 of 17 WiFi clients read −1 with `_last_seen_by_ugw` newer than `_last_seen_by_uap`,
+and earlier the one client whose AP report was newest read 0. The lab has no gateway and keeps
+the AP's value.
+
+Verified 2026-10-10 on both APs against the real 10.6.106 controller: `stat/sta` shows `rssi`
+45/44 for clients at −51/−48 dBm (noise −106 → floored −96 on ath10k, −92 on mt798x), `noise`,
+and `is_11r: true` on the six clients whose hostapd AKM is 00-0f-ac-9 or -4. No 2.4 GHz client
+was on the ath9k radio during the check, so `powersave_enabled: true` has not been seen end to
+end; the reader was checked against live debugfs.
 
 **Per-driver tx counters (hardware, 2026-09-27).** `iw station dump`'s `tx retries` and
 `tx failed` don't mean the same thing on every driver, and neither tracks end-to-end loss. The

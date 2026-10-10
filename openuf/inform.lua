@@ -1153,6 +1153,18 @@ function M.build_json(st, cfg, ufhw)
 			-- attempts on mt76 (satisfaction.failed_is_dropped).
 			local failed_is_dropped = sat.failed_is_dropped(
 				M._sysinfo.wifi_driver and M._sysinfo.wifi_driver(ok_if and ifnames[1]))
+			-- Each station's AKM from hostapd, for is_11r below.
+			local akms = {}
+			if #stas > 0 and M._sysinfo.sta_akms then
+				local bsses, seen_bss = {}, {}
+				for _, b in pairs(sta_ifname) do
+					if not seen_bss[b] then seen_bss[b] = true; bsses[#bsses + 1] = b end
+				end
+				local ok_akm, rv_akm = pcall(M._sysinfo.sta_akms, bsses)
+				if ok_akm and type(rv_akm) == "table" then akms = rv_akm end
+			end
+			local noise = noise_by_radio[vap.radio_name]
+			if type(noise) ~= "number" or noise >= 0 then noise = nil end
 			local sta_table = {}
 			for sta_i, sta in ipairs(stas) do
 				local ifname = sta_ifname[sta_i]
@@ -1228,7 +1240,7 @@ function M.build_json(st, cfg, ufhw)
 				}
 				local mov = win.mov or {}
 				local satisfaction_now, satisfaction_reason, anomalies = sat.score{
-					snr = sat.snr(sta.signal_avg or sta.signal, noise_by_radio[vap.radio_name]),
+					snr = sat.snr(sta.signal_avg or sta.signal, noise),
 					tx_kbps = sta.tx_bitrate and math.floor(sta.tx_bitrate * 1000 + 0.5),
 					rx_kbps = sta.rx_bitrate and math.floor(sta.rx_bitrate * 1000 + 0.5),
 					tries = mov.tries, retries = mov.retries, dropped = mov.dropped,
@@ -1236,6 +1248,11 @@ function M.build_json(st, cfg, ufhw)
 				if satisfaction_now then
 					tally.add(satisfaction_now, satisfaction_reason, anomalies)
 				end
+				-- Station state bit 0x10 = dozing, the only bit the controller
+				-- reads (powersave_enabled). Absent where the radio can't tell.
+				local ps_ok, ps = pcall(M._sysinfo.sta_powersave or function() end, ifname, sta.mac)
+				local sta_state
+				if ps_ok and ps ~= nil then sta_state = ps and 0x10 or 0 end
 
 				sta_table[#sta_table + 1] = {
 					active     = true,
@@ -1245,8 +1262,19 @@ function M.build_json(st, cfg, ufhw)
 					ap_mac     = mac_str,
 					channel    = vap.channel,
 					radio      = vap.radio,
+					-- rssi is the SNR in dB, as UniFi firmware sends it
+					-- (fill_stainfo_json, firmware-confirmed for 3.9.27 to
+					-- 4.0.15: signal = rssi + max(noise, -96)); the
+					-- controller's readers test it against 5 and convert it
+					-- with -95. noise is the radio's floor in dBm.
 					signal     = sta.signal,
-					rssi       = sta.signal,
+					rssi       = sat.snr(sta.signal, noise),
+					noise      = noise,
+					state      = sta_state,
+					-- Only when true, as the firmware sends it: the station
+					-- holds a Fast BSS Transition AKM.
+					is_11r     = M._sysinfo.akm_is_ft
+						and M._sysinfo.akm_is_ft(akms[sta.mac:lower()]) or nil,
 					-- capacity: best-effort proxy from the negotiated PHY tx
 					-- rate (Mbps). linkscore/multicast: no local source
 					-- exists at all (not in iw output, not in any public

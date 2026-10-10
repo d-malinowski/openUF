@@ -196,6 +196,76 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: sta_powersave() reads PS_STA only where mac80211 tracks it",
+		fn = function()
+			local D = "/sys/kernel/debug/ieee80211/"
+			local st = D .. "phy1/netdev:phy1-ap0/stations/"
+			sysinfo._ps_phy_cache = {}
+			with_fixtures({
+				["/sys/class/net/phy1-ap0/phy80211/name"] = "phy1\n",
+				[D .. "phy1/hwflags"] = "RX_INCLUDES_FCS\nSIGNAL_DBM\nPS_NULLFUNC_STACK\n",
+				[st .. "00:00:5e:00:53:31/flags"] = "AUTH\nASSOC\nPS_STA\nAUTHORIZED\n",
+				[st .. "00:00:5e:00:53:32/flags"] = "AUTH\nASSOC\nAUTHORIZED\n",
+			}, {}, function()
+				assert_eq(sysinfo.sta_powersave("phy1-ap0", "00:00:5e:00:53:31"), true, "PS_STA: dozing")
+				assert_eq(sysinfo.sta_powersave("phy1-ap0", "00:00:5e:00:53:32"), false, "no PS_STA: awake")
+				assert_eq(sysinfo.sta_powersave("phy1-ap0", "00:00:5e:00:53:33"), nil, "no station dir: unknown")
+			end)
+			-- ath10k and mt76 set AP_LINK_PS: the driver owns power save and
+			-- PS_STA never appears, so the answer is unknown, not "awake".
+			sysinfo._ps_phy_cache = {}
+			with_fixtures({
+				["/sys/class/net/phy0-ap0/phy80211/name"] = "phy0\n",
+				[D .. "phy0/hwflags"] = "SIGNAL_DBM\nAP_LINK_PS\nSUPPORTS_TX_ENCAP_OFFLOAD\n",
+				[D .. "phy0/netdev:phy0-ap0/stations/00:00:5e:00:53:31/flags"] = "AUTH\nASSOC\nAUTHORIZED\n",
+			}, {}, function()
+				assert_eq(sysinfo.sta_powersave("phy0-ap0", "00:00:5e:00:53:31"), nil, "AP_LINK_PS: unknown")
+			end)
+			-- No debugfs at all.
+			sysinfo._ps_phy_cache = {}
+			with_fixtures({["/sys/class/net/phy0-ap0/phy80211/name"] = "phy0\n"}, {}, function()
+				assert_eq(sysinfo.sta_powersave("phy0-ap0", "00:00:5e:00:53:31"), nil, "no hwflags: unknown")
+			end)
+			sysinfo._ps_phy_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: sta_akms() parses hostapd all_sta, akm_is_ft() knows the FT suites",
+		fn = function()
+			local seen
+			with_fixtures({}, {["all_sta"] =
+				"00:00:5e:00:53:31\nflags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP]\naid=3\n"
+				.. "AKMSuiteSelector=00-0f-ac-9\nhostapdWPAPTKState=11\n"
+				.. "00:00:5e:00:53:32\nflags=[AUTH][ASSOC][AUTHORIZED]\nAKMSuiteSelector=00-0f-ac-2\n"
+				.. "00:00:5e:00:53:33\nflags=[AUTH][ASSOC][AUTHORIZED]\n"}, function()
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd) seen = cmd; return orig(cmd) end
+				local a = sysinfo.sta_akms({"phy0-ap0", "phy0-ap1", "bad;name"})
+				sysinfo._run_cmd = orig
+				assert_eq(a["00:00:5e:00:53:31"], "00-0f-ac-9", "FT-SAE station")
+				assert_eq(a["00:00:5e:00:53:32"], "00-0f-ac-2", "PSK station")
+				assert_eq(a["00:00:5e:00:53:33"], nil, "open station: no AKM line")
+			end)
+			assert_true(seen:find("for b in phy0-ap0 phy0-ap1;", 1, true) ~= nil, "one run over both BSSes")
+			assert_true(seen:find("bad;name", 1, true) == nil, "a name unsafe for the shell is dropped")
+			with_fixtures({}, {}, function()
+				local n = 0
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd) n = n + 1; return orig(cmd) end
+				assert_eq(next(sysinfo.sta_akms({})), nil, "no BSS: empty")
+				sysinfo._run_cmd = orig
+				assert_eq(n, 0, "no BSS: nothing run")
+			end)
+			for _, akm in ipairs({"00-0f-ac-3", "00-0f-ac-4", "00-0f-ac-9", "00-0f-ac-13", "00-0f-ac-19", "00-0f-ac-25"}) do
+				assert_true(sysinfo.akm_is_ft(akm), akm .. " is FT")
+			end
+			for _, akm in ipairs({"00-0f-ac-1", "00-0f-ac-2", "00-0f-ac-6", "00-0f-ac-8", "00-0f-ac-18"}) do
+				assert_eq(sysinfo.akm_is_ft(akm), false, akm .. " is not FT")
+			end
+			assert_eq(sysinfo.akm_is_ft(nil), false, "no AKM: not FT")
+		end
+	},
+	{
 		name = "sysinfo: sta_table() returns empty table for empty command output",
 		fn = function()
 			with_fixtures({}, {["station dump"] = ""}, function()

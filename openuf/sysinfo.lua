@@ -381,6 +381,69 @@ function M.wifi_driver(ifname)
 	return M._driver_cache[ifname] or nil
 end
 
+-- Whether a station is dozing right now (UniFi firmware's sta `state` bit
+-- 0x10, which the controller turns into powersave_enabled): true/false, or nil
+-- when this radio cannot say. mac80211 keeps the PS_STA flag itself only when
+-- the driver leaves power-save tracking to it; a driver that sets AP_LINK_PS
+-- in hwflags takes that job over, and neither ath10k nor mt76 reports back
+-- (both APs, 2026-10-10: ath9k showed PS_STA on a dozing client, ath10k and
+-- mt798x never once in 10 s across 17 stations). There, false would be a
+-- guess. Needs debugfs, which OpenWrt mounts.
+M._ps_phy_cache = {}
+function M.sta_powersave(ifname, mac)
+	if not ifname or not mac then return nil end
+	local phy = M._ps_phy_cache[ifname]
+	if phy == nil then
+		phy = (M._read_file("/sys/class/net/" .. ifname .. "/phy80211/name") or ""):match("^%s*(%S+)")
+		if phy then
+			local hw = M._read_file("/sys/kernel/debug/ieee80211/" .. phy .. "/hwflags")
+			if not hw or hw:find("AP_LINK_PS", 1, true) then phy = nil end
+		end
+		M._ps_phy_cache[ifname] = phy or false
+	end
+	if not phy then return nil end
+	local flags = M._read_file("/sys/kernel/debug/ieee80211/" .. phy .. "/netdev:"
+		.. ifname .. "/stations/" .. mac:lower() .. "/flags")
+	if not flags then return nil end
+	for word in flags:gmatch("%S+") do
+		if word == "PS_STA" then return true end
+	end
+	return false
+end
+
+-- Each station's AKM suite on the given hostapd BSSes, as hostapd prints it
+-- ("00-0f-ac-9"), keyed by lower-case MAC. One hostapd_cli run for all of them.
+function M.sta_akms(bsses)
+	local out = {}
+	local names = {}
+	for _, b in ipairs(bsses or {}) do
+		if b:match("^[%w%-%._]+$") then names[#names + 1] = b end
+	end
+	if #names == 0 then return out end
+	local text = M._run_cmd("for b in " .. table.concat(names, " ")
+		.. "; do hostapd_cli -i $b all_sta; done")
+	local cur
+	for line in text:gmatch("[^\n]+") do
+		local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+		if mac then
+			cur = mac:lower()
+		elseif cur then
+			local akm = line:match("^AKMSuiteSelector=(%S+)")
+			if akm then out[cur] = akm:lower() end
+		end
+	end
+	return out
+end
+
+-- AKM suites that use Fast BSS Transition (IEEE 802.11-2020 table 9-151:
+-- 3 FT-802.1X, 4 FT-PSK, 9 FT-SAE, 13 FT-802.1X-SHA384, 19 FT-PSK-SHA384,
+-- 25 FT-SAE-EXT-KEY).
+local FT_AKMS = {["00-0f-ac-3"] = true, ["00-0f-ac-4"] = true, ["00-0f-ac-9"] = true,
+	["00-0f-ac-13"] = true, ["00-0f-ac-19"] = true, ["00-0f-ac-25"] = true}
+function M.akm_is_ft(akm)
+	return akm ~= nil and FT_AKMS[akm] == true
+end
+
 -- Sibling-AP recognition. The controller decides whether a scanned BSS is
 -- one of its own from the REPORTING AP's word alone, never from the site's
 -- vap_tables (decompiled 10.6.101, com.ubnt.service.aS.rhAW): a scan entry
