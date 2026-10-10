@@ -1161,19 +1161,76 @@ stamgr.1.minrssi.rssi=15
 stamgr.1.loadbalance.status=false
 ```
 
-**The threshold is not plain dBm.** UI `-80 dBm` → wire `15`; UI `-85 dBm` → wire `10` —
-consistent with `wire = dbm + 95`, an offset from an assumed -95 dBm noise floor (a madwifi
-convention, matching `aaa.1.driver=madwifi`). openUF stores the raw wire value in UCI and
-converts to dBm only where a live noise-floor reading exists (`sysinfo.radio_stats()`'s
-`iw survey dump` parse), falling back to the -95 assumption otherwise.
+**The threshold is not plain dBm.** UI `-80 dBm` → wire `15`; UI `-85 dBm` → wire `10`.
+The controller's generator (`com.ubnt.service.config`, 10.x) computes it as
+`max(min_rssi + 95, 1)` with `min_rssi` defaulting to `-80`, so openUF converts back with a
+fixed `- 95` (`openuf/minrssi.lua`). An earlier version added the radio's live noise floor
+instead, which moved the threshold by up to 12 dB between drivers (ath9k reads -107, mt76
+-90/-92).
 
 `loadbalance.status` is a sibling sub-feature sharing the block; unimplemented.
 
-**Enforcement semantics** (from web research — this is client-facing AP behavior, not a wire
-format): Minimum RSSI is a **roaming aid, not a block**. The AP sends a single deauth frame to
-a below-threshold client; there is no persistent drop rule and the client may reassociate
-immediately, even to the same AP. This is materially different from `block-sta`, so it has its
-own helper, `ucihelper.kick_station()`, rather than reusing `firewall.deauth()`.
+**Two top-level keys come with it** (lab 10.4.57, 2026-10-10, Minimum RSSI on for one radio):
+
+```
+stamgr.status=enabled
+stamgr.interval=1
+```
+
+`stamgr.status=disabled` (and no `stamgr.<n>` block) when no radio has Minimum RSSI or load
+balancing on. `stamgr.interval` is the site's `config.stamgr_interval`, default 1. openUF
+does not read either: they stay in the dropped-key report.
+
+**What the AP does with it (firmware-confirmed for 4.0.15, 2026-10-10).** Two halves:
+
+1. **Refuse.** `ubntbox` sets the driver's per-radio `minrssi` to `minrssi.rssi` plus
+   `stamgr.<n>.minrssi.rssi.offset` (default 3; the controller never sends it), only while
+   `minrssi.status` is true. `umac.ko` then answers no probe request and no authentication
+   below it ("probe/auth: disallowed by minrssi").
+2. **Kick.** `ubntbox` writes `/bin/stamgr -i <stamgr.interval, default 1> -c
+   <stamgr.minrssi_conseq_fails, default 30>` into inittab, plus `-b <band> -r <rssi> -n
+   <maxsta>` per radio. `stamgr` (`/bin/stainfo`) samples each station every interval,
+   smooths its RSSI (0.2 × previous + 0.8 × current), and counts consecutive samples below
+   `-r`; any sample at or above resets the count to 0. At `-c` it runs `kick-sta-on`
+   (`syswrapper.sh`), the same one-shot deauth as the `kick-sta` command. Nothing is blocked.
+
+So the firmware kicks a client after **30 s continuously below** the threshold, and lets it
+back only **3 dB above** it, which is what stops a weak client from looping kick → rejoin.
+The controller emits neither `minrssi_conseq_fails` nor the offset, so the defaults are what
+every UniFi AP runs. `stamgr`'s two other kicks are off on a managed AP: `ubntbox` never
+passes `-t` (inactivity), and it appends `-K` (no kick for a wireless client seen on
+Ethernet) unless `stamgr.kicketh.status` is false. The controller sends neither key.
+
+**openUF (2026-10-10):**
+- *Refuse:* hostapd's `rssi_reject_assoc_rssi` and `rssi_ignore_probe_request` at threshold
+  + 3 dBm, both `wifi-device` options (present in 25.12's schema, `hostapd.uc`'s
+  `append_vars` and `hostapd.sh`; read on both APs, OpenWrt 25.12.5). Stamped `openuf_minrssi`; turning
+  the feature off removes exactly the stamped options. A hand-set value on an unstamped radio
+  is never touched. hostapd refuses association (not authentication) below the threshold;
+  that is the closest it has.
+- *Kick:* openUF samples once per inform, not once a second, so it counts time: a station
+  whose `signal avg` was below the threshold in every sample for 30 s gets one deauth
+  (`ucihelper.kick_station`). One sample at or above restarts the count; a station that
+  leaves is forgotten. The previous version kicked on the first sample below, with nothing
+  stopping the client from reconnecting at once.
+- A station below Minimum RSSI is not also handed to Roaming Assistant.
+
+Lab (10.4.57): the captured push replays through `_parse_wifi_system_cfg` + `apply_config`
+into `rssi_reject_assoc_rssi=-77`, `rssi_ignore_probe_request=-77` for `-80 dBm`, and the
+real off push removes both. The controller shows `min_rssi: -80` back.
+
+Hardware (2026-10-10, Archer C5 2.4 GHz ath9k, real 10.6 controller): Minimum RSSI set to
+-90 dBm (the controller's API accepts -67 to -90 only, `api/fields/Device.json`) arrived as
+`stamgr.2.minrssi.rssi=5` with `stamgr.interval=1`. Within ~8 s the live
+`/var/run/hostapd-phy1.conf` read `rssi_reject_assoc_rssi=-87` and
+`rssi_ignore_probe_request=-87`; only that radio restarted (`AP-ENABLED` 2 s later, the
+5 GHz BSS untouched), and the controller showed `min_rssi: -90` back. Switching it off
+returned both to `0` (hostapd's off) and removed the stamp. Not observed: an actual refused
+association or a 30 s kick, since no client was anywhere near -87 dBm.
+
+**Enforcement semantics.** Minimum RSSI is a **roaming aid, not a block**. The kick is a
+single deauth with no persistent drop rule, so it has its own helper,
+`ucihelper.kick_station()`, rather than reusing `firewall.deauth()`.
 
 ### `wireless.<n>.btm_disassoc.*` — Roaming Assistant
 
@@ -2198,7 +2255,7 @@ through 0/3/4/5/6/7/15/31/255 only changed *which* of two near-identical errors 
 | `nss`, `is_11ac`, `is_11ax`, `is_11be`, `has_dfs`, `has_fccdfs`, `has_ht160`, `has_eht240`, `has_eht320` | Read directly off each entry by `PGOcbDWlbnYQdFW`'s `copyAttrsIfPresent`, **independent of `radio_caps`**. Derived by `sysinfo.radio_caps()` from `iw phy phyN info`. |
 | **`radio_caps`** | A separate **integer bitmask**, not `nss`. See below. |
 | **`radio_caps2`** | `0x3` on an SAE-capable radio (`0x1` WPA3, `0x2` FT with WPA3), `0` otherwise, plus `0x8` (Enhanced Open) where hostapd has OWE. See [Capability bitmasks](#capability-bitmasks). |
-| `min_rssi`, `min_rssi_enabled` | `min_rssi` is **dBm** on the wire (converted from the raw `stamgr` units using the live noise floor) |
+| `min_rssi`, `min_rssi_enabled` | `min_rssi` is **dBm** on the wire (the raw `stamgr` value - 95, the controller's own encoding) |
 | **`athstats`** | Nested `{cu_total, cu_self_rx, cu_self_tx, cu_interf}`. See below. |
 
 **An empty `radio_table` blocks a large amount of downstream behavior.** The controller checks
@@ -3158,7 +3215,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` (+ 802.11k `rrm_beacon_req`) | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls), and ✅ **confirmed rendering** in the live Environment tab 2026-09-02 (AX3000T): the 30-minute window listed exactly the BSSes in that AP's own scan cache, with matching signals, and the spectrum chart drew them alongside `This AP`. Note what the `scan dump` source can and cannot see: the cache is filled **passively, from beacons the radio overhears on the channel it is already parked on**, so the list is neighbours on/adjacent to the operating channel and nothing else — 6 entries on a 2.4 GHz radio on ch 11, exactly 1 on a 5 GHz radio on ch 44. That is the deliberate trade for never dwelling off-channel. ✅ Closed 2026-09-02 with 802.11k client-assisted enrichment (`openuf/rrmscan.lua`) -- Ubiquiti's own Channel AI mechanism -- which took a 5 GHz radio's list from **0 neighbours to 4** without the AP leaving its channel; see [the section above](#enriching-it-without-scanning--80211k-beacon-reports). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |
 | 22 | Radios tab Avg. Signal / Interference / Airtime / MIMO | `vap_table.avg_client_signal`; `radio_table.athstats`; `radio_table.radio_caps` | ✅ All four confirmed live on a fresh reset (`-64`/`-50 dBm`, `3%`, `7%`, `2x2`), with bidirectional filter behavior verified |
-| 23 | Minimum RSSI | `system_cfg` `stamgr.<n>.*`; outbound `min_rssi`/`min_rssi_enabled` | ✅ Wire format and field names confirmed. Enforcement (`kick_station`) is unit-tested only — no real radios here. |
+| 23 | Minimum RSSI | `system_cfg` `stamgr.<n>.*`; outbound `min_rssi`/`min_rssi_enabled` | ✅ Wire format and field names confirmed. Enforcement follows the firmware since 2026-10-10 (hostapd refuses below threshold + 3 dB; kick after 30 s below). The refusal reaching hostapd's live config, and its teardown, are confirmed on real hardware; a refused or kicked client is unit-tested only. |
 | 24 | Security tab WPA2/WPA3 protocol options | **None** | ℹ️ Not capability-driven from anything openUF sends. No security-capability field exists in the payload; `ucihelper`'s `SECURITY_MAP` (`wpa2`→`psk2`, `wpa3`→`sae`, `wpa2/wpa3`→`sae-mixed`, `wpa-enterprise`→`wpa2+ccmp`) is a one-way map of a choice the controller has already made. The dropdown's options come from the controller's own internal per-model database, keyed on the reported `model`/`platform`. Not fixable here. |
 | 25 | Band Steering / BSS Transition / DTIM | `wireless.<n>.no2ghz_oui` / `aaa.<n>.bss_transition` / `wireless.<n>.dtim_period` | ✅ All three confirmed live by individual before/after `system_cfg` diffs, and ✅ **a real client steered 2.4 → 5 GHz** on the AX3000T 2026-09-02. The whole exchange is in the AP's log: the station associates on `phy0-ap0` (2.4 GHz, ch 11) at 05:33:23, and 72 s later `phy0-ap0: BSS-TM-RESP <sta> status_code=0 target_bssid=00:00:5e:00:53:05` — accepted, naming the **5 GHz** BSSID — followed in the same second by `phy1-ap0: associated` and `phy0-ap0: Prune association`. `auth_alg=ft` on both, so the move used fast roaming. usteer had been up since boot and was never restarted, so this was its own unprompted decision. Two negative results worth keeping: usteer's per-BSS `roam_events` counters stayed at 0 through it, so they do not count BTM-driven band steers; and every client that was *not* steered had a concrete reason visible in `ubus call usteer get_clients` / `hostapd get_clients` — either no 5 GHz sighting at all, or `rrm: [0,0,0,0,0]` with the BSS-Transition bit clear in `extended_capabilities`. "Nothing moved" is not evidence of a broken steerer. |
 | 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ⚠️ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt side does not work and is not implemented.** openUF writes `wps_device_name` + `ap_setup_locked` (both valid wifi-iface options — confirmed present in the schema and in `/usr/share/ucode/wifi/`), but OpenWrt emits the WPS/WSC block that carries `device_name` only under `if (config.wps_possible && length(config.config_methods))` (`ap.uc:227`), and `config_methods` is populated solely from `wps_pushbutton`/`wps_label`. openUF sets neither, so WPS never activates and no WSC Device Name IE reaches a beacon. Verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T (filogic), both 25.12.5, same gate on both; no live BSS conf carries any WPS key. Turning WPS on to broadcast a name trades a real security surface for a cosmetic feature — deliberately not done. |

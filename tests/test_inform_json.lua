@@ -1155,19 +1155,20 @@ return {
 		end
 	},
 	{
-		-- Enforcement: a station below the radio's minrssi threshold gets a
-		-- single deauth via ucihelper.kick_station -- confirmed via web
-		-- research this is a one-shot roaming-assist kick, not a persistent
-		-- block, so it's deliberately separate from firewall.lua's
-		-- block-sta feature (no nftables, no state.json).
-		name = "inform json: stations below the radio's minrssi threshold get kicked, others don't",
+		-- Enforcement: a station below the radio's minrssi threshold for 30 s
+		-- gets a single deauth via ucihelper.kick_station (stamgr's 30
+		-- consecutive 1 s samples, openuf/minrssi.lua) -- a one-shot kick,
+		-- not a persistent block, so it's deliberately separate from
+		-- firewall.lua's block-sta feature (no nftables, no state.json).
+		name = "inform json: stations below the radio's minrssi threshold for 30 s get kicked, others don't",
 		fn = function()
 			inject_sysinfo(true)  -- fixture: aa:bb:cc:dd:ee:ff at -62 dBm, 11:22:33:44:55:66 at -75 dBm
 			inject_ucihelper()
+			inform._minrssi._low_since = {}
 			inform._ucihelper.get_radio_table = function()
 				return {
 					{ name = "radio0", radio = "ng", channel = "6",
-					  min_rssi_enabled = true, min_rssi_raw = 25 },  -- threshold: 25 + (-95) = -70 dBm
+					  min_rssi_enabled = true, min_rssi_raw = 25 },  -- threshold: 25 - 95 = -70 dBm
 				}
 			end
 			local kicked = {}
@@ -1179,10 +1180,21 @@ return {
 				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
 				ip = "192.168.1.100", hostname = "testap",
 			}
-			inform.build_json(st, nil, ufhw)
-			assert_eq(#kicked, 1, "exactly one station kicked")
-			assert_eq(kicked[1].mac, "11:22:33:44:55:66", "the -75 dBm station (below -70 threshold) is kicked")
-			assert_eq(kicked[1].ifname, "wlan0", "kicked on the resolved live ifname")
+			local orig_time = inform._time
+			local ok, err = pcall(function()
+				for _, t in ipairs({1000, 1010, 1020}) do
+					inform._time = function() return t end
+					inform.build_json(st, nil, ufhw)
+				end
+				assert_eq(#kicked, 0, "20 s below: not yet")
+				inform._time = function() return 1030 end
+				inform.build_json(st, nil, ufhw)
+				assert_eq(#kicked, 1, "30 s below: exactly one station kicked")
+				assert_eq(kicked[1].mac, "11:22:33:44:55:66", "the -75 dBm station (below -70 threshold) is kicked")
+				assert_eq(kicked[1].ifname, "wlan0", "kicked on the resolved live ifname")
+			end)
+			inform._time = orig_time
+			if not ok then error(err, 0) end
 		end
 	},
 	{
@@ -1198,7 +1210,8 @@ return {
 					return {{mac = "aa:bb:cc:dd:ee:01", signal = -50, tx_packets = 1}}
 				end
 				if ifname == "wlan0-20" then
-					return {{mac = "aa:bb:cc:dd:ee:02", signal = -80, tx_packets = 1}}
+					-- Its last frame was loud; its average is what counts.
+					return {{mac = "aa:bb:cc:dd:ee:02", signal = -65, signal_avg = -80, tx_packets = 1}}
 				end
 				return {}
 			end
@@ -1217,6 +1230,7 @@ return {
 			inform._ucihelper.kick_station = function(ifname, mac)
 				kicked[#kicked + 1] = {ifname = ifname, mac = mac}
 			end
+			inform._minrssi._low_since = {["aa:bb:cc:dd:ee:02"] = os.time() - 60}  -- below for a minute
 			local ok, err = pcall(function()
 				local st = {
 					authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
@@ -1227,7 +1241,7 @@ return {
 				local vap
 				for _, v in ipairs(d.vap_table) do if v.essid == "test" then vap = v end end
 				assert_eq(vap.num_sta, 2, "the VLAN client is counted")
-				assert_eq(#kicked, 1, "the -80 dBm VLAN client is below -70")
+				assert_eq(#kicked, 1, "the VLAN client's -80 dBm average is below -70")
 				assert_eq(kicked[1].mac, "aa:bb:cc:dd:ee:02", "that one")
 				assert_eq(kicked[1].ifname, "wlan0", "through the VAP's hostapd, not wlan0-20")
 			end)
@@ -1268,6 +1282,39 @@ return {
 			assert_true(type(seen_now) == "number", "a clock")
 			assert_eq(seen_opts.diff_db, 6, "conf override passed through")
 			assert_nil(d.vap_table[1].roam_assist_rssi, "internal threshold stripped from the payload")
+		end
+	},
+	{
+		name = "inform json: a station below Minimum RSSI is not also handed to Roaming Assistant",
+		fn = function()
+			inject_sysinfo(true)  -- aa:bb:cc:dd:ee:ff at -62 dBm, 11:22:33:44:55:66 at -75 dBm
+			inject_ucihelper()
+			inform._minrssi._low_since = {}
+			local base = inform._ucihelper.get_vap_table
+			inform._ucihelper.get_vap_table = function()
+				local v = base()
+				v[1].roam_assist_rssi = -60
+				return v
+			end
+			inform._ucihelper.get_radio_table = function()
+				return {{name = "radio0", radio = "ng", channel = "6",
+					min_rssi_enabled = true, min_rssi_raw = 25}}  -- -70 dBm
+			end
+			local seen
+			local orig = inform._roamassist
+			inform._roamassist = {tick = function(o) seen = o end}
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local ok, err = pcall(inform.build_json, st, nil, ufhw)
+			inform._roamassist = orig
+			if not ok then error(err, 0) end
+			assert_eq(#seen, 1, "only the station above Minimum RSSI")
+			assert_eq(seen[1].mac, "aa:bb:cc:dd:ee:ff", "the -62 dBm one")
+			assert_eq(inform._minrssi._low_since["11:22:33:44:55:66"] ~= nil, true,
+				"the -75 dBm one is Minimum RSSI's")
 		end
 	},
 	{

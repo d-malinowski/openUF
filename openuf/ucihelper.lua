@@ -17,6 +17,8 @@ M._uci        = nil  -- override with a mock UCI table; nil = require("uci")
 M._bcfilter   = nil  -- nil = load openuf/bcfilter.lua on first use
 -- "WiFi Speed Limit" enforcement (tc). Injectable for the same reason.
 M._shaper     = nil  -- nil = load openuf/shaper.lua on first use
+-- Minimum RSSI's constants (wire offset, refusal margin).
+M._minrssi    = nil  -- nil = load openuf/minrssi.lua on first use
 M._run_cmd    = function(cmd) return os.execute(cmd) end
 
 -- Injectable: command execution that captures stdout (for read-only introspection,
@@ -89,6 +91,7 @@ end
 
 local function get_bcfilter() return get_sibling("bcfilter", M._bcfilter) end
 local function get_shaper()   return get_sibling("shaper",   M._shaper)   end
+local function get_minrssi()  return get_sibling("minrssi",  M._minrssi)  end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
 -- The real controller's radio_table schema requires this "radio" field
@@ -955,12 +958,11 @@ end
 -- a per-radio (not per-SSID) setting -- confirmed live 2026-07-14 via the
 -- controller's stamgr.<n>.minrssi.* wire keys, a section separate from and
 -- indexed the same as radio.<n>. minrssi_raw is stored as-received (raw wire
--- units, an offset from the driver's noise floor, NOT plain dBm -- see
--- inform.lua's M._parse_wifi_system_cfg for the conversion math), since the
--- dBm conversion needs a live noise-floor reading only available later, at
--- enforcement/readback time. On disable only the flag is written to 0;
--- minrssi_rssi stays parked in UCI (harmless -- every consumer gates on the
--- flag first) so a later re-enable without a threshold change reuses it.
+-- units, dBm + 95; openuf/minrssi.lua). On disable only the flag is written
+-- to 0; minrssi_rssi stays parked in UCI (harmless -- every consumer gates on
+-- the flag first) so a later re-enable without a threshold change reuses it.
+-- The refusal half is hostapd's: rssi_reject_assoc_rssi and
+-- rssi_ignore_probe_request, stamped openuf_minrssi and torn down on disable.
 -- rates: optional table from M.derive_rates() plus an optional beacon_rate,
 -- i.e. the "Minimum Data Rate" settings. These are wifi-DEVICE options in
 -- OpenWrt, not wifi-iface ones (confirmed in OpenWrt's hostapd.sh: basic_rate,
@@ -1043,6 +1045,25 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	end
 	if minrssi_raw then
 		cursor:set("wireless", radio, "minrssi_rssi", tostring(minrssi_raw))
+	end
+	-- Minimum RSSI's refusal (openuf/minrssi.lua): the firmware's driver
+	-- answers no probe and no authentication below the threshold + 3 dB;
+	-- hostapd's equivalents are wifi-device options. Computed from the same
+	-- stored threshold the kick reads back, so the two halves never disagree.
+	local mr = get_minrssi()
+	local raw = tonumber(minrssi_raw or cursor:get("wireless", radio, "minrssi_rssi"))
+	if minrssi_enabled and raw and mr then
+		local refuse = tostring(mr.dbm(raw) + mr.REFUSE_MARGIN)
+		cursor:set("wireless", radio, "rssi_reject_assoc_rssi", refuse)
+		cursor:set("wireless", radio, "rssi_ignore_probe_request", refuse)
+		cursor:set("wireless", radio, "openuf_minrssi", "1")
+	elseif minrssi_enabled ~= nil and cursor:get("wireless", radio, "openuf_minrssi") == "1" then
+		-- Off: remove exactly what the stamp says openUF wrote. Hand-set
+		-- values on an unstamped radio are never touched.
+		for _, opt in ipairs({"rssi_reject_assoc_rssi", "rssi_ignore_probe_request",
+				"openuf_minrssi"}) do
+			cursor:delete("wireless", radio, opt)
+		end
 	end
 	if rates then
 		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives

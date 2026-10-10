@@ -67,6 +67,7 @@ local airtime   = _require_sibling("airtime")
 local assoctrack = _require_sibling("assoctrack")
 local guestportal = _require_sibling("guestportal")
 local satisfaction = _require_sibling("satisfaction")
+local minrssi   = _require_sibling("minrssi")
 
 local M = {}
 
@@ -87,6 +88,7 @@ M._usteer    = usteer
 M._switchvlan = switchvlan
 M._rrmscan    = rrmscan
 M._roamassist = roamassist
+M._minrssi    = minrssi
 M._airtime    = airtime
 M._sysconf    = sysconf
 M._l2guard    = l2guard
@@ -869,36 +871,17 @@ function M.build_json(st, cfg, ufhw)
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				local in_use = ok_rs and _in_use_survey(stats) or nil
 				noise_by_radio[radio.name] = in_use and in_use.noise
-				-- min_rssi (outbound field, confirmed via decompile alongside
-				-- radio_caps/tx_power/athstats in the same DTO) converts
-				-- rf_config()'s stored raw wire units back to dBm with the
-				-- SAME FIXED offset the controller encoded them with:
-				-- confirmed live, UI "-80 dBm" <-> wire "15" and UI "-85 dBm"
-				-- <-> wire "10", i.e. raw = dbm + 95 exactly.
-				--
-				-- This used to add the LIVE noise floor instead, on the reading
-				-- that the value is "dB above noise". It is not, and cannot be:
-				-- the controller never learns a radio's noise floor, so it has
-				-- nothing but a constant to encode with -- which is why both
-				-- data points land on one. Live noise also broke the round
-				-- trip, reporting a min_rssi the UI would render as a number
-				-- the operator never chose.
-				--
-				-- It looked right only because it was written against a radio
-				-- whose noise floor happens to be exactly -95 (an Archer C5's
-				-- ath10k 5GHz). Every other radio to hand disagreed, in both
-				-- directions: the same board's ath9k 2.4GHz reads -107, turning
-				-- a requested -80 into -92 and barely kicking anyone, while an
-				-- AX3000T's mt76 radios read -90/-92 and turned it into -75,
-				-- kicking clients the operator meant to keep. A threshold that
-				-- drifts 12 dB with the driver is worse than no threshold.
-				local MINRSSI_WIRE_OFFSET = 95
+				-- min_rssi (outbound, dBm): the stored raw wire value less the
+				-- controller's fixed +95 encoding (openuf/minrssi.lua). Not the
+				-- live noise floor: the controller has none to encode with, and
+				-- noise readings differ by 12 dB between drivers (ath9k -107,
+				-- ath10k -95, mt76 -90).
 				-- min_rssi_raw can legitimately be missing with the flag set
 				-- (inconsistent UCI, e.g. a hand-edit or interrupted write) --
 				-- without the guard this was arithmetic on nil, killing the
 				-- whole inform build.
 				if radio.min_rssi_enabled and radio.min_rssi_raw then
-					radio.min_rssi = radio.min_rssi_raw - MINRSSI_WIRE_OFFSET
+					radio.min_rssi = M._minrssi.dbm(radio.min_rssi_raw)
 					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
 				end
 				if in_use then
@@ -1087,6 +1070,9 @@ function M.build_json(st, cfg, ufhw)
 		-- Roaming Assistant: one observation per station on a vap that has
 		-- it on, decided on after the loop (see openuf/roamassist.lua).
 		local roam_obs = {}
+		-- Minimum RSSI: one observation per station on a radio that has it
+		-- on, decided on after the loop (see openuf/minrssi.lua).
+		local minrssi_obs = {}
 		for _, vap in ipairs(vap_table) do
 			local live = radio_live_by_name[vap.radio_name]
 			if live then
@@ -1181,16 +1167,19 @@ function M.build_json(st, cfg, ufhw)
 					signal_sum   = signal_sum + sta.signal
 					signal_count = signal_count + 1
 				end
-				-- "Minimum RSSI": a real per-radio (not per-vap) setting --
-				-- vap.radio_name is the shared UCI radio device name, so every
-				-- vap/SSID broadcasting on this same physical radio enforces
-				-- the identical threshold. One-shot deauth only (see
-				-- ucihelper.kick_station) -- no block, client can reassociate
-				-- immediately.
+				-- "Minimum RSSI" is per radio: every vap on it shares the
+				-- threshold. The driver's average, as stamgr's own reading
+				-- is smoothed; a station below it is Minimum RSSI's, not
+				-- Roaming Assistant's.
 				local minrssi_threshold = minrssi_threshold_by_radio[vap.radio_name]
-				if minrssi_threshold and sta.signal and sta.signal < minrssi_threshold then
-					pcall(ufuci.kick_station, ifname, sta.mac)
-				elseif vap.roam_assist_rssi and sta.signal then
+				local minrssi_signal = sta.signal_avg or sta.signal
+				if minrssi_threshold and minrssi_signal then
+					minrssi_obs[#minrssi_obs + 1] = {ifname = ifname, mac = sta.mac,
+						signal = minrssi_signal, threshold = minrssi_threshold}
+				end
+				local below_minrssi = minrssi_threshold and minrssi_signal
+					and minrssi_signal < minrssi_threshold
+				if not below_minrssi and vap.roam_assist_rssi and sta.signal then
 					roam_obs[#roam_obs + 1] = {
 						ifname = ifname, ssid = vap.essid, mac = sta.mac,
 						signal = sta.signal, connected_sec = sta.connected_sec,
@@ -1422,6 +1411,13 @@ function M.build_json(st, cfg, ufhw)
 				vap.cu_interf  = cu.cu_interf
 			end
 			vap.roam_assist_rssi = nil  -- internal, consumed above
+		end
+		-- Minimum RSSI's kick: one-shot deauth (ucihelper.kick_station), no
+		-- block; hostapd's rssi_reject_assoc_rssi keeps the client from
+		-- coming straight back.
+		local ok_mr, mr_kicks = pcall(M._minrssi.tick, minrssi_obs, now)
+		for _, k in ipairs(ok_mr and mr_kicks or {}) do
+			pcall(ufuci.kick_station, k.ifname, k.mac)
 		end
 		if M._roamassist and #roam_obs > 0 then
 			pcall(M._roamassist.tick, roam_obs, now,
@@ -2110,12 +2106,10 @@ function M._parse_wifi_system_cfg(sys_raw)
 				disabled = _wire_status_disabled(r.status),
 			}
 			local sm = stamgr[idx]
-			-- minrssi.rssi is NOT plain dBm -- confirmed live: UI "-80 dBm"
-			-- wire-encoded as 15, UI "-85 dBm" as 10 (a madwifi-driver
-			-- convention, offset from an assumed -95 dBm noise floor: raw =
-			-- dbm + 95). Kept as raw wire units here; converted to dBm only
-			-- where a live noise-floor reading is available (apply_config/
-			-- enforcement), not at parse time.
+			-- minrssi.rssi is NOT plain dBm -- confirmed live (UI "-80 dBm"
+			-- wire-encoded as 15, "-85 dBm" as 10) and in the controller's
+			-- generator: raw = max(dBm + 95, 1). Kept as raw wire units here;
+			-- openuf/minrssi.lua converts.
 			-- Explicit tri-state, never nil for a parsed radio: an absent
 			-- stamgr block is the wire's disable convention (the whole block
 			-- simply disappears when the checkbox is off), so it must produce

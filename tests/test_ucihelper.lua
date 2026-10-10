@@ -2235,6 +2235,42 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: Minimum RSSI's refusal is stamped, follows the threshold and leaves hand-set values alone",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios()
+				local function push(entry)
+					ucihelper.apply_config({vap_table = {}, radio_table = {entry}}, nil)
+				end
+				push({name = "radio0", min_rssi_enabled = true, min_rssi = 10})  -- -85 dBm
+				local s = db.wireless.radio0
+				assert_eq(s.rssi_reject_assoc_rssi, "-82", "threshold + 3 dB")
+				assert_eq(s.rssi_ignore_probe_request, "-82", "probes too")
+				assert_eq(s.openuf_minrssi, "1", "stamped")
+
+				push({name = "radio0", min_rssi_enabled = true})  -- no value: the parked one
+				assert_eq(db.wireless.radio0.rssi_reject_assoc_rssi, "-82",
+					"the stored threshold, the same one the kick reads back")
+
+				push({name = "radio0", min_rssi_enabled = false})
+				s = db.wireless.radio0
+				assert_nil(s.rssi_reject_assoc_rssi, "off: removed")
+				assert_nil(s.rssi_ignore_probe_request, "off: removed")
+				assert_nil(s.openuf_minrssi, "off: stamp removed")
+
+				db.wireless.radio1.rssi_reject_assoc_rssi = "-90"  -- set by hand
+				ucihelper.apply_config({vap_table = {}, radio_table = {
+					{name = "radio1", min_rssi_enabled = false}}}, nil)
+				assert_eq(db.wireless.radio1.rssi_reject_assoc_rssi, "-90",
+					"an unstamped radio keeps its own value")
+				ucihelper.apply_config({vap_table = {}, radio_table = {
+					{name = "radio1", channel = 36}}}, nil)
+				assert_eq(db.wireless.radio1.rssi_reject_assoc_rssi, "-90",
+					"no Minimum RSSI keys at all: untouched")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config omits minrssi UCI options when disabled/absent",
 		fn = function()
 			with_ucihelper(function(db)

@@ -1442,11 +1442,18 @@ return {
 			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
 			assert_eq(db.wireless.radio0.minrssi_enabled, "1", "push 1: enforcement enabled")
 			assert_eq(db.wireless.radio0.minrssi_rssi, "15", "push 1: raw threshold stored")
+			assert_eq(db.wireless.radio0.rssi_reject_assoc_rssi, "-77",
+				"push 1: hostapd refuses association below -80 + 3 dBm")
+			assert_eq(db.wireless.radio0.rssi_ignore_probe_request, "-77",
+				"push 1: and ignores probes there")
 
 			rt, vt = inform._parse_wifi_system_cfg(off_blob)
 			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
 			assert_eq(db.wireless.radio0.minrssi_enabled, "0",
 				"push 2 (stamgr absent): enforcement flag explicitly cleared")
+			assert_nil(db.wireless.radio0.rssi_reject_assoc_rssi, "push 2: refusal removed")
+			assert_nil(db.wireless.radio0.rssi_ignore_probe_request, "push 2: probe filter removed")
+			assert_nil(db.wireless.radio0.openuf_minrssi, "push 2: stamp removed")
 		end
 	},
 	{
