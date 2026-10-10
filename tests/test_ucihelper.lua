@@ -2703,6 +2703,20 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_radio_table reads Load balance's cap back",
+		fn = function()
+			with_ucihelper(function()
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "loadbalance_maxsta", "3")
+				cursor:set("wireless", "radio1", "wifi-device")
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].loadbalance_maxsta, 3, "radio0's cap, as a number")
+				assert_nil(radios[2].loadbalance_maxsta, "radio1: off")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_radio_table reports only the modelmap's hwassign radios",
 		fn = function()
 			with_ucihelper(function()

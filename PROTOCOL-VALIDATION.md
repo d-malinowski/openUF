@@ -1250,7 +1250,8 @@ fixed `- 95` (`openuf/minrssi.lua`). An earlier version added the radio's live n
 instead, which moved the threshold by up to 12 dB between drivers (ath9k reads -107, mt76
 -90/-92).
 
-`loadbalance.status` is a sibling sub-feature sharing the block; unimplemented.
+`loadbalance.status` and `loadbalance.maxsta` are Load balance's, sharing the block (see
+[below](#stamgrnloadbalance--load-balance-per-radio-client-cap)).
 
 **Two top-level keys come with it** (lab 10.4.57, 2026-10-10, Minimum RSSI on for one radio):
 
@@ -1313,6 +1314,61 @@ association or a 30 s kick, since no client was anywhere near -87 dBm.
 **Enforcement semantics.** Minimum RSSI is a **roaming aid, not a block**. The kick is a
 single deauth with no persistent drop rule, so it has its own helper,
 `ucihelper.kick_station()`, rather than reusing `firewall.deauth()`.
+
+### `stamgr.<n>.loadbalance.*` — Load balance (per-radio client cap)
+
+The device's `radio_table[].loadbalance_enabled` + `maxsta` (REST `rest/device`; the
+10.6 schema `api/fields/Device.json` accepts `maxsta` 1 to 200 or empty). The 10.6 web
+bundle has no control for it, only a change-log label ("Load Balance", "Maximum Number of
+Clients"). The controller's generator (`com.ubnt.service.config`, 10.4) writes the
+`stamgr.<n>` block when the site's `advanced_feature_enabled` is on and the radio has
+Minimum RSSI or Load balance on. Lab (10.4.57, 2026-10-10), Load balance on for radio0 with
+`maxsta` 3 and Minimum RSSI off:
+
+```
+stamgr.1.status=true
+stamgr.1.radio=ng
+stamgr.1.minrssi.status=false
+stamgr.1.minrssi.rssi=15
+stamgr.1.loadbalance.status=true
+stamgr.1.loadbalance.maxsta=3
+# stamgr
+stamgr.status=enabled
+stamgr.interval=1
+```
+
+Off: the whole `stamgr.1` block went, and `stamgr.status=disabled`.
+
+**What the AP does with it (firmware-confirmed for 4.0.15, 2026-10-10).** `ubntbox` passes
+`stamgr -n <maxsta>` per radio, 0 unless `loadbalance.status` is true (`get_bool`, then
+`get_int32` into `-b %s -r %d -n %d`). `stamgr` (`/bin/stainfo`) ignores a maxsta of 0 or
+less. Every interval it zeroes each radio's count and candidate, then walks the stations of
+all the radio's VAPs: one it has just kicked for low RSSI is skipped, every other one
+increments the count, and the candidate becomes the station with the larger idle time
+(driver station field `0x678`, the `idle=` column of `stainfo`'s table; on equal idle the
+earlier station stays). After the walk, if `maxsta > 0` and count `> maxsta`, it kicks the
+candidate with reason "Too many STAs" (`kick-sta-on`, the same one-shot deauth as
+`kick-sta`; logged `kick-sta-on <mac> <ath> (reason:Too many STAs count:<n>)`). One kick per
+radio per interval. Nothing refuses an association: no driver `maxsta` is set (`umac.ko`
+has an `iwpriv maxsta`, `ubntbox` never writes it), so a full radio admits a newcomer and
+the next pass kicks whichever station is then the most idle.
+
+**openUF (2026-10-10):** the parser turns the block into the radio's
+`loadbalance_maxsta` (false when the block is absent, `status` is not true, or `maxsta` is
+not a positive number). `rf_config` stores it as the openUF-only `wifi-device` option
+`loadbalance_maxsta` and deletes it on off. On every inform, for each radio with a cap,
+openUF counts the stations of all its BSSes except any Minimum RSSI kicks in the same pass,
+and deauthenticates the `count - maxsta` stations with the largest `inactive time`
+(`iw station dump`) through `ucihelper.kick_station`. openUF samples once per inform, not
+once a second, so one pass does what the firmware does over that many seconds. The cap is
+not echoed in `radio_table`: the controller keeps its own copy.
+
+Lab (10.4.57): the push above stored `loadbalance_maxsta=3` on radio0, the off push removed
+it, 0 `handle_response` failures. Hardware (2026-10-10): deployed to both APs; `iw`'s
+`inactive time` parses for every station on ath10k (Archer C5 5 GHz, 3 stations) and mt76
+(AX3000T, 14 stations); the ath9k radio had none to read. A dry run of the selection with a
+cap of 1 per radio picked 2 of 3 and 12 of 14, and kicked nothing. Not observed: a real
+kick, as no radio at home has a cap set.
 
 ### `wireless.<n>.btm_disassoc.*` — Roaming Assistant
 

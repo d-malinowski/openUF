@@ -1312,6 +1312,67 @@ return {
 		end
 	},
 	{
+		-- Load balance (openuf/loadbalance.lua): above the radio's cap the most
+		-- idle stations get the one-shot deauth, not counting one Minimum RSSI
+		-- kicks in the same pass; the cap never reaches the payload.
+		name = "inform json: Load balance kicks the most idle stations above the radio's cap",
+		fn = function()
+			inject_sysinfo(true)
+			inject_ucihelper()
+			local orig_sta = inform._sysinfo.sta_table
+			inform._sysinfo.sta_table = function(ifname)
+				if ifname ~= "wlan0" then return {} end
+				return {
+					{mac = "00:00:5e:00:53:01", signal = -50, inactive_ms = 100, tx_packets = 1},
+					{mac = "00:00:5e:00:53:02", signal = -55, inactive_ms = 9000, tx_packets = 1},
+					{mac = "00:00:5e:00:53:03", signal = -60, inactive_ms = 4000, tx_packets = 1},
+					{mac = "00:00:5e:00:53:04", signal = -85, inactive_ms = 20000, tx_packets = 1},
+				}
+			end
+			local radio = {name = "radio0", radio = "ng", channel = "6", loadbalance_maxsta = 2}
+			inform._ucihelper.get_radio_table = function()
+				local r = {}
+				for k, v in pairs(radio) do r[k] = v end
+				return {r}
+			end
+			local kicked = {}
+			inform._ucihelper.kick_station = function(ifname, mac)
+				kicked[#kicked + 1] = mac
+			end
+			inform._minrssi._low_since = {}
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local ok, err = pcall(function()
+				local d = cjson.decode(inform.build_json(st, nil, ufhw))
+				table.sort(kicked)
+				assert_eq(table.concat(kicked, ","), "00:00:5e:00:53:02,00:00:5e:00:53:04",
+					"four on a cap of two: the two most idle")
+				assert_nil(d.radio_table[1].loadbalance_maxsta, "internal cap stripped from the payload")
+
+				-- Minimum RSSI (-70 dBm) has had .04 below for a minute: it is
+				-- kicked for that, and the three left are one over the cap.
+				kicked = {}
+				radio.min_rssi_enabled, radio.min_rssi_raw = true, 25
+				inform._minrssi._low_since = {["00:00:5e:00:53:04"] = os.time() - 60}
+				inform.build_json(st, nil, ufhw)
+				table.sort(kicked)
+				assert_eq(table.concat(kicked, ","), "00:00:5e:00:53:02,00:00:5e:00:53:04",
+					"Minimum RSSI's kick, then the most idle of the three left")
+
+				kicked = {}
+				radio.min_rssi_enabled, radio.min_rssi_raw = nil, nil
+				radio.loadbalance_maxsta = nil
+				inform.build_json(st, nil, ufhw)
+				assert_eq(#kicked, 0, "off: no kicks")
+			end)
+			inform._sysinfo.sta_table = orig_sta
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: a client on a private pre-shared key's VLAN is reported, and kicked via its BSS",
 		fn = function()
 			-- The VLAN netdev lists its own stations (the VAP's station dump

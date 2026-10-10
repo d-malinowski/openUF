@@ -980,8 +980,11 @@ end
 -- country: ISO 3166-1 alpha-2 regulatory domain from the controller's site
 -- setting (system_cfg's radio.<n>.countrycode, numeric on the wire and mapped
 -- to alpha-2 by inform.lua). nil leaves UCI alone.
+-- maxsta: Load balance's per-radio client cap (openuf/loadbalance.lua), kept
+-- in the openUF-only option loadbalance_maxsta; false deletes it (off), nil
+-- leaves UCI alone.
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
-		disabled, country)
+		disabled, country, maxsta)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Every write below is cursor:set on a named section, which in UCI CREATES
@@ -1064,6 +1067,11 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 				"openuf_minrssi"}) do
 			cursor:delete("wireless", radio, opt)
 		end
+	end
+	if maxsta then
+		cursor:set("wireless", radio, "loadbalance_maxsta", tostring(maxsta))
+	elseif maxsta == false then
+		cursor:delete("wireless", radio, "loadbalance_maxsta")
 	end
 	if rates then
 		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives
@@ -1256,7 +1264,7 @@ function M.apply_config(resp, cfg, opts)
 			end
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
 				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled,
-				radio.country)
+				radio.country, radio.loadbalance_maxsta)
 		end
 	end
 
@@ -1735,6 +1743,9 @@ local function radio_rows()
 			-- discards this raw field.
 			min_rssi_enabled = (s.minrssi_enabled == "1"),
 			min_rssi_raw     = tonumber(s.minrssi_rssi),
+			-- Load balance's cap, nil when off. Internal: build_json
+			-- consumes it and strips it before serializing.
+			loadbalance_maxsta = tonumber(s.loadbalance_maxsta),
 		}
 	end)
 	return radios

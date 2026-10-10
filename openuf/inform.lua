@@ -68,6 +68,7 @@ local assoctrack = _require_sibling("assoctrack")
 local guestportal = _require_sibling("guestportal")
 local satisfaction = _require_sibling("satisfaction")
 local minrssi   = _require_sibling("minrssi")
+local loadbalance = _require_sibling("loadbalance")
 local stun      = _require_sibling("stun")
 
 local M = {}
@@ -90,6 +91,7 @@ M._switchvlan = switchvlan
 M._rrmscan    = rrmscan
 M._roamassist = roamassist
 M._minrssi    = minrssi
+M._loadbalance = loadbalance
 M._airtime    = airtime
 M._sysconf    = sysconf
 M._l2guard    = l2guard
@@ -737,6 +739,9 @@ function M.build_json(st, cfg, ufhw)
 		-- loop) so the enforcement check further down is a plain
 		-- sta.signal comparison.
 		local minrssi_threshold_by_radio = {}
+		-- Load balance's client cap, keyed by radio name; only radios that
+		-- have it on.
+		local maxsta_by_radio = {}
 		-- Live noise floor per radio, for satisfaction.
 		local noise_by_radio = {}
 		-- Live secondary-channel side per radio, for each vap's extchannel.
@@ -1066,8 +1071,10 @@ function M.build_json(st, cfg, ufhw)
 			-- Internal fields, never payload members. Cleared out here (not
 			-- inside the ifname branch above) so they can't leak into the
 			-- serialized radio_table when ifname resolution fails.
+			maxsta_by_radio[radio.name] = radio.loadbalance_maxsta
 			radio.min_rssi_raw = nil
 			radio.country      = nil  -- consumed into country_code above
+			radio.loadbalance_maxsta = nil
 		end
 
 		-- Live connected-client counts, nested per-vap as sta_table -- matches
@@ -1093,6 +1100,8 @@ function M.build_json(st, cfg, ufhw)
 		-- Minimum RSSI: one observation per station on a radio that has it
 		-- on, decided on after the loop (see openuf/minrssi.lua).
 		local minrssi_obs = {}
+		-- Load balance: every station on a radio that has it on.
+		local lb_obs = {}
 		for _, vap in ipairs(vap_table) do
 			local live = radio_live_by_name[vap.radio_name]
 			if live then
@@ -1213,6 +1222,10 @@ function M.build_json(st, cfg, ufhw)
 				if minrssi_threshold and minrssi_signal then
 					minrssi_obs[#minrssi_obs + 1] = {ifname = ifname, mac = sta.mac,
 						signal = minrssi_signal, threshold = minrssi_threshold}
+				end
+				if maxsta_by_radio[vap.radio_name] then
+					lb_obs[#lb_obs + 1] = {radio = vap.radio_name, ifname = ifname,
+						mac = sta.mac, inactive_ms = sta.inactive_ms}
 				end
 				local below_minrssi = minrssi_threshold and minrssi_signal
 					and minrssi_signal < minrssi_threshold
@@ -1469,8 +1482,18 @@ function M.build_json(st, cfg, ufhw)
 		-- block; hostapd's rssi_reject_assoc_rssi keeps the client from
 		-- coming straight back.
 		local ok_mr, mr_kicks = pcall(M._minrssi.tick, minrssi_obs, now)
+		local kicked = {}
 		for _, k in ipairs(ok_mr and mr_kicks or {}) do
 			pcall(ufuci.kick_station, k.ifname, k.mac)
+			kicked[k.mac] = true
+		end
+		-- Load balance's kick: the most idle stations above the radio's cap,
+		-- not counting the ones Minimum RSSI just kicked (openuf/loadbalance.lua).
+		if #lb_obs > 0 then
+			local ok_lb, lb_kicks = pcall(M._loadbalance.kicks, lb_obs, maxsta_by_radio, kicked)
+			for _, k in ipairs(ok_lb and lb_kicks or {}) do
+				pcall(ufuci.kick_station, k.ifname, k.mac)
+			end
 		end
 		if M._roamassist and #roam_obs > 0 then
 			pcall(M._roamassist.tick, roam_obs, now,
@@ -2075,8 +2098,8 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- radio.<n> -- confirmed live 2026-07-14 (Devices -> [AP] -> Radios ->
 		-- "Minimum RSSI" checkbox+slider, NOT a WLAN-level setting): toggling
 		-- it emits stamgr.<n>.radio (band, "ng"/"na"), stamgr.<n>.minrssi.status
-		-- and stamgr.<n>.minrssi.rssi, alongside an unrelated
-		-- stamgr.<n>.loadbalance.status sub-feature sharing the same block.
+		-- and stamgr.<n>.minrssi.rssi, alongside Load balance's
+		-- stamgr.<n>.loadbalance.status/maxsta sharing the same block.
 		-- The whole block is simply absent when disabled (no explicit
 		-- status=false), same convention as every other optional section here.
 		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.(.+)=(.*)$") end
@@ -2195,6 +2218,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 			if entry.min_rssi_enabled then
 				entry.min_rssi = tonumber(sm["minrssi.rssi"])
 			end
+			-- Load balance (openuf/loadbalance.lua): the cap, or an explicit
+			-- false when off, for the same reason as min_rssi_enabled. Like
+			-- the firmware (stamgr -n 0 unless loadbalance.status is true),
+			-- a missing or non-positive maxsta is off.
+			local maxsta = sm ~= nil and sm["loadbalance.status"] == "true"
+				and tonumber(sm["loadbalance.maxsta"])
+			entry.loadbalance_maxsta = (maxsta and maxsta > 0) and math.floor(maxsta) or false
 			radio_table[#radio_table + 1] = entry
 		end
 	end

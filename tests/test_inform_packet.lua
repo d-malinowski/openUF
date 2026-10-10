@@ -1458,6 +1458,51 @@ return {
 		end
 	},
 	{
+		name = "inform packet: Load balance's cap is parsed from stamgr.<n> and stored, and removed when off",
+		fn = function()
+			-- Captured from the lab (10.4.57, 2026-10-10): Load balance on for
+			-- radio0 with maxsta 3 and Minimum RSSI off. Turning it off made the
+			-- whole stamgr.<n> block disappear.
+			local ucihelper, db = new_apply_env()
+			local on_blob = "radio.1.phyname=radio0\nradio.1.channel=6\n"
+				.. "stamgr.1.status=true\nstamgr.1.radio=ng\n"
+				.. "stamgr.1.minrssi.status=false\nstamgr.1.minrssi.rssi=15\n"
+				.. "stamgr.1.loadbalance.status=true\nstamgr.1.loadbalance.maxsta=3\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=36\n"
+			local off_blob = "radio.1.phyname=radio0\nradio.1.channel=6\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=36\n"
+
+			local rt, vt = inform._parse_wifi_system_cfg(on_blob)
+			assert_eq(rt[1].loadbalance_maxsta, 3, "radio0's cap")
+			assert_eq(rt[1].min_rssi_enabled, false, "Minimum RSSI stays off beside it")
+			assert_eq(rt[2].loadbalance_maxsta, false, "radio1 has no stamgr block: explicitly off")
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_eq(db.wireless.radio0.loadbalance_maxsta, "3", "push 1: cap stored")
+			assert_nil(db.wireless.radio1.loadbalance_maxsta, "push 1: radio1 has none")
+
+			rt, vt = inform._parse_wifi_system_cfg(off_blob)
+			assert_eq(rt[1].loadbalance_maxsta, false, "push 2: off")
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_nil(db.wireless.radio0.loadbalance_maxsta, "push 2: cap removed")
+		end
+	},
+	{
+		name = "inform packet: Load balance is off unless status is true and maxsta is positive",
+		fn = function()
+			local function cap(lines)
+				return inform._parse_wifi_system_cfg("radio.1.phyname=radio0\n"
+					.. "stamgr.1.status=true\nstamgr.1.radio=ng\n" .. lines)[1].loadbalance_maxsta
+			end
+			assert_eq(cap("stamgr.1.loadbalance.status=false\nstamgr.1.loadbalance.maxsta=3\n"), false,
+				"status false: off, whatever maxsta says")
+			assert_eq(cap("stamgr.1.loadbalance.status=true\n"), false, "no maxsta: off")
+			assert_eq(cap("stamgr.1.loadbalance.status=true\nstamgr.1.loadbalance.maxsta=0\n"), false, "0: off")
+			assert_eq(cap("stamgr.1.loadbalance.status=true\nstamgr.1.loadbalance.maxsta=null\n"), false,
+				"not a number: off")
+			assert_eq(cap("stamgr.1.loadbalance.status=true\nstamgr.1.loadbalance.maxsta=1\n"), 1, "1: on")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg maps radio.<n>.ieee_mode onto htmode",
 		fn = function()
 			-- CONFIRMED live 2026-07-18: a stock dual-band AP sends
