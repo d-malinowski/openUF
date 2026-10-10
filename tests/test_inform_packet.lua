@@ -4688,8 +4688,9 @@ return {
 			inform._guestportal = {
 				parse = real.parse, is_guest_rule = real.is_guest_rule, PORT = real.PORT,
 				bridge_mac = function(ifname) return ifname == "phy0-ap1" and "02:00:00:00:00:aa" or nil end,
-				reconcile = function(spec, vaps, macs, rates)
-					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs, rates = rates}
+				reconcile = function(spec, vaps, macs, rates, selfrun)
+					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs, rates = rates,
+						selfrun = selfrun}
 					return 1
 				end,
 				listen = function()
@@ -4727,6 +4728,12 @@ return {
 				assert_eq(table.concat(r.macs, ","), "de:ad:be:ef:00:02", "and the ledger")
 				assert_eq(#r.rates, 1, "and the rate limits of authorized guests only")
 				assert_eq(r.rates[1].up, 2048, "kbps as received")
+				assert_false(r.selfrun, "the controller is there: no selfrun")
+				inform._guest_selfrun_on = true
+				inform._guest_enforce(st)
+				inform._guest_selfrun_on = false
+				assert_true(calls.reconcile[2].selfrun, "a rebuild while in selfrun keeps guests let through")
+				table.remove(calls.reconcile, 2)
 				assert_eq(calls.listen, 1, "listening")
 				assert_eq(inform._guest_ctx.url, "http://192.0.2.2:8880/guest/s/default/", "the answer's target")
 				local token = st.guest_token
@@ -4811,6 +4818,128 @@ return {
 				assert_eq(rates, nil, "nothing to apply it to")
 			end)
 			inform._guestportal, inform._state.save, inform._guest_built = real, save, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: selfrun_guest_mode is kept from mgmt_cfg",
+		fn = function()
+			local save = inform._state.save
+			inform._state.save = function() end
+			local ok, err = pcall(function()
+				local st = sample_state()
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "capability=notif\nselfrun_guest_mode=pass\ncfgversion=abc\n"}), st)
+				assert_eq(st.guest_selfrun, "pass", "pass")
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "selfrun_guest_mode=off\n"}), st)
+				assert_eq(st.guest_selfrun, "off", "off")
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "selfrun_guest_mode=weird\n"}), st)
+				assert_eq(st.guest_selfrun, "pass", "like the firmware, only off is off")
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "selfrun_guest_mode=off\n"}), st)
+				inform.handle_response(cjson.encode({_type = "setparam", mgmt_cfg = "cfgversion=x\n"}), st)
+				assert_eq(st.guest_selfrun, "off", "absent: unchanged")
+			end)
+			inform._state.save = save
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: selfrun starts after 3 unanswered informs; pass opens the portal, off takes the guest WLANs down",
+		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr, gp = inform._guestportal, vaps = inform._guest_vaps,
+				save = inform._state.save,
+			}
+			local logged = {}
+			io.stderr = {write = function(_, s) logged[#logged + 1] = s end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.handle_response = function() return false end
+			local saves = 0
+			inform._state.save = function() saves = saves + 1 end
+			local calls, links = {}, {}
+			inform._guestportal = {
+				set_selfrun = function(pass) calls[#calls + 1] = pass end,
+				set_vaps_up = function(names, up)
+					links[#links + 1] = (up and "up " or "down ") .. table.concat(names, " ")
+				end,
+			}
+			inform._guest_vaps = function() return {{ifname = "phy0-ap1"}, {ifname = "phy1-ap1"}} end
+			inform._inform_fails, inform._guest_selfrun_on, inform._guest_built = 0, false, "phy0-ap1=x"
+			local ok, err = pcall(function()
+				local ctx = {interval = 10, backoff = 10}
+				local st = {inform_url = "http://unifi:8080/inform", guest_portal = {enabled = true}}
+				local function tick(up)
+					inform.http_post = up and function() return "body" end
+						or function() return nil, "connection refused" end
+					inform._tick(st, nil, nil, ctx)
+				end
+				-- never told: pass
+				tick(true); tick(false); tick(false)
+				assert_eq(#calls, 0, "two failures: the portal holds")
+				tick(false)
+				assert_eq(calls[1], true, "the third: guests let through")
+				tick(false)
+				assert_eq(#calls, 1, "once")
+				assert_eq(#links, 0, "pass leaves the WLANs up")
+				tick(true)
+				assert_eq(calls[2], false, "the first answer closes it again")
+				tick(false); tick(false); tick(true); tick(false); tick(false)
+				assert_eq(#calls, 2, "the count restarts at each answer")
+				tick(true)
+
+				st.guest_selfrun = "off"
+				tick(false); tick(false)
+				assert_eq(#links, 0, "off: nothing before the third failure")
+				tick(false)
+				assert_eq(links[1], "down phy0-ap1 phy1-ap1", "off: the guest WLANs go down")
+				assert_eq(#calls, 2, "off never opens the portal")
+				assert_eq(table.concat(st.guest_vaps_down, " "), "phy0-ap1 phy1-ap1", "kept for a restart")
+				local saved = saves
+				assert_true(saved > 0, "the ledger is saved")
+				tick(false); tick(false)
+				assert_eq(#links, 1, "once")
+				-- a daemon restart while down: module state is fresh, the ledger is not
+				inform._inform_fails, inform._guest_selfrun_on = 0, false
+				tick(false)
+				assert_eq(#links, 1, "still no controller after the restart: they stay down")
+				tick(true)
+				assert_eq(links[2], "up phy0-ap1 phy1-ap1", "the answer brings them back up")
+				assert_nil(st.guest_vaps_down, "ledger cleared")
+				assert_eq(#calls, 2, "and the portal was never opened")
+
+				st.guest_selfrun = "pass"
+				st.guest_portal = nil
+				tick(false); tick(false); tick(false)
+				assert_eq(#calls, 2, "no portal: nothing to open")
+				st.guest_portal = {enabled = true}
+				inform._guest_built = nil
+				tick(false)
+				assert_eq(#calls, 2, "no tables yet: remembered, not applied")
+				assert_true(inform._guest_selfrun_on, "for the next reconcile")
+				local all = table.concat(logged)
+				assert_true(all:find("letting guests through", 1, true) ~= nil, "said: pass")
+				assert_true(all:find("guest WLANs down (phy0-ap1 phy1-ap1)", 1, true) ~= nil, "said: off")
+				assert_true(all:find("guest WLANs back up", 1, true) ~= nil, "said: back up")
+			end)
+			io.stderr = orig.stderr
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick, inform._guestportal =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm, orig.gp
+			inform._guest_vaps, inform._state.save = orig.vaps, orig.save
+			inform._inform_fails, inform._guest_selfrun_on, inform._guest_built = 0, false, nil
 			if not ok then error(err, 0) end
 		end
 	},

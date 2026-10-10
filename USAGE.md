@@ -287,7 +287,7 @@ config blob listing the keys no parser consumed, collapsed to key shapes with
 counts, e.g.
 
 ```
-inform: mgmt_cfg: 5 dropped key(s): capability x1, mgmt_url x1, report_crash x1, selfrun_guest_mode x1, stun_url x1
+inform: mgmt_cfg: 3 dropped key(s): mgmt_url x1, report_crash x1, stun_url x1
 inform: system_cfg: 12 dropped key(s): switch.port.<n>.name x5, switch.vlan.<n>.id x4, ...
 ```
 
@@ -443,7 +443,7 @@ announced on stderr rather than passed off as a fresh install.
 | `inform_url` | URL for the inform heartbeat (every 10 s, or the interval the controller's `noop` names). Seeded from `conf.lua` on a first boot (or after a factory reset) and overwritten by the controller or by `syswrapper.sh set-inform`; once present here it always wins over `conf.lua` |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts. Replaced by the controller's `blocked_sta` list on every config push, so it can't drift from the controller's list |
-| `guest_wlans`, `guest_authorized`, `guest_rates`, `guest_portal`, `guest_token` | Guest portal state (⚠️ lab-validated only). `guest_wlans`: the wlanconf ids of the guest WLANs while the controller has the portal on, replaced on every config push. `guest_authorized`: each MAC the controller sent `authorize-guest` for, with the time it arrived; `unauthorize-guest` removes it. This map is where each station's `authorized` on a portal WLAN comes from (`true` everywhere else), and it fills the `authorized` nft set. It holds at most 512 entries; past that the oldest goes, and the controller re-authorizes it on the next heartbeat if its guest record is still active. `guest_rates`: the per-guest speed limit from `rate-update` (`up`/`down` in kbps), kept only for an authorized MAC and removed with it. `guest_portal`: what the enforcement is built from (portal URL, the portal's address and ports, restricted subnets), present only while the portal is on. `guest_token`: generated once, then reported while the portal is on. See § Guest portal |
+| `guest_wlans`, `guest_authorized`, `guest_rates`, `guest_portal`, `guest_token`, `guest_selfrun`, `guest_vaps_down` | Guest portal state (⚠️ lab-validated only). `guest_wlans`: the wlanconf ids of the guest WLANs while the controller has the portal on, replaced on every config push. `guest_authorized`: each MAC the controller sent `authorize-guest` for, with the time it arrived; `unauthorize-guest` removes it. This map is where each station's `authorized` on a portal WLAN comes from (`true` everywhere else), and it fills the `authorized` nft set. It holds at most 512 entries; past that the oldest goes, and the controller re-authorizes it on the next heartbeat if its guest record is still active. `guest_rates`: the per-guest speed limit from `rate-update` (`up`/`down` in kbps), kept only for an authorized MAC and removed with it. `guest_portal`: what the enforcement is built from (portal URL, the portal's address and ports, restricted subnets), present only while the portal is on. `guest_token`: generated once, then reported while the portal is on. `guest_selfrun`: `pass` or `off`, from `mgmt_cfg`'s `selfrun_guest_mode`. `guest_vaps_down`: the guest WLANs `off` took down, until the controller answers again. See § Guest portal |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
 | `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf`. In static mode these are **re-applied on every start**, because the address is `ip addr` state that a reboot discards and the controller does not re-push it (a matching `cfgversion` gets a `noop` back, carrying no `system_cfg` at all) — the same reason `blocked_stas` and `led_enabled` are reconciled at startup |
 
@@ -1117,6 +1117,26 @@ of `-1` means unlimited in that direction. The limit is lifted with the authoriz
   they are not applied.
 - **Needs** `nft_limit`, which is part of `kmod-nft-core`.
 
+**Without the controller (`selfrun_guest_mode`).** Every `mgmt_cfg` carries
+`selfrun_guest_mode`. It is `pass` unless the site's `config.properties` sets
+`config.selfrun_guest_mode` to something else, and then it is `off`. openUF does what
+UniFi firmware does (read from its `mcad` and `syswrapper.sh`, builds 3.9.27–4.0.15):
+selfrun starts after **3 informs in a row** go unanswered (`GUEST_SELFRUN_FAILS`). With the
+backoff (10, 20, 40 s) that is about 70 s after the last answer. Selfrun ends with the first
+answer, and it only does anything while the portal is on.
+- **`pass`, or never received:** openUF adds `meta pkttype other accept` to the `selfrun`
+  chain. Every guest then gets through, as an authorized one would: the restricted subnets
+  and the AP itself stay behind the portal's rules. Nobody could log in meanwhile, because
+  the portal is the controller's. The first answer empties the chain again.
+- **`off`:** the guest WLANs are taken down (`ip link set <vap> down`) and brought back up
+  with the first answer. Their names are kept in `st.guest_vaps_down`, so a daemon restart
+  in between leaves them down until the controller answers, and then brings them up.
+- One deliberate difference: when the controller comes back, UniFi firmware forgets every
+  authorized guest and waits for the controller to re-authorize them. openUF keeps its
+  list, and the controller re-sends `authorize-guest` for the same guests anyway.
+- ⚠️ `off` is lab-tested on dummy interfaces only. That hostapd brings a BSS back when its
+  netdev comes back up is hostapd's documented behaviour, but no radio has shown it here.
+
 The daemon also reports a random `guest_token`. Without one, the controller refuses
 every portal login on the AP and logs "Missing Guest Token in AP[…] during guest
 authorization".
@@ -1135,7 +1155,8 @@ redirect. firewall4 already pulls in `kmod-nft-nat`.
 
 **Check it:**
 
-    nft list table bridge openuf_guest      # rate_up / rate_down hold the speed limits
+    nft list table bridge openuf_guest      # rate_up / rate_down hold the speed limits;
+                                            # selfrun is empty unless guests are let through
     nft list table ip openuf_guest
     netstat -lnt | grep 8820
 
@@ -1143,6 +1164,12 @@ redirect. firewall4 already pulls in `kmod-nft-nat`.
 - `guestportal: … not bridged`: those guests are blocked but not redirected.
 - `nft rejected …`: a rule failed. The log says which one and why.
 - `nft rejected a guest rate limit`: some guests' speed limits are not applied.
+- `guestportal: 3 informs unanswered, selfrun_guest_mode=pass -- letting guests through`:
+  the portal is open until the controller answers again
+  (`… guest portal enforced again`).
+- `guestportal: 3 informs unanswered, selfrun_guest_mode=off -- guest WLANs down (…)`:
+  the guest WLANs are down until the controller answers again
+  (`guestportal: guest WLANs back up (…)`).
 - `guestportal: unrecognised guest rule shape`: the controller pushed a rule openUF
   doesn't know. It was not applied.
 

@@ -124,6 +124,12 @@ M.FIELDS = {
 	-- The portal's enforcement facts (guestportal.parse) while it is on;
 	-- the nft tables are rebuilt from it at startup.
 	guest_portal              = "table",
+	-- mgmt_cfg selfrun_guest_mode: "pass" lets guests through while the
+	-- controller is unreachable, "off" takes the guest WLANs down.
+	guest_selfrun             = "string",
+	-- The guest VAP ifnames selfrun_guest_mode=off took down, until they
+	-- are brought back up (also after a restart in between).
+	guest_vaps_down           = "table",
 	-- Reported as guest_token while the portal is on (32 hex).
 	guest_token               = "string",
 }

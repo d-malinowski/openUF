@@ -179,8 +179,8 @@ return {
 			local spec = gp.parse(CAPTURE)
 			local cmds = with_capture(function()
 				assert_eq(gp.reconcile(spec, VAPS, {"de:ad:be:ef:00:02"},
-					{{mac = "de:ad:be:ef:00:02", up = 2048, down = 4096}}), 32,
-					"every rule counted (31 in the lab with one bridged VAP)")
+					{{mac = "de:ad:be:ef:00:02", up = 2048, down = 4096}}, true), 33,
+					"every rule counted (32 in the lab with one bridged VAP)")
 			end)
 			local rate_hook = find(cmds, [[pre 'iifname { "phy0-ap1", "phy1-ap1" } jump rate_up']])
 			local in_hook = find(cmds, [[pre 'iifname { "phy0-ap1", "phy1-ap1" } jump guestin']])
@@ -206,6 +206,9 @@ return {
 			assert_true(v6 < authorized, "IPv6 is dropped even for an authorized guest")
 			assert_true(rfc1918 < authorized, "restricted subnets hold for an authorized guest")
 			assert_true(authorized < http and http < last, "authorized passes; the rest of :80 is answered locally")
+			local selfrun = find(cmds, "guestin 'jump selfrun'")
+			assert_true(authorized < selfrun and selfrun < http, "selfrun after the authorized accept, before :80")
+			assert_not_nil(find(cmds, "selfrun 'meta pkttype other accept'"), "selfrun applied")
 			assert_not_nil(find(cmds, [[iifname "phy0-ap1" ether daddr set 02:00:00:00:00:aa meta pkttype set host accept]]),
 				"marked frames go up to the bridge")
 			assert_not_nil(find(cmds, "guestout 'ip daddr 224.0.0.0/4 drop'"), "outbound multicast")
@@ -261,6 +264,42 @@ return {
 				assert_false(gp.set_authorized({"02:00:00:00:00:01"}), "no table: nothing to fill")
 			end, "flush set")
 			assert_eq(#none, 1, "stops after the failed flush")
+		end
+	},
+	{
+		name = "guestportal: set_selfrun opens the portal to other hosts, and closes it",
+		fn = function()
+			local open = with_capture(function() assert_true(gp.set_selfrun(true), "applied") end)
+			assert_true(open[1]:find("flush chain bridge openuf_guest selfrun", 1, true) ~= nil, "flush first")
+			assert_eq(#open, 2, "one rule")
+			assert_true(open[2]:find("selfrun 'meta pkttype other accept'", 1, true) ~= nil,
+				"other hosts only: the AP itself stays behind the portal's rules")
+			local closed = with_capture(function() assert_true(gp.set_selfrun(false), "closed") end)
+			assert_eq(#closed, 1, "closed: the flush only")
+			local none = with_capture(function()
+				assert_false(gp.set_selfrun(true), "no table")
+			end, "flush chain")
+			assert_eq(#none, 1, "stops after the failed flush")
+		end
+	},
+	{
+		name = "guestportal: set_vaps_up takes the guest WLANs down and back up",
+		fn = function()
+			local down = with_capture(function()
+				assert_true(gp.set_vaps_up({"phy0-ap1", "phy1-ap1"}, false), "down")
+			end)
+			assert_eq(#down, 2, "one per VAP")
+			assert_true(down[1]:find("ip link set dev phy0-ap1 down", 1, true) ~= nil, "down")
+			local up = with_capture(function() assert_true(gp.set_vaps_up({"phy0-ap1"}, true), "up") end)
+			assert_true(up[1]:find("ip link set dev phy0-ap1 up", 1, true) ~= nil, "up")
+			local bad = with_capture(function()
+				assert_false(gp.set_vaps_up({"x; reboot", "phy1-ap1"}, true), "reported")
+			end)
+			assert_eq(#bad, 1, "malformed never spliced, the rest still done")
+			local refused = with_capture(function()
+				assert_false(gp.set_vaps_up({"phy0-ap1", "phy1-ap1"}, true), "refused")
+			end, "phy0-ap1")
+			assert_eq(#refused, 2, "one refusal does not stop the others")
 		end
 	},
 	{

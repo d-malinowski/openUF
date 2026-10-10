@@ -3077,7 +3077,7 @@ local RECOGNIZED_SYSTEM_CFG = {
 
 local RECOGNIZED_MGMT_CFG = {
 	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
-	"^capability$",
+	"^capability$", "^selfrun_guest_mode$",
 }
 
 -- Set from handle_response when cfg.config.debug_dump_file is on -- the
@@ -3216,6 +3216,10 @@ function M.handle_response(json_str, st, cfg)
 						st.notif_assoc_stat = asked
 					elseif k == "use_aes_gcm" then
 						st.use_gcm = (v == "true")
+					elseif k == "selfrun_guest_mode" then
+						-- The controller sends "pass" or "off"; like the
+						-- firmware, only "off" is off.
+						st.guest_selfrun = (v == "off") and "off" or "pass"
 					elseif k == "cfgversion" then
 						if v ~= "" then st.cfgversion = v end
 					elseif k == "led_enabled" then
@@ -3965,7 +3969,8 @@ function M._guest_enforce(st, vaps)
 		M._state.save(st)
 	end
 	vaps = vaps or M._guest_vaps(st)
-	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_rate_list(st))
+	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_rate_list(st),
+		M._guest_selfrun_on)
 	M._guest_built = guest_vaps_key(vaps)
 	M._guest_ctx = {url = spec.url, ap = st.mac, vaps = vaps}
 	if not M._guest_server then
@@ -4014,6 +4019,62 @@ function M._guest_resync(st)
 		.. ") -- rebuilding\n")
 	M._guest_enforce(st, vaps)
 	return true
+end
+
+-- selfrun_guest_mode (mgmt_cfg, every push): what guests get while the AP
+-- runs without its controller, as the UniFi firmware does it (mcad +
+-- syswrapper.sh, BZ2 3.9.27-4.0.15). Selfrun starts after
+-- GUEST_SELFRUN_FAILS informs in a row went unanswered and ends with the
+-- first answer; it only matters while the portal is on. "pass" (or never
+-- told -- only "off" is off) lets every guest through
+-- (guestportal.set_selfrun), since nobody could log in meanwhile. "off"
+-- takes the guest WLANs down until the controller is back; the ifnames are
+-- kept in st.guest_vaps_down, so a restart in between still brings them up.
+-- Unlike the firmware, the authorized ledger is kept on return: the
+-- controller re-authorizes the same guests anyway.
+M.GUEST_SELFRUN_FAILS = 3
+M._inform_fails = 0
+M._guest_selfrun_on = false
+function M._guest_selfrun(st, contacted)
+	M._inform_fails = contacted and 0 or M._inform_fails + 1
+	local spec = st and st.guest_portal
+	-- WLANs left down before a restart stay down until an answer, rather
+	-- than flapping up for the first failures of the new count.
+	local selfrun = M._inform_fails >= M.GUEST_SELFRUN_FAILS
+		or (st.guest_vaps_down ~= nil and not contacted)
+	local mode
+	if type(spec) == "table" and spec.enabled == true and selfrun then
+		mode = (st.guest_selfrun == "off") and "off" or "pass"
+	end
+	local changed = false
+	if mode == "off" and not st.guest_vaps_down then
+		local names = {}
+		for _, v in ipairs(M._guest_vaps(st)) do names[#names + 1] = v.ifname end
+		pcall(M._guestportal.set_vaps_up, names, false)
+		st.guest_vaps_down = names
+		M._state.save(st)
+		io.stderr:write("guestportal: " .. M._inform_fails .. " informs unanswered, "
+			.. "selfrun_guest_mode=off -- guest WLANs down (" .. table.concat(names, " ") .. ")\n")
+		changed = true
+	elseif mode ~= "off" and st.guest_vaps_down then
+		pcall(M._guestportal.set_vaps_up, st.guest_vaps_down, true)
+		io.stderr:write("guestportal: guest WLANs back up ("
+			.. table.concat(st.guest_vaps_down, " ") .. ")\n")
+		st.guest_vaps_down = nil
+		M._state.save(st)
+		changed = true
+	end
+	local pass = mode == "pass"
+	if pass ~= M._guest_selfrun_on then
+		M._guest_selfrun_on = pass
+		io.stderr:write(pass
+			and ("guestportal: " .. M._inform_fails .. " informs unanswered, "
+				.. "selfrun_guest_mode=pass -- letting guests through\n")
+			or "guestportal: controller answered -- guest portal enforced again\n")
+		if M._guest_built then pcall(M._guestportal.set_selfrun, pass) end
+		changed = true
+	end
+	return changed
 end
 
 -- The guest's SSID for the portal's ssid=: the only one, or the VAP that
@@ -4915,6 +4976,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	if not body then
 		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
 		M._warn_http_400(err, st, cfg)
+		if M._guestportal then pcall(M._guest_selfrun, st, false) end
 		-- Doubles from the CURRENT cadence, capped at 60 s -- or at the
 		-- controller's own interval when that is longer, since a failure
 		-- must never make the device poll faster than it was asked to.
@@ -4924,6 +4986,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	end
 	ctx.backoff = ctx.interval
 	M._warned_400 = false
+	if M._guestportal then pcall(M._guest_selfrun, st, true) end
 
 	local parse_ok, json_body = pcall(M.parse_packet, body, st)
 	if not parse_ok then

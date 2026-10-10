@@ -24,7 +24,10 @@
 	       tcp 80 -> local answer; everything else -> drop
 	  out: DHCP reply, ARP -> accept; IPv6, other broadcast, multicast -> drop
 
-	ahead of both, a per-guest rate limit from rate-update (set_rates).
+	ahead of both, a per-guest rate limit from rate-update (set_rates), and
+	after the authorized accept a `selfrun` chain that lets every guest
+	through while the controller is unreachable (set_selfrun); with
+	selfrun_guest_mode=off the guest VAPs go down instead (set_vaps_up).
 
 	Deliberate narrowings, all of them stated in README/USAGE:
 	- DNS passes for every guest. The stock firmware answers an unauthorized
@@ -291,11 +294,39 @@ function M.set_rates(rates)
 	return ok
 end
 
+-- selfrun_guest_mode=pass while the controller is unreachable (the firmware's
+-- AUTHORIZED_GUESTS ACCEPT-all): every guest
+-- is let through as an authorized one would be (to other hosts only, and
+-- still not into the restricted subnets), since nobody can log in to the
+-- portal meanwhile. An empty chain otherwise. Refreshed in place.
+function M.set_selfrun(pass)
+	if not nft("flush chain " .. M.BRIDGE_TABLE .. " selfrun 2>/dev/null") then return false end
+	if pass then
+		return nft("add rule " .. M.BRIDGE_TABLE .. " selfrun 'meta pkttype other accept'")
+	end
+	return true
+end
+
+-- selfrun_guest_mode=off while the controller is unreachable: the guest
+-- WLANs are taken down (ifnames, a list) and brought back up after, as the
+-- UniFi firmware does with ifconfig. hostapd re-enables a BSS whose netdev
+-- comes back up. Returns false if any interface refused.
+function M.set_vaps_up(ifnames, up)
+	local ok = true
+	for _, n in ipairs(ifnames or {}) do
+		if not (valid_ifname(n) and exec_ok(M._exec("ip link set dev " .. n
+				.. (up and " up" or " down") .. " 2>/dev/null"))) then
+			ok = false
+		end
+	end
+	return ok
+end
+
 -- Rebuild both tables for spec on these VAPs ({ifname=, bridge_mac=}), with
--- macs authorized and rates (see set_rates) applied. Returns the number of
+-- macs authorized, rates (see set_rates) and selfrun (see set_selfrun) applied. Returns the number of
 -- rules installed (0, tables gone, when there is nothing to enforce or
 -- nothing to enforce it on).
-function M.reconcile(spec, vaps, macs, rates)
+function M.reconcile(spec, vaps, macs, rates, selfrun)
 	M._exec("nft delete table " .. M.BRIDGE_TABLE .. " 2>/dev/null")
 	M._exec("nft delete table " .. M.NAT_TABLE .. " 2>/dev/null")
 	if type(spec) ~= "table" or not spec.enabled then return 0 end
@@ -324,6 +355,7 @@ function M.reconcile(spec, vaps, macs, rates)
 	nft("add chain " .. T .. " redirect_http")
 	nft("add chain " .. T .. " rate_up")
 	nft("add chain " .. T .. " rate_down")
+	nft("add chain " .. T .. " selfrun")
 
 	local rules = {
 		-- Rate limits first: guestin/guestout end in accept.
@@ -352,6 +384,7 @@ function M.reconcile(spec, vaps, macs, rates)
 	end
 	-- AUTHORIZED_GUESTS: --pkttype-type otherhost, i.e. not to the AP itself.
 	add("guestin", "ether saddr @authorized meta pkttype other accept")
+	add("guestin", "jump selfrun")
 	add("guestin", "tcp dport 80 jump redirect_http")
 	add("guestin", "drop")
 	add("redirect_http", "meta mark set meta mark or " .. M.MARK_HTTP)
@@ -383,6 +416,7 @@ function M.reconcile(spec, vaps, macs, rates)
 	end
 	M.set_authorized(macs)
 	M.set_rates(rates)
+	M.set_selfrun(selfrun)
 
 	-- The marked frames reach the bridge's own stack; send them to M.PORT.
 	nft("add table " .. M.NAT_TABLE)

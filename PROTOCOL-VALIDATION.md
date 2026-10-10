@@ -881,9 +881,51 @@ Lab:
 
 `mgmt_cfg` carries `selfrun_guest_mode=pass` in **every** push, guest WLAN or not. Its
 source is the site property `config.selfrun_guest_mode`, and any value other than `pass`
-goes out as `off` (`config/GWoWvNEX`). It is not in the 10.4.57 UI. The name suggests how
-guests are treated while the AP runs without its controller, with `pass` letting them
-through. That is unverified: the device side is UniFi firmware, which this project doesn't read.
+goes out as `off` (`config/GWoWvNEX`). It is not in the 10.4.57 UI. The site properties
+are the per-site file `data/sites/<site name>/config.properties` (`config/bLwwMKkr` →
+the file service by site name), **not** `system.properties`. Lab, 10.4.57: a line in
+`system.properties` (restart included) left the wire at `pass`. Writing
+`config.selfrun_guest_mode=off` to `data/sites/default/config.properties` made the next
+push carry `selfrun_guest_mode=off`, with no restart needed.
+
+**What the AP does with it (UniFi firmware, BZ2 3.9.27 and 4.0.15).** Current firmware is
+encrypted. These builds are not, and their selfrun code is identical:
+- `/bin/mcad` enters SELFRUN (state 3, writes `/var/run/system.selfrun`, calls
+  `syswrapper.sh set_selfrun`) once its consecutive-failure count reaches 3 (`fail_count`
+  at object offset 0x264, `sltiu …, 3`). The first successful inform calls `unset_selfrun`.
+- `/usr/etc/syswrapper.sh` only acts while the portal is on (`redirector.status=enabled`).
+  `selfrun_guest()` reads the key from `/etc/persistent/cfg/mgmt`: only `off` is off, so any
+  other value, or none, means `pass`.
+- `pass`: `ebtables -t nat -F AUTHORIZED_GUESTS; ebtables -t nat -A AUTHORIZED_GUESTS -j
+  ACCEPT` ("bypass the guest authorization"). On return, `rm -f /var/run/guest.authorized`
+  plus `authorized_guests_updated`: every authorization is forgotten, and the controller
+  re-authorizes.
+- `off`: `ifconfig $ath down` for every guest VAP (`/var/run/guest_devnames`). The VAP
+  scheduler keeps them down while selfrun lasts. On return, `ifconfig $ath up`.
+
+**openUF's answer (C4, lab-validated only).** It keeps the value as `st.guest_selfrun`,
+where only `off` is off. Selfrun starts after 3 failed informs in a row
+(`GUEST_SELFRUN_FAILS`) and ends with the first answer. With `pass`, the `selfrun` chain
+(jumped from `guestin` right after the authorized accept) gets `meta pkttype other accept`,
+the same position as the firmware's AUTHORIZED_GUESTS accept. With `off`, the guest VAPs
+are taken down with `ip link set` and their names are kept in `st.guest_vaps_down`, so they
+come back up even across a daemon restart. On return openUF keeps its authorized list
+instead of clearing it, because the controller re-authorizes the same guests either way.
+Lab, with the controller cut off from the AP by an nft `reject` on :8080:
+- `pass`: three `POST failed`, then "3 informs unanswered, selfrun_guest_mode=pass …
+  letting guests through", and the chain held the accept. Once the cut was lifted: "guest
+  portal enforced again", and the chain was empty. The guest VAPs stayed up.
+- `off` (the guest VAPs `wlan0`/`wlan1` as dummy interfaces, since the lab has no radios):
+  after the third failure, "guest WLANs down (wlan0 wlan1)". Both went DOWN, the chain stayed
+  empty, and `guest_vaps_down` was saved. The daemon was then restarted mid-outage: two more
+  failures, and both stayed DOWN. With the cut lifted, "guest WLANs back up" appeared, both
+  were UP again, and the ledger was gone.
+- Data path, from the earlier 120 s run of this feature (the fake guest from C2, not
+  authorized): closed → HTTP redirected to the portal and :5201 blocked. Open →
+  `INTERNET-OK` and :5201 open, while a restricted subnet (10.9.9.9) still timed out.
+- `handle_response failed` = 0.
+- Unverified: that hostapd beacons again on a real radio after its BSS netdev comes back
+  up. hostapd handles that as `INTERFACE_ENABLED`, but the lab has no radio.
 
 ### Connection tracking notifs (`STA_ASSOC_TRACKER`)
 

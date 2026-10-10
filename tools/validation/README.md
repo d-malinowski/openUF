@@ -106,6 +106,12 @@ docker exec openuf-validation-ap sh -c \
 docker exec -d openuf-validation-ap sh -c 'cd /opt/openuf && exec lua announce.lua > /tmp/announce.log 2>&1'
 docker exec -d openuf-validation-ap sh -c 'cd /opt/openuf && exec lua inform.lua   > /tmp/inform.log   2>&1'
 
+# 5b. Mark the controller as set up. This REST path never writes is_default=false,
+#     so without this line the controller treats its next restart as a factory
+#     default and drops its database (seen 2026-10-10: devices, WLANs, admins gone).
+docker exec openuf-validation-controller sh -c \
+  'echo is_default=false >> /config/data/system.properties'
+
 # 6. Wait for it to appear (state=2, adopted=false), then adopt
 sleep 25
 curl -sk -b $J $B/api/s/default/stat/device | python3 -m json.tool | grep -E '"mac"|"state"|"adopted"'
