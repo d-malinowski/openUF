@@ -3629,6 +3629,7 @@ function M.handle_response(json_str, st, cfg)
 				pcall(M._guestportal.set_authorized, M._guest_macs(st))
 				pcall(M._guestportal.set_rates, M._guest_rate_list(st))
 			end
+			if cmd == "unauthorize-guest" then M._guest_kick(resp.mac) end
 		elseif cmd == "rate-update" then
 			-- Guest portal: {"cmd":"rate-update","mac":...,"ul_max":kbps,
 			-- "dl_max":kbps,...}, right after authorize-guest when the
@@ -3754,6 +3755,34 @@ function M._guest_authorize(st, mac, authorized)
 		st.guest_authorized[oldest] = nil
 		if st.guest_rates then st.guest_rates[oldest] = nil end
 	end
+end
+
+-- Disconnect a guest whose authorization ended, as UniFi firmware does
+-- (syswrapper.sh unauthorize-guest: drop the MAC, then kick_sta on every
+-- user and guest VAP; firmware-confirmed for 3.9.27 to 4.0.15). Associated
+-- and unauthorized, the guest's OS never re-runs its captive-portal check,
+-- so it sits behind the portal with no page to log in on. On reconnecting
+-- it reports authorized false, which the controller leaves alone.
+--
+-- The firmware reports `authorized` from the very list it just changed, so
+-- one unauthorize-guest is all it ever gets. openUF reports it only on the
+-- WLANs st.guest_wlans names, and true elsewhere; if that ever disagreed with
+-- the controller, unauthorize-guest would come on every inform. One kick per
+-- MAC per GUEST_KICK_HOLD seconds keeps that from becoming a deauth storm.
+M.GUEST_KICK_HOLD = 60
+M._guest_kicked = {}
+
+function M._guest_kick(mac)
+	mac = type(mac) == "string" and mac:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+	if not mac then return false end
+	local now = M._time()
+	for m, t in pairs(M._guest_kicked) do
+		if now - t >= M.GUEST_KICK_HOLD or now < t then M._guest_kicked[m] = nil end
+	end
+	if M._guest_kicked[mac] then return false end
+	M._guest_kicked[mac] = now
+	M._firewall.deauth(mac, M._bss_ifnames())
+	return true
 end
 
 -- A rate-update into st.guest_rates ({mac = {up=kbps, down=kbps}}). Only for

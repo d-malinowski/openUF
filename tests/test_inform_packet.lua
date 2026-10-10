@@ -2966,6 +2966,63 @@ return {
 		end
 	},
 	{
+		name = "inform packet: unauthorize-guest disconnects the guest after closing the portal on it",
+		fn = function()
+			local real_fw, real_gp, real_time = inform._firewall, inform._guestportal, inform._time
+			local save = inform._state.save
+			local order, kicks = {}, {}
+			local now = 1000
+			inform._time = function() return now end
+			inform._state.save = function() end
+			inform._firewall = {reconcile = function() end, deny_sync = function() return false end,
+				deauth = function(mac, ifnames)
+					kicks[#kicks + 1] = {mac = mac, ifnames = ifnames}; order[#order + 1] = "deauth"
+				end}
+			inform._guestportal = {set_rates = function() end,
+				set_authorized = function() order[#order + 1] = "nft" end}
+			inform._ucihelper = bss_mock()
+			inform._guest_kicked = {}
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				inform._guest_built = "phy0-ap1=x"
+				local function cmd(c, mac)
+					return inform.handle_response(cjson.encode({_type = "cmd", cmd = c, mac = mac}), st)
+				end
+				assert_true(cmd("unauthorize-guest", "DE:AD:BE:EF:00:02"), "re-inform")
+				assert_eq(#kicks, 1, "one deauth")
+				assert_eq(kicks[1].mac, "de:ad:be:ef:00:02", "of that guest, lowercased")
+				assert_eq(table.concat(kicks[1].ifnames, ","), "phy0-ap0,phy0-ap1,phy1-ap0",
+					"on every BSS: the firmware kicks on every user and guest VAP")
+				assert_eq(table.concat(order, ","), "nft,deauth",
+					"out of the authorized set first, so it reconnects to the portal")
+				cmd("authorize-guest", "de:ad:be:ef:00:03")
+				cmd("unauthorize-guest", "x;reboot")
+				cmd("unauthorize-guest", nil)
+				assert_eq(#kicks, 1, "authorize-guest and a malformed mac kick nobody")
+				-- A MAC openUF had no record of is still kicked: the controller
+				-- only asks when the station reports authorized.
+				cmd("unauthorize-guest", "de:ad:be:ef:00:09")
+				assert_eq(#kicks, 2, "kicked without a ledger entry, as the firmware does")
+				now = now + inform.GUEST_KICK_HOLD - 1
+				cmd("unauthorize-guest", "de:ad:be:ef:00:02")
+				assert_eq(#kicks, 2, "a repeat inside the hold is not kicked again")
+				now = now + 1
+				cmd("unauthorize-guest", "de:ad:be:ef:00:02")
+				assert_eq(#kicks, 3, "after the hold it is")
+				now = 10
+				cmd("unauthorize-guest", "de:ad:be:ef:00:02")
+				assert_eq(#kicks, 4, "a clock step backwards does not hold it forever")
+				inform._guest_built = nil
+				cmd("unauthorize-guest", "de:ad:be:ef:00:05")
+				assert_eq(#kicks, 5, "no portal built: still kicked")
+			end)
+			inform._firewall, inform._guestportal, inform._time = real_fw, real_gp, real_time
+			inform._state.save, inform._ucihelper, inform._guest_built = save, nil, nil
+			inform._guest_kicked = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform packet: the guest ledger is capped, oldest authorization first",
 		fn = function()
 			local st = sample_state({guest_authorized = {}})

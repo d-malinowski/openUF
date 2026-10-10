@@ -912,8 +912,35 @@ VAP's bridge.
 | Wire (all `{"_type":"cmd", …, "mac":"…"}`) | Sent when |
 |---|---|
 | `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above (openUF: into `st.guest_authorized`). A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
-| `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above |
+| `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above. openUF: out of `st.guest_authorized`, then a deauth on every BSS (see below) |
 | `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per authorization (`qos_policy_applied` latch), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's user group rate is sent instead (same sender) |
+
+**`unauthorize-guest` disconnects the guest (lab-validated only, 2026-10-10).** UniFi
+firmware drops the MAC from `/var/run/guest.authorized` and the authorized ipset, then
+runs `kick_sta`: `iwpriv <ath> kickmac <mac>` on every VAP whose `/var/run/vapusage.<ath>`
+is `user` or `guest` (`syswrapper.sh` `unauthorize-guest`, `platdep_funcs.sh` `kick_sta`;
+firmware-confirmed for 3.9.27 to 4.0.15). It kicks unconditionally, with or without the
+portal. Without the kick, the guest stays associated and unauthorized, and its OS never
+re-runs captive-portal detection, so it never sees the portal again. openUF now does the
+same after updating the `authorized` set: `hostapd_cli deauthenticate` on every BSS, the
+path `kick-sta` uses. One difference: at most one kick per MAC per 60 s. The firmware
+reports `authorized` from the very list it just changed, so it gets one
+`unauthorize-guest`. openUF reports it only on the WLANs `st.guest_wlans` names. If that
+ever disagreed with the controller, the command would come on every inform, and the hold
+keeps it from becoming a deauth storm.
+
+Lab, 10.4.57, with a logging wrapper around `hostapd_cli`:
+- A REST `authorize-guest` for mock station `de:ad:be:ef:00:01` put it in the ledger and
+  `stat/sta` showed it `authorized: true`. Nothing was deauthenticated.
+- A REST `unauthorize-guest` brought the cmd on the next heartbeat (19 s later). While handling it,
+  openUF emptied the ledger and ran `hostapd_cli -i wlan0 deauthenticate de:ad:be:ef:00:01`, then
+  the same on `wlan1`.
+  `guest_kicks` went to 1 and stayed there. Over the next 60 s no other cmd came and nothing
+  else was deauthenticated. `handle_response failed` = 0.
+
+Hardware: deployed to both APs, which keep informing. The home site has no guest portal
+(`guest_wlans` empty), so the controller never sends `unauthorize-guest` there. The
+over-the-air kick is the deauth path `kick-sta` and `block-sta` already use.
 
 **`rate-update`, openUF's answer (C3, lab-validated only, 2026-10-10).** A REST
 `authorize-guest` with `"up":2048,"down":4096` for a mock station brought, on the next
