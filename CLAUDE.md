@@ -72,7 +72,9 @@ Put every verification step into a tier and name the tier:
   never a block's presence (decoys: `mac_acl.status`, `bcmc_l2_filter.status`, `qos.vap.*`).
 - Controller protocol questions: decompile the controller (CFR, not jadx, on
   `internal-dependencies.jar`) or call live frontend functions. Don't infer from
-  behaviour and don't read AP firmware.
+  behaviour. For what the AP *does* with a key, read the firmware: current builds are
+  encrypted, but UAP BZ2 3.9.27 to 4.0.15 are plaintext (`/usr/etc/syswrapper.sh`,
+  `/bin/mcad`). Label such claims "firmware-confirmed for 3.9.27 to 4.0.15".
 - Absence of a wire key is often a sentinel for "off/auto". Tear down via an explicit
   signal, or via a marker/ledger when absence is ambiguous (`openuf_*` stamps, `st.*` ledgers).
 - A controller-initiated kick (one-shot deauth) is not a block (persistent nft drop).
