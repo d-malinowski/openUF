@@ -2029,7 +2029,8 @@ Everything openUF sends. Names were audited against the controller's own Device 
 | **`version`** | **Bare firmware version only — never model-prefixed.** See below. |
 | `required_version`, `bootrom_version`, `country_code` | `bootrom_version` has no counterpart anywhere in the device schema (closest is `boot_time`, a timestamp); likely ignored, left as-is for want of evidence to rename it to. |
 | `mem_total`, **`mem_used`** | Bytes. `mem_used = total − free`; the schema has `mem_used`, not `mem_free`. |
-| **`system-stats`** | Hyphenated key, `{cpu, mem, uptime}` — all three **strings**, cpu/mem as percentages. Not `sys_stats`, and not loadavgs. `cpu` is `0` on the very first inform (delta-sampling `/proc/stat` has no prior sample). |
+| **`system-stats`** | Hyphenated key, `{cpu, mem, uptime}` — all three **strings**, cpu/mem as percentages. `cpu` is `0` on the very first inform (delta-sampling `/proc/stat` has no prior sample). |
+| **`sys_stats`** | Sent beside `system-stats`, as UniFi firmware does: `loadavg_1/5/15` as `/proc/loadavg`'s strings, `mem_total`, `mem_used` (total − free), `mem_buffer` in bytes. The UI's **Load Average**. See [VAP, device and radio fields](#vap-device-and-radio-fields-2026-10-10). |
 | **`fw_caps`** | `0x110` — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps`** | `0xC`, plus `0x20` (Airtime Fairness) and `0x100000` (Private Pre-Shared Keys) where the device can do them — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps2`** | `0x60` — see [capability bitmasks](#capability-bitmasks) |
@@ -2562,6 +2563,7 @@ Established 2026-10-10 on lab 10.4.57 (CFR decompile plus REST), and on UAP firm
 | **`radio`** | The **band** (`ng`/`na`), same enum as `radio_table`. Sending `radio0` here logs `WARN stat - unexpected radio[radio0] while processing stats` on every inform and silently drops that vap's stats aggregation. |
 | **`radio_name`** | The UCI device name (`radio0`) — a separate, real field on the same DTO. This is what `get_ifname_for_radio()` needs. |
 | `encryption`, `disabled`, `bssid`, `channel`, `tx_power`, `usage` | `usage` is `"user"` |
+| `extchannel` | Secondary 20 MHz channel side: `1` above, `-1` below. Only when non-zero, as the firmware sends it. See below. |
 | `num_sta` | Coexists with the nested `sta_table` on the real DTO |
 | `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets`, `tx_retries`, `tx_dropped` | The UI's "Air Stats" panel. `iw` exposes these only per-station, so they're summed across connected stations while building `sta_table`. `rx_dropped`/`rx_errors`/`tx_errors` have no source in `iw` output at all — left unset rather than invented (802.11 ARQ retry/failure counters are inherently TX-side only). |
 | `avg_client_signal` | Mean `signal` of associated clients, dBm. Omitted entirely when the VAP has no clients. |
@@ -2579,6 +2581,32 @@ The `"Inconsistent vap"`/`"Invalid id"` warn paths only fire on an actual lookup
 **"Air Stats" needs growing counters, not just non-zero ones.** The widget renders a
 rate/delta between informs. Static counters produce a zero delta even when the absolute value
 is correct — which is why `iw-mock.sh`'s fake counters must increase monotonically.
+
+### VAP, device and radio fields (2026-10-10)
+
+Audit F11: firmware keys that openUF did not send, checked against what 10.6.106
+reads. A key is only worth sending if something shows it.
+
+| Key | Firmware (3.9.27 to 4.0.15) | 10.6.106 consumer | openUF |
+|---|---|---|---|
+| `sys_stats` | `prepare_system_stats`: `/proc/loadavg` read with `%s %s %s` (default `0.00 0.00 0.00`) and sent as strings; `json_integer` of sysinfo `totalram`, `totalram − freeram`, `bufferram` | Stored whole on the device. UI: the device panel's **Load Average** row (`loadavg_1 / 5 / 15`, hidden when absent) and the device comparison's load column. `mem_*` have no UI reader | Sent. `/proc/meminfo` `MemTotal`, `MemTotal − MemFree`, `Buffers`, times 1024 |
+| vap `extchannel` | `prepare_vap_array`: signed byte from `fill_chextoffset` (driver getparam 0x76, chextoffset), set only when non-zero | Copied into `radio_table_stats[].extchannel` (`getInt`, 0 when absent). UI: a 2.4 GHz radio's centre channel is `channel + 2 * extchannel` | Sent from `iw dev <if> info`: the side of the primary's partner in its 40 MHz half (`sysinfo.ext_offset`; above 40 MHz the block is halved around the primary). |
+| vap `bw` | Not among the 4.0.15 firmware's vap keys | Copied into `radio_table_stats[].bw` (0 when absent) | Not sent: no firmware evidence for its unit |
+| `isolated` | Sent | Ignored: derived from `uplink == "down"` | Not sent (Step 5) |
+| `countrycode_table` | Sent | UI warns when the site country is missing from it; absent = no warning | Not sent: no list of supported countries on OpenWrt |
+| `antenna_table`, radio `current_antenna_gain`, `builtin_ant_gain` | Sent | No `antenna_table` = `antenna_id -1`, `antenna_gain = builtin_ant_gain` (0 when absent); EIRP is tx power + gain | Not sent: OpenWrt has no antenna gain to report, and 0 keeps EIRP = tx power instead of inventing one |
+| radio `has_restricted_channels`, `min/max_chan_cntr_frq` | Sent | UI drops channels outside the range when `has_restricted_channels` | Not sent: absent means no restriction, which is true here |
+| `model_display` | Sent | UI reads it on neighbour (scan) rows only | Not sent |
+| `mac_filter_rejections`, vap `wifi_tx_latency_mov` | Sent | No reader in the controller or UI | Not sent |
+
+`anomalies_bar_chart` and `reasons_bar_chart` went out with the satisfaction port.
+
+**Live (10.6.106, both APs).** `stat/device` holds `sys_stats` for both (for example
+`loadavg_1 "0.08"`, `mem_total 123625472`, `mem_buffer 0`: OpenWrt reports `Buffers: 0 kB`).
+The Living room AP's panel shows **Load Average 0.09 / 0.13 / 0.17**, matching `/proc/loadavg`.
+`radio_table_stats[].extchannel` reads `1` on both 5 GHz radios (channel 36 and 100, 80 MHz)
+and `0` on the 20 MHz 2.4 GHz radios. A 40 MHz 2.4 GHz channel was not tried live: the site
+runs 20 MHz there.
 
 ### `sta_table[]` entry (nested inside each `vap_table` entry)
 

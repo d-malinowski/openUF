@@ -51,6 +51,7 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 			return "AUTH\nASSOC\nAUTHORIZED\n"
 		end
 		if path:find("meminfo") then return fixture("proc_meminfo.txt") end
+		if path == "/proc/loadavg" then return "0.42 0.17 0.05 1/63 1234\n" end
 		if path:find("net/dev") then return fixture("proc_net_dev.txt") end
 		if with_wired and path:find("net/arp")     then return fixture("proc_net_arp.txt") end
 		if with_wired and path:find("dhcp.leases") then return fixture("dhcp_leases.txt")  end
@@ -523,13 +524,30 @@ return {
 		fn = function()
 			local d = build()
 			-- Real devices report this under the hyphenated key "system-stats"
-			-- (verified against a real captured USG payload) -- not "sys_stats".
+			-- (verified against a real captured USG payload).
 			local stats = d["system-stats"]
 			assert_not_nil(stats, "system-stats present")
 			assert_not_nil(stats.cpu, "cpu field present")
 			assert_not_nil(stats.uptime, "uptime field present")
 			-- meminfo fixture: total=131072kB, free=65536kB -> 50% used
 			assert_eq(stats.mem, "50", "mem percent computed from meminfo fixture")
+		end
+	},
+	{
+		name = "inform json: sys_stats carries load averages and memory bytes as the firmware sends them",
+		fn = function()
+			local d = build()
+			local ss = d.sys_stats
+			assert_not_nil(ss, "sys_stats present beside system-stats")
+			-- /proc/loadavg's own strings: the UI parses and rounds them.
+			assert_eq(ss.loadavg_1, "0.42", "1 min")
+			assert_eq(ss.loadavg_5, "0.17", "5 min")
+			assert_eq(ss.loadavg_15, "0.05", "15 min")
+			-- meminfo fixture, in bytes: total 131072 kB, free 65536 kB,
+			-- buffers 2048 kB. Used is total - free, as sysinfo() gives it.
+			assert_eq(ss.mem_total, 134217728, "mem_total")
+			assert_eq(ss.mem_used, 67108864, "mem_used")
+			assert_eq(ss.mem_buffer, 2097152, "mem_buffer")
 		end
 	},
 	{
@@ -1528,10 +1546,69 @@ return {
 			-- the literal string "auto" here, and used to go out as-is.
 			assert_eq(d.vap_table[1].channel, 6, "vap channel overridden with the live value")
 			assert_eq(d.vap_table[1].radio, "ng", "vap band matches the corrected radio band")
+			-- 20 MHz: no secondary channel, and the firmware leaves it out.
+			assert_nil(d.vap_table[1].extchannel, "no extchannel at 20 MHz")
+			assert_nil(d.radio_table[1].extchannel, "extchannel is a vap field only")
 			-- tx_power has the same UCI-echo problem: the option is absent
 			-- while Transmit Power is Auto, so both copies stayed nil.
 			assert_eq(d.radio_table[1].tx_power, 20, "radio reports the live driver TX power")
 			assert_eq(d.vap_table[1].tx_power, 20, "and the vap inherits the same correction")
+		end
+	},
+	{
+		name = "inform json: a 40 MHz 2.4GHz vap reports its secondary channel side as extchannel",
+		fn = function()
+			-- HT40- on channel 11: the secondary 20 MHz is channel 7, below.
+			-- The UI centres the channel at channel + 2 * extchannel = 9.
+			inject_sysinfo(false, false, false, true)
+			inform._sysinfo._run_cmd = function(cmd)
+				if cmd:find("dev wlan0 info") then
+					return (fixture("iw_dev_info.txt"):gsub(
+						"channel 6 %(2437 MHz%), width: 20 MHz, center1: 2437 MHz",
+						"channel 11 (2462 MHz), width: 40 MHz, center1: 2452 MHz"))
+				end
+				if cmd:find("phy phy0 info") then return fixture("iw_phy_info_2g.txt") end
+				return ""
+			end
+			local real_uci = dofile("openuf/ucihelper.lua")
+			local sections = {
+				{[".name"] = "radio0", [".type"] = "wifi-device", channel = "11"},
+				{[".name"] = "openuf_radio0_test", [".type"] = "wifi-iface",
+				 device = "radio0", ssid = "test", encryption = "psk2"},
+			}
+			real_uci._uci = {cursor = function() return {
+				foreach = function(_, config, stype, fn)
+					if config ~= "wireless" then return end
+					for _, s in ipairs(sections) do
+						if s[".type"] == stype then fn(s) end
+					end
+				end,
+				get = function() return nil end,
+				set = function() end,
+				delete = function() end,
+				commit = function() end,
+			} end}
+			real_uci._popen = function(cmd)
+				if cmd:find("network.wireless", 1, true) then
+					return '{"radio0":{"interfaces":[{"ifname":"wlan0"}]}}'
+				end
+				return ""
+			end
+			real_uci._read_file = function() return nil end
+			real_uci._run_cmd = function() return true end
+
+			local orig = inform._ucihelper
+			inform._ucihelper = real_uci
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			inform._ucihelper = orig
+			assert_eq(d.vap_table[1].channel, 11, "live channel")
+			assert_eq(d.vap_table[1].extchannel, -1, "secondary below the primary")
+			assert_nil(d.radio_table[1].extchannel, "not a radio_table field")
 		end
 	},
 	{

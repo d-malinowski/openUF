@@ -71,7 +71,39 @@ return {
 				local m = sysinfo.meminfo()
 				assert_eq(m.total_kb, 131072, "total_kb")
 				assert_eq(m.free_kb,   65536, "free_kb")
+				assert_eq(m.buffers_kb, 2048, "buffers_kb")
 			end)
+		end
+	},
+	{
+		name = "sysinfo: loadavg() returns /proc/loadavg's three strings, zeros without it",
+		fn = function()
+			with_fixtures({["/proc/loadavg"] = "1.07 0.66 0.30 2/71 4321\n"}, {}, function()
+				local a, b, c = sysinfo.loadavg()
+				assert_eq(a, "1.07", "1 min")
+				assert_eq(b, "0.66", "5 min")
+				assert_eq(c, "0.30", "15 min")
+			end)
+			with_fixtures({}, {}, function()
+				local a, b, c = sysinfo.loadavg()
+				assert_eq(a .. " " .. b .. " " .. c, "0.00 0.00 0.00", "firmware's default")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: ext_offset() puts the secondary 20 MHz on the primary's 40 MHz partner",
+		fn = function()
+			assert_eq(sysinfo.ext_offset(2437, 20, 2437), 0, "20 MHz: none")
+			assert_eq(sysinfo.ext_offset(2412, 40, 2422), 1, "HT40+ ch 1: above")
+			assert_eq(sysinfo.ext_offset(2462, 40, 2452), -1, "HT40- ch 11: below")
+			-- 80 MHz block 100-112 (center 5530): 40 MHz pairs 100/104, 108/112.
+			assert_eq(sysinfo.ext_offset(5500, 80, 5530), 1, "ch 100: partner 104 above")
+			assert_eq(sysinfo.ext_offset(5520, 80, 5530), -1, "ch 104: partner 100 below")
+			assert_eq(sysinfo.ext_offset(5540, 80, 5530), 1, "ch 108: partner 112 above")
+			assert_eq(sysinfo.ext_offset(5560, 80, 5530), -1, "ch 112: partner 108 below")
+			-- 160 MHz block 36-64 (center 5250): ch 44's partner is 48.
+			assert_eq(sysinfo.ext_offset(5220, 160, 5250), 1, "160 MHz ch 44: above")
+			assert_eq(sysinfo.ext_offset(nil, 40, 2422), 0, "no frequency: none")
 		end
 	},
 	{
@@ -1105,6 +1137,7 @@ return {
 				assert_false(caps.has_ht160, "no 160 MHz support (no VHT at all on 2.4GHz)")
 				assert_eq(caps.nss, 2, "nss from 'HT TX Max spatial streams: 2'")
 				assert_eq(caps.channel, 6, "live channel from 'channel 6 (2437 MHz)...'")
+				assert_eq(caps.extchannel, 0, "20 MHz: no secondary channel")
 			end)
 		end
 	},

@@ -633,6 +633,8 @@ function M.build_json(st, cfg, ufhw)
 	local uptime     = M._sysinfo.uptime()
 	local meminfo    = M._sysinfo.meminfo()
 	local cpu_pct    = M._sysinfo.cpu_percent()
+	local load1, load5, load15
+	if M._sysinfo.loadavg then load1, load5, load15 = M._sysinfo.loadavg() end
 	local mem_pct    = meminfo.total_kb > 0
 	                    and math.floor((meminfo.total_kb - meminfo.free_kb) * 100 / meminfo.total_kb + 0.5)
 	                    or 0
@@ -734,6 +736,8 @@ function M.build_json(st, cfg, ufhw)
 		local minrssi_threshold_by_radio = {}
 		-- Live noise floor per radio, for satisfaction.
 		local noise_by_radio = {}
+		-- Live secondary-channel side per radio, for each vap's extchannel.
+		local extchan_by_radio = {}
 		for _, radio in ipairs(radio_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
@@ -746,6 +750,8 @@ function M.build_json(st, cfg, ufhw)
 				local ok_caps, caps = pcall(M._sysinfo.radio_caps, ifname)
 				if ok_caps and caps then
 					caps.width = nil
+					extchan_by_radio[radio.name] = caps.extchannel
+					caps.extchannel = nil
 					for k, v in pairs(caps) do radio[k] = v end
 					-- The live negotiated channel is band-authoritative once
 					-- ACS has picked one: UCI's config value may be the
@@ -1084,6 +1090,11 @@ function M.build_json(st, cfg, ufhw)
 				-- entry picked up the driver's real value.
 				if live.tx_power then vap.tx_power = live.tx_power end
 			end
+			-- Only when non-zero, as the firmware sends it. The controller
+			-- copies it into radio_table_stats, where the UI centres a
+			-- 2.4 GHz 40 MHz channel at channel + 2 * extchannel.
+			local ext = extchan_by_radio[vap.radio_name]
+			vap.extchannel = ext ~= 0 and ext or nil
 			-- Resolve THIS vap's netdev, not the radio's first one.
 			-- get_ifname_for_radio() returns whichever interface netifd
 			-- lists first, which is the same thing only on a single-SSID
@@ -1844,9 +1855,20 @@ function M.build_json(st, cfg, ufhw)
 		-- Real devices report this under the hyphenated key "system-stats"
 		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
 		-- against a real captured USG inform payload (stephanlascar/
-		-- unifi-gateway, poc/real_inform_payload_exemple.json). Previously
-		-- sent as "sys_stats" (underscore) with raw loadavg_1/5/15 fields,
-		-- which the controller would not have recognized at all.
+		-- unifi-gateway, poc/real_inform_payload_exemple.json).
+		-- UniFi firmware sends sys_stats beside it (prepare_system_stats,
+		-- firmware-confirmed for 3.9.27 to 4.0.15): /proc/loadavg's three
+		-- strings and sysinfo()'s totalram, totalram - freeram and
+		-- bufferram in bytes. The controller stores it; the UI shows the
+		-- load averages as the device's Load Average.
+		sys_stats = {
+			loadavg_1  = load1,
+			loadavg_5  = load5,
+			loadavg_15 = load15,
+			mem_total  = meminfo.total_kb * 1024,
+			mem_used   = (meminfo.total_kb - meminfo.free_kb) * 1024,
+			mem_buffer = (meminfo.buffers_kb or 0) * 1024,
+		},
 		["system-stats"] = {
 			cpu    = tostring(cpu_pct),
 			mem    = tostring(mem_pct),

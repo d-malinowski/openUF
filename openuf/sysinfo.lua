@@ -117,16 +117,27 @@ function M.uptime()
 	end)
 end
 
--- Returns {total_kb, free_kb} by parsing /proc/meminfo.
+-- Returns {total_kb, free_kb, buffers_kb} by parsing /proc/meminfo.
 function M.meminfo()
 	local s = M._read_file("/proc/meminfo")
-	if not s then return {total_kb = 0, free_kb = 0} end
+	if not s then return {total_kb = 0, free_kb = 0, buffers_kb = 0} end
 	local total = tonumber(s:match("MemTotal:%s+(%d+)"))
 	local free  = tonumber(s:match("MemFree:%s+(%d+)"))
+	local bufs  = tonumber(s:match("Buffers:%s+(%d+)"))
 	return {
-		total_kb = total or 0,
-		free_kb  = free  or 0,
+		total_kb   = total or 0,
+		free_kb    = free  or 0,
+		buffers_kb = bufs  or 0,
 	}
+end
+
+-- The 1, 5 and 15 minute load averages as /proc/loadavg prints them
+-- ("0.05"), strings as UniFi firmware sends them in sys_stats.
+function M.loadavg()
+	local s = M._read_file("/proc/loadavg") or ""
+	local a, b, c = s:match("^(%S+)%s+(%S+)%s+(%S+)")
+	if not a then return "0.00", "0.00", "0.00" end
+	return a, b, c
 end
 
 -- Previous /proc/stat sample for delta-based CPU% (see M.cpu_percent).
@@ -847,6 +858,22 @@ function M._phy_info(phy)
 	return text, caps
 end
 
+-- The secondary 20 MHz channel's side of the primary, as the QCA driver
+-- reports it (getparam chextoffset; UniFi firmware sends it as vap
+-- extchannel): 1 above, -1 below, 0 without one. Above 40 MHz it is the
+-- primary's partner in its 40 MHz half, so halve the block around the
+-- primary until 40 MHz is left (80 MHz at 5530, primary 5520: 40 MHz at
+-- 5510, so -1).
+function M.ext_offset(freq, width, center)
+	if not (freq and width and center) or width < 40 then return 0 end
+	while width > 40 do
+		width = width / 2
+		if freq < center then center = center - width / 2
+		else center = center + width / 2 end
+	end
+	return freq < center and 1 or -1
+end
+
 function M.radio_caps(ifname)
 	if not ifname then return {} end
 	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
@@ -879,6 +906,11 @@ function M.radio_caps(ifname)
 	-- Live channel width in MHz ("width: 80 MHz"), for the satisfaction
 	-- estimate's rate ceiling. Not a wire field: build_json takes it off.
 	caps.width    = tonumber(dev_info:match("width:%s+(%d+)"))
+	-- Which side of the primary the secondary 20 MHz sits: 1 above, -1
+	-- below, 0 at 20 MHz. Not a radio_table field: build_json moves it to
+	-- each vap's extchannel.
+	caps.extchannel = M.ext_offset(tonumber(dev_info:match("channel%s+%d+%s+%((%d+) MHz%)")),
+		caps.width, tonumber(dev_info:match("center1:%s+(%d+)")))
 
 	return caps
 end
