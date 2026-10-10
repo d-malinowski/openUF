@@ -2586,6 +2586,40 @@ return {
 		end
 	},
 	{
+		name = "inform packet: an unhandled cmd or _type is logged by name and counted",
+		fn = function()
+			inform._unhandled_counts = {}
+			local out = with_stderr(function()
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', sample_state())
+			end)
+			assert_nil(out:find("unhandled", 1, true), "a handled cmd is not reported")
+
+			local r1, r2
+			out = with_stderr(function()
+				r1 = inform.handle_response('{"_type":"cmd","cmd":"clear-counters"}', sample_state())
+				r2 = inform.handle_response('{"_type":"cmd","cmd":"clear-counters"}', sample_state())
+			end)
+			assert_contains(out, "unhandled cmd 'clear-counters' (1 since start)", "first sighting")
+			assert_contains(out, "unhandled cmd 'clear-counters' (2 since start)", "counted per name")
+			assert_true(r1 and r2, "an unhandled cmd still re-informs at once")
+
+			out = with_stderr(function()
+				inform.handle_response('{"_type":"cmd","cmd":"x y\\n' .. ("z"):rep(80) .. '"}', sample_state())
+			end)
+			assert_contains(out, "unhandled cmd 'x?y?", "controller-supplied name is reduced to one token")
+			assert_nil(out:find(("z"):rep(48), 1, true), "and capped in length")
+
+			out = with_stderr(function()
+				inform.handle_response('{"_type":"setstate"}', sample_state())
+				inform.handle_response('{"cfgversion":"abc"}', sample_state())
+			end)
+			assert_contains(out, "unhandled _type 'setstate' (1 since start)", "an unknown _type is reported")
+			local _, n = out:gsub("unhandled", "")
+			assert_eq(n, 1, "a response with no _type is not reported")
+			inform._unhandled_counts = {}
+		end
+	},
+	{
 		name = "inform packet: handle_response cmd unset-locate clears st.locating",
 		fn = function()
 			local st = sample_state({locating = true})

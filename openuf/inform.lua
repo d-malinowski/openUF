@@ -3135,6 +3135,29 @@ function M._report_dropped_keys(label, raw, recognized)
 		:format(label, total, table.concat(parts, ", ")))
 end
 
+-- Requests the dispatcher has no handler for, counted per name since the
+-- daemon started. The controller's request set grows with each release, and
+-- before this an unknown cmd left only the generic "cmd: X" line, the same as
+-- a handled one, so the last gap (kick-sta) took a decompile to find. Memory
+-- only, no state.json field: flash on the small boards is too scarce for a
+-- ledger that grows with whatever the controller sends.
+M._unhandled_counts = {}
+
+-- A controller-supplied name as one short log token: no newline can forge a
+-- second log line, and a huge string can't flood the log.
+local function log_token(name)
+	return (tostring(name):sub(1, 48):gsub("[^%w%-_.]", "?"))
+end
+
+function M._note_unhandled(kind, name)
+	name = log_token(name)
+	local key = kind .. " " .. name
+	local n = (M._unhandled_counts[key] or 0) + 1
+	M._unhandled_counts[key] = n
+	io.stderr:write(("inform: unhandled %s '%s' (%d since start) -- ignored\n")
+		:format(kind, name, n))
+end
+
 -- ─── Response dispatcher ─────────────────────────────────────────────────────
 
 -- Handle a parsed controller response JSON string.
@@ -3623,7 +3646,7 @@ function M.handle_response(json_str, st, cfg)
 
 	if _type == "cmd" then
 		local cmd = resp.cmd or ""
-		io.stderr:write("inform: cmd: " .. tostring(cmd) .. "\n")
+		io.stderr:write("inform: cmd: " .. log_token(cmd) .. "\n")
 
 		if cmd == "set-locate" or cmd == "unset-locate" then
 			local led_path = cfg and cfg.led
@@ -3792,9 +3815,13 @@ function M.handle_response(json_str, st, cfg)
 					end
 				end
 			end
+		else
+			-- Anything else (other device classes' cmds, the WebRTC console,
+			-- crash-log requests; PROTOCOL-VALIDATION.md lists them) is a
+			-- no-op, but a named one, so a new request shows up in the log.
+			M._note_unhandled("cmd", cmd)
 		end
-		-- other cmd values (e.g. mfi-output, restart): no-op
-		--
+		-- Every cmd, handled or not, gets the immediate follow-up inform.
 		-- Per fxkr/unifi-protocol-reverse-engineering's documented inform
 		-- semantics: "Upon receiving a command message, an AP will execute a
 		-- command and then send another inform immediately" -- regardless of
@@ -3802,6 +3829,9 @@ function M.handle_response(json_str, st, cfg)
 		-- cfgversion branch below, which already does this correctly.
 		return true
 	end
+
+	-- Every _type openUF knows has returned by now.
+	if _type ~= nil then M._note_unhandled("_type", _type) end
 
 	-- Config update: check cfgversion. WiFi config itself is applied from
 	-- system_cfg above, not here -- a real controller never sends the

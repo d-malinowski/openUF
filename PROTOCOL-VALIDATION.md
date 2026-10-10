@@ -621,6 +621,13 @@ meaning on an AP:
 | `set-locate`, `unset-locate`, `block-sta`, `unblock-sta`, `kick-sta`, `scan` (`type`, `mode`, `freq`, `radio_name`), `scan_band` (`band`; only for devices without `wifi_caps2` 0x200), `authorize-guest`, `unauthorize-guest`, `rate-update` (`ul_max`, `dl_max`; handled: guest ledger + portal enforcement + per-guest limit, lab-validated only; see [Guest portal](#guest-portal-hotspot-what-the-controller-pushes-and-expects)) · `spectrum-scan` (+`spectrum-cfg`) · `quick-scan` (`scan-band`, `scan-bw`; refused by the controller unless `wifi_caps2` 0x80, which openUF does not claim, so never sent) · guest portal: `rate-update`'s `ul_min`, `dl_min` (a 64 kbps floor, not applied) | switch: `power-cycle`, `clear-counters`, `clear-all-counters`, `port-recovery`, `rps-port-recovery`, `show/hide-lcm-tracker`, `set-etherlight-mode` · gateway: `query-dpi-stats`, `clear-all-dpi-counters` · SmartPower: `relayctl` · mesh/Element: `set/unset-meshv3-payload`, `mesh-halt`, `run`+`shellcmd`, `unset-element-payload` · WebRTC console: `build-ssh-session`, `ssh-sdp-answer`, `close-ssh-session` · crash/support: `send-crashlog`, `send-recovery`, `send-trace`, `clear-crashlog`, `clear-recovery`, `clear-trace` |
 
 An unhandled `cmd` falls through to a no-op, which still triggers the immediate re-inform.
+Since 2026-10-10 it is also logged by name with a per-name count since the daemon started
+(`inform: unhandled cmd 'X' (N since start) -- ignored`), and so is an unknown `_type`. Before
+that, an unknown cmd left the same `inform: cmd: X` line as a handled one, and `kick-sta` took
+a decompile to find. The count is in memory only, with no `state.json` ledger, because flash on
+the small boards is too scarce. Lab (10.4.57): REST `cmd/devmgr` with `clear-counters`,
+`send-crashlog` or `clear-crashlog` for a UAP returns `rc ok` but queues nothing, so no unhandled
+cmd can be provoked against the lab AP. The unhandled path is covered by unit tests only.
 
 Block/unblock commands are the **immediate** path. The noop field `include_blocks` is not the
 block list: it stays `[]` even while a client is blocked. The persistent list is `setparam`'s

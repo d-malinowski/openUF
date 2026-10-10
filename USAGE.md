@@ -298,6 +298,16 @@ two whole features sat unnoticed in every capture for months. Key names and
 counts only: these blobs carry passphrases and the adoption key, so no value is
 ever logged.
 
+Not behind that flag, because it is rare: a controller request openUF has no handler
+for is logged by name, with a count since the daemon started:
+
+```
+inform: unhandled cmd 'clear-counters' (1 since start) -- ignored
+```
+
+Some of these are expected, such as other device classes' commands. A name not listed in
+PROTOCOL-VALIDATION.md's cmd audit is a request openUF should probably answer, so please report it.
+
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
 hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
 that `inform.lua` should lock/unlock as the device's adopted state changes.
