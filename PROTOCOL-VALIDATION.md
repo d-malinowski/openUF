@@ -2392,7 +2392,7 @@ through 0/3/4/5/6/7/15/31/255 only changed *which* of two near-identical errors 
 | **`radio_caps`** | A separate **integer bitmask**, not `nss`. See below. |
 | **`radio_caps2`** | `0x3` on an SAE-capable radio (`0x1` WPA3, `0x2` FT with WPA3), `0` otherwise, plus `0x8` (Enhanced Open) where hostapd has OWE. See [Capability bitmasks](#capability-bitmasks). |
 | `min_rssi`, `min_rssi_enabled` | `min_rssi` is **dBm** on the wire (the raw `stamgr` value - 95, the controller's own encoding) |
-| **`athstats`** | Nested `{cu_total, cu_self_rx, cu_self_tx, cu_interf}`. See below. |
+| **`athstats`** | Nested `{cu_total, cu_self_rx, cu_self_tx, cu_interf, satisfaction}`, plus `ast_txto`/`ast_cst` on ath9k radios. See below and "Possible interference" (2026-10-10). |
 
 **An empty `radio_table` blocks a large amount of downstream behavior.** The controller checks
 `if (list3.isEmpty()) { … "Missing radio_table in inform…" }` and this is exactly the
@@ -2608,6 +2608,49 @@ The Living room AP's panel shows **Load Average 0.09 / 0.13 / 0.17**, matching `
 `radio_table_stats[].extchannel` reads `1` on both 5 GHz radios (channel 36 and 100, 80 MHz)
 and `0` on the 20 MHz 2.4 GHz radios. A 40 MHz 2.4 GHz channel was not tried live: the site
 runs 20 MHz there.
+
+### "Possible interference": `athstats.ast_txto` / `ast_cst` (2026-10-10)
+
+The controller has a warning event, `EVT_AP_PossibleInterference`, that no openUF AP could
+raise: it reads two hardware counters openUF did not send.
+
+**Controller.** For each `radio_table[]` entry that carries `athstats`, the device manager
+diffs `ast_txto`, `ast_cst`, `ast_ath_reset`, `fullqueue_stop` and `ast_be_xmit` against
+the previous inform (a missing or zero first sample gives no delta; a counter that went
+down gives none either). It logs the event when the time since that inform is over 5 s, either
+counter rose faster than **10 per second**, the radio has a VAP (`vap_table[].radio_name`), and
+no event was logged for this radio in the last 5 minutes. The deltas are kept in
+`radio_table_stats[]`. The only other consumer is the UI's sort order for the Devices list
+columns "TX 2.4G/5G", which sorts by `ast_be_xmit` + `tx_packets`; the cells themselves
+show retries and drops.
+- 10.4.57 (lab jar): the AP handler passes the inform time in milliseconds to the delta helper.
+- 10.6.106: the UAP handler (`iceUMDuewFNFLMOqti`, wired into the Atheros, Broadcom and
+  MediaTek AP config factories) does the same. A second copy in the gateway handler
+  (`IPBUmPKpJrymtFQry`, wired only into the UDM/UXG managers) passes seconds, so for a
+  gateway's built-in radios `time_delta` comes out 1000 times too small and the event cannot
+  fire. That copy never sees an AP's inform.
+- **Lab (10.4.57):** a throwaway copy of openUF that sent `ast_txto` rising by 1000 per second
+  made the controller set `radio_table_stats[].last_interference_at` (it is written only when
+  the event fires) on both radios within 90 s, with a stored delta of 10000 per inform.
+
+**Firmware (athbox `athstats`, firmware-confirmed for 4.0.15).** mcad fills `athstats` from
+libubnt's `get_radio_stat_info` (the driver's `ath_stats`). The `athstats` tool prints the
+same fields as "global txmit timeout interrupts" (`ast_txto`), "carrier sense timeout
+interrupts" (`ast_cst`) and "beacons transmitted" (`ast_be_xmit`). These are raw counts since
+the driver loaded; the controller computes the rates.
+
+**openUF.** ath9k counts the same two hardware interrupts in debugfs
+(`/sys/kernel/debug/ieee80211/phyN/ath9k/interrupt`, lines `GTT` and `CST`), and openUF
+sends them as `ast_txto`/`ast_cst` (`sysinfo.radio_timeouts`). ath10k (its firmware stats
+have a "TX timeout" count, but no carrier-sense one) and mt76 have no such pair, so their
+radios send neither, as a radio that never timed out would. `ast_be_xmit` is not sent:
+mac80211 keeps no count of beacons sent, and the column it affects is only sorted by it.
+- **Live (10.6, 2026-10-10).** Archer C5 2.4 GHz (ath9k): GTT 312203, CST 263611 after 69 days,
+  about 0.05 per second together; over one minute CST +1 and GTT +0. The payload
+  built on the AP carried both on that radio and neither on the ath10k one, and the controller
+  stored a `radio_table_stats[].ast_cst` delta of 1 for it. AX3000T (mt76): nothing sent, as
+  intended. At these rates the event stays quiet; it is meant for a radio that cannot get
+  on air.
 
 ### STUN wake-up (2026-10-10)
 

@@ -262,6 +262,39 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: radio_timeouts() reads ath9k's GTT and CST interrupt counts",
+		fn = function()
+			local D = "/sys/kernel/debug/ieee80211/"
+			-- Trimmed from the Archer C5's 2.4 GHz radio (2026-10-10).
+			local irq = "                 RXLP:  391606534\n             WATCHDOG:       1147\n"
+				.. "                   TX:  281575066\n                 SWBA:  468345888\n"
+				.. "                  CST:     263611\n                  GTT:     312203\n"
+				.. "                TOTAL: 1123082953\nSYNC_CAUSE stats:\n             Sync-All:          0\n"
+			with_fixtures({
+				["/sys/class/net/phy1-ap0/phy80211/name"] = "phy1\n",
+				[D .. "phy1/ath9k/interrupt"] = irq,
+			}, {}, function()
+				local txto, cst = sysinfo.radio_timeouts("phy1-ap0")
+				assert_eq(txto, 312203, "ast_txto = GTT, global transmit timeouts")
+				assert_eq(cst, 263611, "ast_cst = CST, carrier sense timeouts")
+			end)
+			-- ath10k and mt76: no ath9k directory.
+			with_fixtures({["/sys/class/net/phy0-ap0/phy80211/name"] = "phy0\n"}, {}, function()
+				assert_nil(sysinfo.radio_timeouts("phy0-ap0"), "not ath9k: nil")
+			end)
+			-- Half a pair is not read as one.
+			for _, only in ipairs({"CST", "GTT"}) do
+				with_fixtures({
+					["/sys/class/net/phy1-ap0/phy80211/name"] = "phy1\n",
+					[D .. "phy1/ath9k/interrupt"] = "                  " .. only .. ":     263611\n",
+				}, {}, function()
+					assert_nil(sysinfo.radio_timeouts("phy1-ap0"), "only " .. only .. ": nil")
+				end)
+			end
+			assert_nil(sysinfo.radio_timeouts(nil), "no netdev: nil")
+		end
+	},
+	{
 		name = "sysinfo: sta_akms() parses hostapd all_sta, akm_is_ft() knows the FT suites",
 		fn = function()
 			local seen

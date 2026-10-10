@@ -422,6 +422,25 @@ function M.sta_powersave(ifname, mac)
 	return false
 end
 
+-- A radio's transmit-timeout and carrier-sense-timeout interrupt counts since
+-- the driver loaded: UniFi firmware's athstats ast_txto and ast_cst, which its
+-- athstats tool labels "global txmit timeout interrupts" and "carrier sense
+-- timeout interrupts" (firmware-confirmed for 4.0.15). ath9k counts the same
+-- two hardware interrupts as GTT and CST in debugfs. ath10k (its firmware
+-- keeps a tx timeout count, but no carrier-sense one) and mt76 have no such
+-- pair: nil there.
+function M.radio_timeouts(ifname)
+	if not ifname then return nil end
+	local phy = (M._read_file("/sys/class/net/" .. ifname .. "/phy80211/name") or ""):match("^%s*(%S+)")
+	if not phy then return nil end
+	local s = M._read_file("/sys/kernel/debug/ieee80211/" .. phy .. "/ath9k/interrupt")
+	if not s then return nil end
+	local gtt = tonumber(s:match("GTT:%s*(%d+)"))
+	local cst = tonumber(s:match("CST:%s*(%d+)"))
+	if not (gtt and cst) then return nil end
+	return gtt, cst
+end
+
 -- Each station's AKM suite on the given hostapd BSSes, as hostapd prints it
 -- ("00-0f-ac-9"), keyed by lower-case MAC. One hostapd_cli run for all of them.
 function M.sta_akms(bsses)

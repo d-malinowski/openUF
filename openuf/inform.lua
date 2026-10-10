@@ -945,6 +945,17 @@ function M.build_json(st, cfg, ufhw)
 						cu_self_tx = cu_self_tx,
 						cu_interf  = entry.cu_interf,
 					}
+					-- Hardware tx and carrier-sense timeouts, raw counts as
+					-- the firmware sends them. The controller diffs them per
+					-- inform and logs "Possible interference" when either
+					-- rises faster than 10/s (at most every 5 min per radio).
+					-- ath9k only; elsewhere absent, as on a radio that never
+					-- times out.
+					local ok_to, txto, cst = pcall(M._sysinfo.radio_timeouts, ifname)
+					if ok_to and txto then
+						radio.athstats.ast_txto = txto
+						radio.athstats.ast_cst = cst
+					end
 					-- Cached spectrum-scan result, if a "spectrum-scan" cmd
 					-- was handled for this radio (see cmd dispatch below).
 					-- On the radio_table entry, beside athstats: the

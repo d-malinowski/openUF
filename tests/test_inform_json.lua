@@ -50,6 +50,11 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 		if with_clients and path == "/sys/kernel/debug/ieee80211/phy0/netdev:wlan0/stations/11:22:33:44:55:66/flags" then
 			return "AUTH\nASSOC\nAUTHORIZED\n"
 		end
+		-- An ath9k radio's interrupt counts (sysinfo.radio_timeouts).
+		if with_clients and path == "/sys/kernel/debug/ieee80211/phy0/ath9k/interrupt" then
+			return "                 SWBA:  468345888\n                  CST:     263611\n"
+				.. "                  GTT:     312203\n"
+		end
 		if path:find("meminfo") then return fixture("proc_meminfo.txt") end
 		if path == "/proc/loadavg" then return "0.42 0.17 0.05 1/63 1234\n" end
 		if path:find("net/dev") then return fixture("proc_net_dev.txt") end
@@ -1162,6 +1167,26 @@ return {
 			assert_eq(radio.athstats.cu_self_rx, 18, "athstats.cu_self_rx matches radio_table_stats")
 			assert_eq(radio.athstats.cu_self_tx, 9, "athstats.cu_self_tx matches radio_table_stats")
 			assert_eq(radio.athstats.cu_interf, 10, "athstats.cu_interf matches radio_table_stats")
+		end
+	},
+	{
+		-- The controller logs "Possible interference" when athstats.ast_txto
+		-- or ast_cst rises faster than 10/s; it diffs the raw counts itself.
+		name = "inform json: athstats carries ath9k's tx and carrier-sense timeout counts",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			local radio = d.radio_table[1]
+			assert_eq(radio.athstats.ast_txto, 312203, "ast_txto = GTT")
+			assert_eq(radio.athstats.ast_cst, 263611, "ast_cst = CST")
+			assert_nil(radio.athstats.ast_be_xmit, "no beacon count: no source")
+			-- Not ath9k (or no debugfs): absent, never a made-up 0.
+			local orig = inform._sysinfo.radio_timeouts
+			inform._sysinfo.radio_timeouts = function() return nil end
+			d = build({with_uci = true, with_clients = true})
+			inform._sysinfo.radio_timeouts = orig
+			assert_nil(d.radio_table[1].athstats.ast_txto, "no counter: no ast_txto")
+			assert_nil(d.radio_table[1].athstats.ast_cst, "no counter: no ast_cst")
+			assert_eq(d.radio_table[1].athstats.cu_total, 37, "the rest of athstats unchanged")
 		end
 	},
 	{
