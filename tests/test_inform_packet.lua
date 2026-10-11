@@ -1648,6 +1648,19 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.11k.status",
+		fn = function()
+			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			for _, c in ipairs({{"enabled", true}, {"disabled", false}}) do
+				local _, v = inform._parse_wifi_system_cfg(base .. "aaa.1.11k.status=" .. c[1] .. "\n")
+				assert_eq(v[1].rrm, c[2], "11k.status=" .. c[1])
+			end
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_eq(none[1].rrm, nil, "no 11k.status key -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=1\n"

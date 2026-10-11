@@ -2556,6 +2556,34 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config turns 802.11k on from the WLAN's own toggle, and only then",
+		fn = function()
+			local K = {"ieee80211k", "rrm_neighbor_report", "rrm_beacon_report"}
+			for _, c in ipairs({{true, "1"}, {false, nil}, {nil, nil}}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", rrm = c[1]},
+					}}, nil)
+					for _, k in ipairs(K) do
+						assert_eq(db.wireless.openuf_radio0_corp[k], c[2],
+							k .. " with rrm=" .. tostring(c[1]))
+					end
+				end)
+			end
+			-- Band Steering still forces it on, whatever the WLAN says.
+			with_ucihelper(function(db)
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22", rrm = false},
+				}}, nil, {band_steering_active = true})
+				for _, k in ipairs(K) do
+					assert_eq(db.wireless.openuf_radio0_corp[k], "1", k .. " under steering")
+				end
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config omits the Force WiFi 4 options when the vap has neither",
 		fn = function()
 			with_ucihelper(function(db)

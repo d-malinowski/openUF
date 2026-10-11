@@ -2582,6 +2582,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- eWivisHeQsnaqDtx). UniFi firmware writes it to hostapd as
 				-- wpa_group_rekey= (firmware-confirmed for 4.0.15). 0 = off.
 				group_rekey           = _wire_group_rekey(a["wpa.group_rekey"]),
+				-- aaa.<n>.11k.status: the wlanconf's rrm_enabled (default
+				-- false; REST-only, the 10.6 UI has no control), "enabled" or
+				-- "disabled" on every WLAN (10.x generator eWivisHeQsnaqDtx).
+				-- UniFi firmware runs `iwpriv <ath> rrm 0|1` with it
+				-- (firmware-confirmed for 4.0.15). nil when absent.
+				rrm                   = _wire_bool(a["11k.status"]),
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
 				-- {key=, vid=} per private pre-shared key, in wire order;

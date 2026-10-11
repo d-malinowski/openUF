@@ -1352,6 +1352,16 @@ function M.apply_config(resp, cfg, opts)
 				if vap.bss_transition ~= nil then
 					extra.bss_transition = vap.bss_transition and "1" or "0"
 				end
+				-- The WLAN's own 802.11k toggle (aaa.<n>.11k.status). Off
+				-- needs nothing: the section is rebuilt, and OpenWrt's
+				-- ieee80211k defaults to 0. Without usteer nothing fills
+				-- hostapd's neighbor list, so a neighbor report names no
+				-- other AP; beacon reports (rrmscan) work regardless.
+				if vap.rrm then
+					extra.ieee80211k          = "1"
+					extra.rrm_neighbor_report = "1"
+					extra.rrm_beacon_report   = "1"
+				end
 			end
 			if vap.dtim_period then extra.dtim_period = vap.dtim_period end
 			-- U-APSD. `uapsd` is hostapd.sh's option and, on 25.12, a schema
