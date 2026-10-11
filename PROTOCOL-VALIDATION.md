@@ -2239,6 +2239,16 @@ place of the md5:
 OpenWrt reads them only when `ft_psk_generate_local` is 0 (`/usr/share/ucode/wifi/ap.uc`
 `iface_roaming`, and `hostapd.sh` on 24.10), so FT-PSK keeps local derivation and FT-SAE/EAP
 use the controller's key. Without a key, the md5 fallback still applies.
+- openUF also copies the firmware template's `pmk_r1_push=1` and `reassociation_deadline=3000`
+  (OpenWrt defaults: 0 and 20000 TU). OpenWrt writes `pmk_r1_push` only on the key-holder path,
+  so it matters for FT-SAE/EAP only. Stock hostapd's `wpa_ft_push_pmk_r1` skips an R1KH whose
+  address or ID is all zeroes, so the wildcard entry never receives a push. A peer gets pushes
+  once it has been learned from its first pull (`wpa_ft_rrb_add_r1kh`, kept for
+  `rkh_pos_timeout`, a day by default), which is close to the firmware's learned-peer push.
+  `r0_key_lifetime=10000` is already OpenWrt's default. `r1_key_holder` stays unset, so hostapd uses the BSSID,
+  because the firmware's fixed `020055424e54` would give every AP the same R1KH-ID.
+  Hardware (after a Force Provision): all four FT BSSes on both APs read back `pmk_r1_push=1`
+  and `reassociation_deadline=3000` in `/var/run/hostapd-phy*.conf`.
 - Lab: the lab controller's push for a new WLAN reached UCI on both radios with
   `x_iapp_key` byte-for-byte.
 - Hardware: both APs produced identical `r0kh=`/`r1kh=` lines carrying the gateway's key in
@@ -2251,7 +2261,23 @@ use the controller's key. Without a key, the md5 fallback still applies.
     FT AKM already set before association, i.e. the FT authentication including the PMK-R1
     fetch succeeded. The client then never acknowledged the response at -74 dBm and fell back.
   - A third client used PMKSA caching (`auth_alg=open`), which is the client's choice.
-  - A clean cross-AP `auth_alg=ft` with the new key is still to be captured.
+  - 2026-10-11, an FT-SAE phone steered from one AP to the other: the first `bss_tm_req`
+    was accepted (status 0) and ignored. The second, with `disassoc_imminent`, ended in a full
+    SAE + 4-way on the target. At both steers the target AP's hostapd logged
+    `l2_packet_send - send: No such device or address`. Its `0x88b7` (RRB OUI, the PMK-R1
+    pull/response/push frames) packet socket was bound to ifindex -1, which the kernel sets
+    when a bound interface is unregistered: `br-lan` had been recreated under a hostapd that
+    had run for weeks. Until hostapd reopens that socket, the AP can neither pull nor answer a
+    pull, so a cross-AP FT involving it cannot succeed. Check with `/proc/net/packet`: the
+    `88b7` row of hostapd's sockets must carry `br-lan`'s current ifindex.
+  - 2026-10-11, after `/etc/init.d/wpad restart; wifi up` on that AP (its `88b7` socket back on
+    `br-lan`'s ifindex): an FT-SAE laptop (`00-0f-ac-9`) that had associated there after the
+    restart was steered to the other AP's 5 GHz BSS. A plain `bss_tm_req` was declined
+    (status 6, no suitable candidate). With `disassoc_imminent` it accepted (status 0) and the
+    target logged `AP-STA-CONNECTED … auth_alg=ft` with no `EAPOL-4WAY-HS-COMPLETED`: ✅ a
+    clean cross-AP fast transition, keyed with `iapp_key`, with `pmk_r1_push=1` and the
+    3000 TU deadline in place. The log does not say whether the target got the PMK-R1 by push
+    or by pull.
 
 The mobility domain deliberately keeps openUF's own hash, not UniFi's. Stock hostapd can't
 speak the learned-peer RRB messages, so FT between openUF and a real UAP can't work. A shared

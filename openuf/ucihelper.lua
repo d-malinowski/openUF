@@ -1294,6 +1294,17 @@ function M.apply_config(resp, cfg, opts)
 				extra.ieee80211r = "1"
 				extra.mobility_domain = M.derive_mobility_domain(vap.ssid)
 				extra.ft_over_ds = "0"
+				-- UniFi firmware's hostapd template also sets these two
+				-- (firmware-confirmed for 4.0.15). The push hands a
+				-- client's PMK-R1 to each peer key holder right after it
+				-- connects, so its first roam there needs no pull.
+				-- hostapd skips the wildcard r1kh entry when pushing, so
+				-- the push reaches a peer only once it has been learned
+				-- from a pull (kept for rkh_pos_timeout, a day). It is
+				-- written on the key-holder path only (SAE, EAP). The
+				-- deadline is in TU: 3000 instead of OpenWrt's 20000.
+				extra.pmk_r1_push            = "1"
+				extra.reassociation_deadline = "3000"
 				-- ft_psk_generate_local is deliberately NOT set. It used to be
 				-- forced to "1", which silently disabled fast roaming for every
 				-- WPA3 client: local key generation is FT-PSK only (each AP

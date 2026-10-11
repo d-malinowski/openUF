@@ -687,6 +687,10 @@ return {
 					"mobility_domain derived from the ssid")
 				assert_eq(#s.mobility_domain, 4, "mobility_domain is 4 hex chars")
 				assert_eq(s.ft_over_ds, "0", "over-DS disabled by default")
+				-- UniFi firmware's FT template (4.0.15).
+				assert_eq(s.pmk_r1_push, "1", "PMK-R1 push on, as UniFi")
+				assert_eq(s.reassociation_deadline, "3000",
+					"3000 TU deadline, as UniFi (OpenWrt default 20000)")
 				-- Deliberately absent. Forcing it to "1" is FT-PSK-only local
 				-- key generation, and setting it at all stops OpenWrt
 				-- configuring the r0kh/r1kh key holders FT-SAE cannot work
@@ -825,6 +829,10 @@ return {
 					"neither toggle set -- no ieee80211r written")
 				assert_eq(db.wireless.openuf_radio0_corp.mobility_domain, nil,
 					"and no mobility domain")
+				assert_nil(db.wireless.openuf_radio0_corp.pmk_r1_push,
+					"nor the FT push")
+				assert_nil(db.wireless.openuf_radio0_corp.reassociation_deadline,
+					"nor the FT deadline")
 			end)
 		end
 	},

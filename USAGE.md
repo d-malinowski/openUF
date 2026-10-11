@@ -487,7 +487,7 @@ Settings carried through from the controller:
 | Private Pre-Shared Keys | One `wifi-station` section per key (`openuf_<vap>_psk<k>`: `iface` = the VAP's section, `mac` = `00:00:00:00:00:00`, `key`, `vid` unless the key's network is VLAN 1) and one `wifi-vlan` per VLAN (`openuf_<vap>_vlan<vid>`: `name`/`vid` = the VLAN id, `network` = `openuf_vlan<vid>`), plus `dynamic_vlan=1` on the VAP, from `aaa.<n>.wpa.psk_file.<k>.psk`/`.vlanid`. OpenWrt turns them into hostapd's `wpa_psk_file` and `vlan_file`; the client's netdev is `<vap ifname>-<vid>`. The WLAN's own `wpa.psk` (a random passphrase the controller generates) stays the section's `key`. Needs a hostapd with VLAN support (the full `wpad-*` builds have it) and a `lan_cpueth` to build the VLANs on. `psk_radius=2` (keys from RADIUS only) skips the WLAN |
 | WPA-Enterprise (802.1X) | **not supported** — the WLAN is skipped and logged. The wire protocol carries no RADIUS server/port/secret to write, so there is nothing openUF could provision |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
-| Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged. Both keys arrive `disabled` on a WPA3-only WLAN unless openUF advertises `radio_caps2` bit `0x2`, which it does wherever it advertises `0x1`. Key holders: `r0kh`/`r1kh` wildcard lists keyed with `aaa.<n>.iapp_key` (see below) |
+| Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged. Both keys arrive `disabled` on a WPA3-only WLAN unless openUF advertises `radio_caps2` bit `0x2`, which it does wherever it advertises `0x1`. Key holders: `r0kh`/`r1kh` wildcard lists keyed with `aaa.<n>.iapp_key` (see below). Also `pmk_r1_push=1`, `reassociation_deadline=3000`, as UniFi firmware |
 | BSS Transition (802.11v) | `bss_transition` — **needs a full `wpad` build** |
 | 802.11k (per WLAN, `rrm_enabled`, REST only) | `ieee80211k`, `rrm_neighbor_report`, `rrm_beacon_report` = `1` when on; left unset (OpenWrt's default, off) when off. Band Steering and Roaming Assistant force all three on whatever the WLAN says. Neighbor reports list other APs only while usteer runs, since usteer is what fills hostapd's list (`ubus call hostapd.<iface> rrm_nr_list`) |
 | Band Steering | `usteer` config, not a hostapd option. On when any WLAN's Band Steering is on, or the AP's own setting is Prefer 5G |
@@ -559,7 +559,8 @@ shows the width, which was right) and visible only in `iw dev`. An explicit
 
 **Fast Roaming (802.11r) and the `ft_psk_generate_local` trap.** openUF sets
 `ieee80211r`, a `mobility_domain` derived from the SSID (so every AP computes the same one
-with no coordination) and `ft_over_ds=0` — and deliberately does **not** set
+with no coordination), `ft_over_ds=0`, and UniFi firmware's `pmk_r1_push=1` and
+`reassociation_deadline=3000` (OpenWrt: 0 and 20000 TU) — and deliberately does **not** set
 `ft_psk_generate_local`. That option looks harmless and is not:
 
 - It means "derive PMK-R0/R1 locally from the PSK", which only exists for **FT-PSK**. FT-SAE
@@ -593,6 +594,14 @@ logread | grep AP-STA-CONNECTED
 followed by a 4-way handshake is the fallback — the client roamed, it just paid full
 authentication for it. `hostapd_cli -i <vap> sta <mac>` shows the negotiated
 `AKMSuiteSelector`: `00-0f-ac-4` is FT-PSK, `00-0f-ac-9` FT-SAE, `00-0f-ac-8` plain SAE.
+
+If cross-AP roams always fall back to a full handshake and the target logs
+`l2_packet_send - send: No such device or address`, hostapd's FT socket is stale. hostapd
+binds its RRB socket (ethertype `0x88b7`, which carries the PMK-R1 pull and push between APs)
+to `br-lan` once, at start. If `br-lan` is recreated later, that socket stays bound to the
+old bridge. Check `/proc/net/packet`: the `Iface` column of the `88b7` row must show `br-lan`'s current
+ifindex (`cat /sys/class/net/br-lan/ifindex`), not `-1`. Fix it with
+`/etc/init.d/wpad restart; sleep 6; wifi up` (`wifi up` alone does not restart hostapd).
 
 **VLAN-tagged SSIDs** (assigning a WiFi network to a non-native network) need three
 things on the AP, and openUF builds all three:
