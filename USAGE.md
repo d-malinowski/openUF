@@ -616,8 +616,8 @@ authentication for it. `hostapd_cli -i <vap> sta <mac>` shows the negotiated
 If cross-AP roams always fall back to a full handshake and the target logs
 `l2_packet_send - send: No such device or address`, hostapd's FT socket is stale. hostapd
 binds its RRB socket (ethertype `0x88b7`, which carries the PMK-R1 pull and push between APs)
-to `br-lan` once, at start. If `br-lan` is recreated later, that socket stays bound to the
-old bridge. Check `/proc/net/packet`: the `Iface` column of the `88b7` row must show `br-lan`'s current
+to `br-lan` once, at start, and keeps it across wifi reloads. If `br-lan` is replaced after
+that (seen once, on an AP that had run for weeks; a clean reboot did not reproduce it), the socket stays bound to the old bridge. Check `/proc/net/packet`: the `Iface` column of the `88b7` row must show `br-lan`'s current
 ifindex (`cat /sys/class/net/br-lan/ifindex`), not `-1`. Fix it with
 `/etc/init.d/wpad restart; sleep 6; wifi up` (`wifi up` alone does not restart hostapd).
 

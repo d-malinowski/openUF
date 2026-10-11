@@ -2292,10 +2292,20 @@ use the controller's key. Without a key, the md5 fallback still applies.
     SAE + 4-way on the target. At both steers the target AP's hostapd logged
     `l2_packet_send - send: No such device or address`. Its `0x88b7` (RRB OUI, the PMK-R1
     pull/response/push frames) packet socket was bound to ifindex -1, which the kernel sets
-    when a bound interface is unregistered: `br-lan` had been recreated under a hostapd that
-    had run for weeks. Until hostapd reopens that socket, the AP can neither pull nor answer a
-    pull, so a cross-AP FT involving it cannot succeed. Check with `/proc/net/packet`: the
-    `88b7` row of hostapd's sockets must carry `br-lan`'s current ifindex.
+    when a bound interface is unregistered. The same hostapd's other packet sockets were on
+    `br-lan`'s current ifindex (17), and that ifindex is unchanged since early boot: a later
+    recreation would have drawn a far higher one, as the VAPs (48-50) and `br-openuf10` (43)
+    did. So `br-lan` was not recreated during the 39 days of uptime. hostapd had started
+    10.9 s after boot, and it shares one `0x88b7` socket per `ft_iface` name, freeing it only
+    when no BSS uses it any more. Its other sockets are reopened on each BSS reconfiguration.
+    The likely cause was a boot-time race: the socket was opened on a `br-lan` that netifd
+    replaced during that same boot, and no reload ever released it. A clean reboot of that AP
+    (2026-10-11) did not reproduce it: `br-lan` came up as ifindex 7, hostapd's `0x88b7` socket
+    was on 7 from the start and stayed there for the four minutes sampled while openUF started.
+    The earlier boot had given `br-lan` ifindex 17, so ten interfaces were created before it
+    then. What that boot did differently is not known. Until hostapd reopens that socket, the AP can neither pull nor
+    answer a pull, so a cross-AP FT involving it cannot succeed. Check with
+    `/proc/net/packet`: the `88b7` row of hostapd's sockets must carry `br-lan`'s current ifindex.
   - 2026-10-11, after `/etc/init.d/wpad restart; wifi up` on that AP (its `88b7` socket back on
     `br-lan`'s ifindex): an FT-SAE laptop (`00-0f-ac-9`) that had associated there after the
     restart was steered to the other AP's 5 GHz BSS. A plain `bss_tm_req` was declined
