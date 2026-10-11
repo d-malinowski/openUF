@@ -2652,6 +2652,18 @@ return {
 		end
 	},
 	{
+		name = "inform packet: setdefault keeps the inform URL that reached the controller",
+		fn = function()
+			-- The default names the controller by host name, and an L3
+			-- re-adoption over it fails (HTTP 400, "invalid inform_ip").
+			local st = sample_state({adopted = true, inform_url = "http://192.0.2.1:8080/inform"})
+			inform.handle_response('{"_type":"setdefault"}', st)
+			assert_false(st.adopted, "reset")
+			assert_eq(st.inform_url, "http://192.0.2.1:8080/inform", "kept in memory")
+			assert_eq(inform._state.load().inform_url, "http://192.0.2.1:8080/inform", "and on disk")
+		end
+	},
+	{
 		name = "inform packet: handle_response setdefault unlocks bootstrap account when configured",
 		fn = function()
 			local st = sample_state({adopted = true})
@@ -4433,6 +4445,104 @@ return {
 			assert_eq(interval_kept, 300, "a reload that stays adopted keeps it")
 			assert_true(deny_after_setdefault, "the block ledger is gone: hostapd's deny lists get cleaned")
 			assert_true(deny_after_reset, "on both paths")
+		end
+	},
+	{
+		name = "inform: Forget puts UCI back the way it was before the controller's push",
+		fn = function()
+			-- UniFi firmware answers setdefault with a factory reset (no SSID,
+			-- no VLAN); openUF undoes its own writes instead of rebooting.
+			local ucihelper, db = new_apply_env()
+			local c = ucihelper._uci.cursor()
+			c:set("wireless", "radio0", "channel", "6")
+			-- The user's own SSID, which use_only_unifi_wlan switches off.
+			c:set("wireless", "default_radio0", "wifi-iface")
+			c:set("wireless", "default_radio0", "device", "radio0")
+			c:set("wireless", "default_radio0", "ssid", "Mine")
+			-- A hand-tuned rate on a radio openUF never rate-managed.
+			c:set("wireless", "radio1", "basic_rate", {"6000"})
+			c:set("network", "lan", "interface")
+			c:set("network", "lan", "device", "br-lan")
+			local function dump(t)
+				local out = {}
+				for cfgname, secs in pairs(t) do
+					for name, sec in pairs(secs) do
+						for k, v in pairs(sec) do
+							if type(v) == "table" then v = table.concat(v, ",") end
+							out[#out + 1] = cfgname .. "." .. name .. "." .. k .. "=" .. tostring(v)
+						end
+					end
+				end
+				table.sort(out)
+				return table.concat(out, "\n")
+			end
+			local before = dump(db)
+
+			local cmds = {}
+			ucihelper._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return true end
+			local rt, vt = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.channel=6\n"
+				.. "stamgr.1.status=true\nstamgr.1.radio=ng\n"
+				.. "stamgr.1.minrssi.status=true\nstamgr.1.minrssi.rssi=15\n"
+				.. "stamgr.1.loadbalance.status=true\nstamgr.1.loadbalance.maxsta=3\n"
+				.. "aaa.1.ssid=IoT\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.1.br.devname=br0.20\n"
+				.. "wireless.1.ssid=IoT\nwireless.1.parent=radio0\n"
+				.. "wireless.1.minrate_data=12000\nwireless.1.minrate_cck_rates.status=false\n")
+			ucihelper.apply_config({radio_table = rt, vap_table = vt},
+				{net = {lan_cpueth = "eth0"}, config = {use_only_unifi_wlan = true}})
+			assert_eq(db.wireless.default_radio0.disabled, "1", "push: the user's SSID is off")
+			assert_eq(db.wireless.radio0.openuf_rates, "1", "push: rates managed")
+			assert_eq(db.wireless.radio0.loadbalance_maxsta, "3", "push: load balance cap")
+			assert_not_nil(db.network.openuf_vlan20, "push: the VLAN 20 network")
+
+			cmds = {}
+			ucihelper.forget()
+			-- set_wlan_exclusive leaves its stamp at "0", which is how it
+			-- marks a section it switched back on.
+			assert_eq(db.wireless.default_radio0.disabled, "0", "the user's SSID is back on")
+			db.wireless.default_radio0.disabled = nil
+			db.wireless.default_radio0.openuf_autodisabled = nil
+			assert_eq(dump(db), before, "every other write is undone, hand-made options kept")
+			assert_eq(table.concat(cmds, "|"),
+				"/etc/init.d/network reload 2>/dev/null|wifi reload", "network, then wireless")
+		end
+	},
+	{
+		name = "inform: Forget tears down per-port VLANs, steering and the LED from the pre-reset state",
+		fn = function()
+			local orig = {sv = inform._switchvlan, us = inform._usteer, uh = inform._ucihelper,
+				led = inform._led, fw = inform._firewall, mtime = inform._state_mtime,
+				load = inform._state.load, stderr = io.stderr}
+			io.stderr = {write = function() end}
+			local restored, steer, forgot, leds = {}, {}, 0, {}
+			inform._switchvlan = {restore = function(st) restored[#restored + 1] = st.dsa_brlan_ports end}
+			inform._usteer = {set_enabled = function(on, _, ra) steer[#steer + 1] = tostring(on) .. tostring(ra) end}
+			inform._ucihelper = {forget = function() forgot = forgot + 1 end}
+			inform._led = {set_enabled = function(_, on) leds[#leds + 1] = on end}
+			inform._firewall = {reconcile = function() end}
+			local ledger = {lan = "lan1 lan2"}
+			local ok, err = pcall(inform.handle_response, '{"_type":"setdefault"}',
+				sample_state({adopted = true, dsa_brlan_ports = ledger, led_enabled = false}),
+				{config = {}})
+			inform._state_mtime = function() return "reset" end
+			inform._state.load = function() return {adopted = false} end
+			local ok2, err2 = pcall(inform._reload_if_changed,
+				sample_state({adopted = true, dsa_brlan_ports = ledger, led_enabled = true}),
+				{config = {}}, "before")
+			inform._switchvlan, inform._usteer, inform._ucihelper, inform._led, inform._firewall,
+				inform._state_mtime, inform._state.load, io.stderr =
+				orig.sv, orig.us, orig.uh, orig.led, orig.fw, orig.mtime, orig.load, orig.stderr
+			inform._controller_interval = nil
+			assert_true(ok, tostring(err))
+			assert_true(ok2, tostring(err2))
+			assert_eq(#restored, 2, "per-port VLAN restored on both paths")
+			assert_eq(restored[1], ledger, "from the ledger the reset cleared (setdefault)")
+			assert_eq(restored[2], ledger, "and on reset-inform")
+			assert_eq(table.concat(steer, ","), "falsefalse,falsefalse", "band steering and roaming assistant off")
+			assert_eq(forgot, 2, "the WLANs are torn down on both paths")
+			assert_eq(#leds, 1, "only the LED the controller switched off comes back on")
+			assert_true(leds[1], "on")
 		end
 	},
 	{

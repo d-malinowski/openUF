@@ -3691,14 +3691,27 @@ function M.handle_response(json_str, st, cfg)
 		-- _populate_net_info and never persisted to state.json -- preserve them
 		-- across the reset rather than losing the device's identity mid-run.
 		local mac, ip, hostname = st.mac, st.ip, st.hostname
+		local prev = {}
+		for k, v in pairs(st) do prev[k] = v end
 		local fresh = M._state.reset()
 		for k in pairs(st) do st[k] = nil end
 		for k, v in pairs(fresh) do st[k] = v end
 		st.mac, st.ip, st.hostname = mac, ip, hostname
+		-- The URL that just reached this controller stays, so the device shows
+		-- up there as pending and can be adopted again. The default it would
+		-- fall back to (conf.lua's, `http://unifi:8080/inform` out of the box)
+		-- names the controller by host name, and an L3 adoption over it fails:
+		-- the controller answers HTTP 400 ("invalid inform_ip unifi"), seen on
+		-- a UCG Ultra and in the lab, 2026-10-11. A reset-inform still starts
+		-- over from the default; it is the explicit way to point elsewhere.
+		if prev.inform_url and prev.inform_url ~= "" then
+			st.inform_url = prev.inform_url
+			M._state.save(st)
+		end
 		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 		M._firewall.reconcile(st.blocked_stas)
 		M._deny_pending = true
-		M._forget_controller()
+		M._forget_controller(prev, cfg)
 		return false
 	end
 
@@ -4599,24 +4612,6 @@ function M._populate_net_info(st, cfg)
 	if hostname then st.hostname = hostname end
 end
 
--- Detects an out-of-process change to the on-disk state file -- written by
--- syswrapper.lua's set-adopt/reset-inform, invoked over SSH as a separate,
--- short-lived process -- and reloads it into the in-memory st table this
--- loop uses. Without this, a long-running inform.lua would never notice a
--- fresh SSH-driven adoption (or a manual reset-inform) and would keep
--- informing with stale credentials until restarted. Also keeps the SSH
--- bootstrap account (if enabled) locked/unlocked to match the reloaded
--- adopted state. Returns the current mtime (unchanged from last_mtime if
--- the file didn't change).
--- What a controller left behind outside state.json, torn down when the
--- device stops being adopted -- a `setdefault` (controller "Forget") or an
--- out-of-process `syswrapper.sh reset-inform`. The l2guard table is kernel
--- state that st.l2guard no longer describes once the reset cleared it; the
--- nightly 11k-scan cron job would keep scanning every radio on behalf of a
--- controller that no longer manages the device; and a long noop interval
--- would slow re-adoption to one attempt per interval. The pushed timezone and
--- NTP servers stay: they are sane settings for the board either way, and
--- their originals remain stamped in UCI (USAGE § 6).
 -- Airtime Fairness is debugfs state, back at the kernel's default (on) after
 -- every reboot, and the controller does not push it again (cfgversion
 -- matches). Reapplied at startup from state.json; nil means never pushed, and
@@ -4627,14 +4622,50 @@ function M._reapply_airtime(st)
 	return true
 end
 
-function M._forget_controller()
+-- What a controller left behind outside state.json, torn down when the
+-- device stops being adopted -- a `setdefault` (controller "Forget") or an
+-- out-of-process `syswrapper.sh reset-inform`. UniFi firmware answers
+-- setdefault with a factory reset and reboot (`syswrapper.sh
+-- restore-default`, firmware-confirmed for 4.0.15), so a forgotten UAP comes
+-- back with no SSID and no VLAN. This reaches the same end state without the
+-- reboot: the WLANs, VLAN bridges and radio extras (ucihelper.forget), the
+-- per-port VLANs, band steering, the l2guard and guest portal rules, the
+-- nightly 11k-scan cron job, Airtime Fairness and a switched-off LED. A long
+-- noop interval would also slow re-adoption to one attempt per interval.
+--
+-- prev is the state from BEFORE the reset: the per-port VLAN ledger
+-- (swvlan_backup, dsa_brlan_ports) and led_enabled live only there, and the
+-- reset has already cleared them from st by the time this runs.
+--
+-- Kept: the pushed timezone and NTP servers (sane for the board either way,
+-- originals stamped in UCI, USAGE § 6), the radios' channel, width, power and
+-- country (see ucihelper.forget), and the management address, which a
+-- reset to DHCP could take off the network.
+function M._forget_controller(prev, cfg)
+	prev = prev or {}
 	M._controller_interval = nil
+	if M._switchvlan then pcall(M._switchvlan.restore, prev, cfg) end
+	if M._usteer then pcall(M._usteer.set_enabled, false, cfg, false) end
+	if M._ucihelper and M._ucihelper.forget then pcall(M._ucihelper.forget) end
 	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
 	if M._guestportal then pcall(M._guest_enforce, {}) end
 	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end
 	-- A controller that switched Airtime Fairness off no longer does.
 	if M._airtime then pcall(M._airtime.set_enabled, true) end
+	if prev.led_enabled == false and M._led then
+		pcall(M._led.set_enabled, cfg and cfg.led, true)
+	end
 end
+
+-- Detects an out-of-process change to the on-disk state file -- written by
+-- syswrapper.lua's set-adopt/reset-inform, invoked over SSH as a separate,
+-- short-lived process -- and reloads it into the in-memory st table this
+-- loop uses. Without this, a long-running inform.lua would never notice a
+-- fresh SSH-driven adoption (or a manual reset-inform) and would keep
+-- informing with stale credentials until restarted. Also keeps the SSH
+-- bootstrap account (if enabled) locked/unlocked to match the reloaded
+-- adopted state. Returns the current mtime (unchanged from last_mtime if
+-- the file didn't change).
 
 function M._reload_if_changed(st, cfg, last_mtime)
 	local mtime = M._state_mtime(M._state._state_file)
@@ -4642,6 +4673,8 @@ function M._reload_if_changed(st, cfg, last_mtime)
 		return last_mtime
 	end
 	local was_adopted = st.adopted
+	local prev = {}
+	for k, v in pairs(st) do prev[k] = v end
 	-- mac/ip/hostname are populated once at M.run() startup and never
 	-- persisted to state.json -- preserve them across the reload.
 	local mac, ip, hostname = st.mac, st.ip, st.hostname
@@ -4652,7 +4685,7 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	M._firewall.reconcile(st.blocked_stas)
 	M._deny_pending = true
-	if was_adopted and not st.adopted then M._forget_controller() end
+	if was_adopted and not st.adopted then M._forget_controller(prev, cfg) end
 	return mtime
 end
 

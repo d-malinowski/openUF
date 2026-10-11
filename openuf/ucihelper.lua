@@ -1668,6 +1668,62 @@ function M.apply_config(resp, cfg, opts)
 	reconcile_runtime(entries)
 end
 
+-- Radio options only openUF writes, deleted outright on Forget, and the
+-- stamped ones rf_config writes only under its openuf_minrssi/openuf_rates
+-- markers, deleted only where the marker is.
+local FORGET_RADIO_OPTS  = {"minrssi_enabled", "minrssi_rssi", "loadbalance_maxsta"}
+local FORGET_RADIO_STAMP = {
+	openuf_minrssi = {"rssi_reject_assoc_rssi", "rssi_ignore_probe_request"},
+	openuf_rates   = {"basic_rate", "supported_rates", "legacy_rates", "beacon_rate"},
+}
+
+-- Undo what apply_config wrote, for a controller "Forget" (setdefault) or a
+-- reset-inform. UniFi firmware answers setdefault with `syswrapper.sh
+-- restore-default`, a factory reset and reboot that leaves no SSID on the air
+-- (firmware-confirmed for 4.0.15); this is the same end state without the
+-- reboot, limited to what openUF itself put there:
+--   * every openuf_ wifi-iface, with its private-key sections (wlan_clear)
+--   * every openuf_ VLAN network and bridge (prune_vlan_networks)
+--   * the radio options above
+--   * the user's own SSIDs that use_only_unifi_wlan switched off come back
+--     on, since no controller SSID is left to stand in for them
+--   * the Multicast and Broadcast Blocker's ruleset
+-- A radio's channel, width, transmit power, country and enable stay as the
+-- controller last set them: rf_config overwrites those without keeping the
+-- original, and they are valid settings for the board either way.
+function M.forget()
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local radios = {}
+	cursor:foreach("wireless", "wifi-device", function(s)
+		radios[#radios + 1] = s
+	end)
+	for _, s in ipairs(radios) do
+		local name = s[".name"]
+		for _, opt in ipairs(FORGET_RADIO_OPTS) do
+			if s[opt] ~= nil then cursor:delete("wireless", name, opt) end
+		end
+		for stamp, opts in pairs(FORGET_RADIO_STAMP) do
+			if s[stamp] == "1" then
+				for _, opt in ipairs(opts) do cursor:delete("wireless", name, opt) end
+				cursor:delete("wireless", name, stamp)
+			end
+		end
+	end
+	cursor:commit("wireless")
+	M.wlan_clear()
+	M.prune_vlan_networks({})
+	M.set_wlan_exclusive(false)
+	if M._network_dirty then
+		M._run_cmd("/etc/init.d/network reload 2>/dev/null")
+		M._network_dirty = false
+	end
+	M._run_cmd("wifi reload")
+	M._ws_cache   = nil
+	M._pass_cache = nil
+	reconcile_runtime({})
+end
+
 -- Reapply the Multicast and Broadcast Blocker from UCI.
 --
 -- It is an nftables ruleset: LIVE KERNEL STATE that a reboot discards, with no

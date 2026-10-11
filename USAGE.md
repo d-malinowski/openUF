@@ -464,6 +464,24 @@ To reset to factory defaults:
 syswrapper.sh reset-inform
 ```
 
+A reset, or the controller's **Forget** (`setdefault`), also removes what the controller set up.
+UniFi firmware erases its config and reboots. openUF undoes its own writes without the reboot:
+- all `openuf_` wifi-iface and VLAN network sections, then `wifi reload`
+- `minrssi_*`, `loadbalance_maxsta` and the stamped rate options on each `wifi-device`
+- per-port VLANs, band steering, l2guard, the guest portal and the 11k-scan cron job
+- Airtime Fairness and the LED are turned back on
+- your own SSIDs that `use_only_unifi_wlan` disabled are switched back on
+
+What stays: timezone and NTP (§ 6), each radio's channel, width, power and country, the
+management address, and, after a Forget, the inform URL. A forgotten device keeps informing the same
+controller and shows up there ready to adopt. A `reset-inform` goes back to conf.lua's
+`inform_url`. If that names the controller by host name (the shipped `http://unifi:8080/inform`),
+an L3 adoption fails with HTTP 400 (`invalid inform_ip`), so run
+`syswrapper.sh set-inform http://<controller IP>:8080/inform` first.
+
+Forget also deletes the device record on the controller. After re-adopting, set its name,
+channels, channel width, port VLANs and LED again.
+
 ---
 
 ## 6. WiFi provisioning
