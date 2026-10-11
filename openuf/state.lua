@@ -133,6 +133,9 @@ M.FIELDS = {
 	-- The guest VAP ifnames selfrun_guest_mode=off took down, until they
 	-- are brought back up (also after a restart in between).
 	guest_vaps_down           = "table",
+	-- The VAP ifnames a WiFi Blackout Schedule took down (wlansched.lua),
+	-- likewise until they are brought back up.
+	sched_vaps_down           = "table",
 	-- Reported as guest_token while the portal is on (32 hex).
 	guest_token               = "string",
 }

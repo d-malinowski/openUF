@@ -69,6 +69,7 @@ local guestportal = _require_sibling("guestportal")
 local satisfaction = _require_sibling("satisfaction")
 local minrssi   = _require_sibling("minrssi")
 local loadbalance = _require_sibling("loadbalance")
+local wlansched = _require_sibling("wlansched")
 local stun      = _require_sibling("stun")
 
 local M = {}
@@ -92,6 +93,7 @@ M._rrmscan    = rrmscan
 M._roamassist = roamassist
 M._minrssi    = minrssi
 M._loadbalance = loadbalance
+M._wlansched  = wlansched
 M._airtime    = airtime
 M._sysconf    = sysconf
 M._l2guard    = l2guard
@@ -1830,7 +1832,15 @@ function M.build_json(st, cfg, ufhw)
 		-- "Capability bitmasks" for the full derivation (traced through
 		-- an obfuscation-induced macOS case-folding extraction bug along
 		-- the way).
-		fw_caps          = 0x110,
+		-- Bit 0x1000 (4096): supportMultiBlockWlanSchedule(). A WiFi
+		-- Blackout Schedule with several on-blocks in one day then goes
+		-- out as schedule_<day>.<i>, one key per block; without it every
+		-- block shares the bare schedule_<day> key and only the last one
+		-- survives the parse (lab capture, 10.4.57). The schedule itself is
+		-- wlansched.lua. 0x400000 (schedule_invert) stays unclaimed: the
+		-- controller then inverts the blackout windows into on-times
+		-- itself, the form the 4.0.15 firmware reads.
+		fw_caps          = 0x1110,
 		-- wifi_caps, the first WiFi bitmask. Bit 0x4 is
 		-- Device.supportBandsteering(): without it the controller never emits
 		-- the device-level bandsteering.* block (the AP's own Band Steering
@@ -2746,6 +2756,10 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- 2026-07-19. The VAP is still provisioned when disabled,
 					-- just with disabled=1, so its config survives a re-enable.
 					disabled              = _wire_status_disabled(w.status),
+					-- wireless.<n>.schedule_enabled + schedule_<day>[.<i>]:
+					-- the "WiFi Blackout Schedule", as the firmware's
+					-- schedule lines (wlansched.lua). false: no schedule.
+					schedule_lines        = wlansched.lines(w) or false,
 			}
 		end
 	end
@@ -3195,6 +3209,8 @@ function M.handle_response(json_str, st, cfg)
 	if not ok or type(resp) ~= "table" then
 		return false
 	end
+	-- Every answer carries the controller's clock (WiFi Blackout Schedule).
+	pcall(M._note_server_time, resp)
 
 	local _type = resp._type
 
@@ -4074,7 +4090,14 @@ function M._guest_selfrun(st, contacted)
 			.. "selfrun_guest_mode=off -- guest WLANs down (" .. table.concat(names, " ") .. ")\n")
 		changed = true
 	elseif mode ~= "off" and st.guest_vaps_down then
-		pcall(M._guestportal.set_vaps_up, st.guest_vaps_down, true)
+		-- A WLAN its blackout schedule holds down stays down
+		-- (_sched_resync brings it up when the schedule ends).
+		local held, up = {}, {}
+		for _, n in ipairs(st.sched_vaps_down or {}) do held[n] = true end
+		for _, n in ipairs(st.guest_vaps_down) do
+			if not held[n] then up[#up + 1] = n end
+		end
+		pcall(M._guestportal.set_vaps_up, up, true)
 		io.stderr:write("guestportal: guest WLANs back up ("
 			.. table.concat(st.guest_vaps_down, " ") .. ")\n")
 		st.guest_vaps_down = nil
@@ -4092,6 +4115,70 @@ function M._guest_selfrun(st, contacted)
 		changed = true
 	end
 	return changed
+end
+
+-- WiFi Blackout Schedule (wlansched.lua): each heartbeat, every scheduled
+-- WLAN outside its schedule's on-times is taken down, as the firmware's
+-- configure_vap does with ifconfig, and brought back up when they start
+-- again. hostapd stops and restarts that BSS alone when its netdev goes
+-- down and up. The ifnames taken down are kept in st.sched_vaps_down, so
+-- a restart in between still brings them up. Nothing is done before the
+-- clock is known to be right (_clock_trusted): the firmware keeps every
+-- VAP up until NTP has set the time, and after a boot every VAP starts up.
+function M._sched_resync(st)
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.schedule_vaps) then return false end
+	if not M._clock_trusted() then return false end
+	local ok, vaps = pcall(ufuci.schedule_vaps)
+	if not ok or type(vaps) ~= "table" then return false end
+	if #vaps == 0 and not st.sched_vaps_down then return false end
+	local t = os.date("*t", M._time())
+	local down = M._wlansched.down_set(vaps, t.wday - 1, t.hour * 60 + t.min)
+	local keep = {}
+	for _, n in ipairs(st.guest_vaps_down or {}) do keep[n] = true end
+	local held, changed = M._wlansched.reconcile(down, st.sched_vaps_down, keep)
+	if #changed.down > 0 then
+		io.stderr:write("wlansched: outside the WLAN schedule -- down: "
+			.. table.concat(changed.down, " ") .. "\n")
+	end
+	if #changed.up > 0 then
+		io.stderr:write("wlansched: inside the WLAN schedule again -- up: "
+			.. table.concat(changed.up, " ") .. "\n")
+	end
+	if #held == 0 then held = nil end
+	local before = table.concat(st.sched_vaps_down or {}, " ")
+	if before ~= table.concat(held or {}, " ") then
+		st.sched_vaps_down = held
+		M._state.save(st)
+	end
+	return #changed.down > 0 or #changed.up > 0
+end
+
+-- The firmware's /var/run/ntp.ready, which its ntpclient writes once it has
+-- set the clock. OpenWrt's ntpd leaves no such mark, so openUF writes its
+-- own once a controller answer's server_time_in_utc agrees with the local
+-- clock. Under /var/run like the firmware's: it outlives a restart of
+-- openUF, not a reboot.
+M.CLOCK_OK_FILE = "/var/run/openuf.clock-ok"
+M.CLOCK_MAX_SKEW = 60
+M._clock_ok = false
+function M._clock_trusted()
+	if M._clock_ok then return true end
+	M._clock_ok = M._read_file(M.CLOCK_OK_FILE) ~= nil
+	return M._clock_ok
+end
+function M._note_server_time(resp)
+	if M._clock_ok or type(resp) ~= "table" then return end
+	local ms = tonumber(resp.server_time_in_utc)
+	if not ms then return end
+	if math.abs(M._time() - ms / 1000) <= M.CLOCK_MAX_SKEW then
+		M._clock_ok = true
+		M._touch(M.CLOCK_OK_FILE)
+	end
+end
+M._touch = function(path)
+	local f = io.open(path, "w")
+	if f then f:close() end
 end
 
 -- The guest's SSID for the portal's ssid=: the only one, or the VAP that
@@ -5045,6 +5132,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._hairpin_resync)
 	pcall(M._usteer_filter_resync)
 	pcall(M._block_resync, st)
+	pcall(M._sched_resync, st)
 
 	-- Reported as spectrum_scanning = true by this inform; swept below.
 	local spectrum_due = M._spectrum_pending

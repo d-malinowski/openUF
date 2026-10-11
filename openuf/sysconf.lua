@@ -66,6 +66,13 @@ M.CRON_COMMANDS = {
 	["syswrapper.sh 11k-scan"] = "/usr/bin/syswrapper.sh 11k-scan",
 }
 
+-- Wire commands openUF's inform loop already does on its own, so they need
+-- no crontab line: the WiFi Blackout Schedule's re-check (wlansched.lua),
+-- done on every heartbeat.
+M.CRON_IN_DAEMON = {
+	["syswrapper.sh schedule-action"] = true,
+}
+
 local function get_uci()
 	if M._uci then return M._uci end
 	return require("uci")
@@ -317,7 +324,9 @@ function M.apply_cron(cron)
 		for _, job in ipairs(cron.jobs or {}) do
 			if job.enabled ~= false then
 				local runs = M.CRON_COMMANDS[job.cmd]
-				if not runs then
+				if M.CRON_IN_DAEMON[job.cmd] then
+					-- Nothing to install.
+				elseif not runs then
 					io.stderr:write("sysconf: cron job not installed -- not a command this build provides: "
 						.. ("%q"):format(tostring(job.cmd)) .. "\n")
 				elseif not M.is_valid_schedule(job.schedule) then

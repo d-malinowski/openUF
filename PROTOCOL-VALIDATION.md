@@ -1370,6 +1370,119 @@ it, 0 `handle_response` failures. Hardware (2026-10-10): deployed to both APs; `
 cap of 1 per radio picked 2 of 3 and 12 of 14, and kicked nothing. Not observed: a real
 kick, as no radio at home has a cap set.
 
+### `wireless.<n>.schedule_*` — WiFi Blackout Schedule
+
+The WLAN's `schedule_with_duration` (REST `rest/wlanconf`): a list of
+`{name, start_days_of_week, start_hour, start_minute, duration_minutes}`. The 10.6 UI calls
+it "WiFi Blackout Schedule": the windows in which the WLAN is turned off. The 10.4 and 10.6
+generators (`com.ubnt.service.config`, same code in both) emit it per VAP whenever the list
+is non-empty (`isScheduleEnabled()` is `hasScheduleWithDuration()`), with no capability
+gate. A window is cut at midnight into per-day blocks (`HHmm`, the end as start +
+duration) and overlapping blocks of a day are merged. Then:
+
+- **`fw_caps` `0x400000` (`supportWlanScheduleInvert`)** set: the blackout blocks go out
+  as they are, plus `schedule_invert=enabled`. Clear (openUF): the controller inverts them
+  into the times the WLAN is ON. A day with no blackout gets `0000-2359`. A day blacked
+  out entirely gets no key at all. The inverter emits a block twice when a day's last
+  blackout runs to midnight (harmless).
+- **`fw_caps` `0x1000` (`supportMultiBlockWlanSchedule`)** set (openUF): one key per block,
+  `schedule_<day>.<i>`. Clear: every block of a day is written to the same bare
+  `schedule_<day>`, so a key=value parser keeps only one.
+
+`schedule_enabled` is `enabled` with a schedule and `disabled` without. The same push
+carries a cron job, `cron.1.job.<n>.schedule=1-59/5 * * * *` with
+`cmd=syswrapper.sh schedule-action`. Lab (10.4.57, 2026-10-10): blackout 22:00 for 540 min
+Mon to Fri, 13:00 for 60 and 15:30 for 30 on Saturday, with `fw_caps` `0x1110`:
+
+```
+wireless.1.schedule_enabled=enabled
+wireless.1.schedule_sun.0=0000-2359
+wireless.1.schedule_mon.0=0000-2200
+wireless.1.schedule_mon.1=0000-2200
+wireless.1.schedule_tue.0=0700-2200
+wireless.1.schedule_tue.1=0700-2200
+...                                   (wed, thu, fri as tue)
+wireless.1.schedule_sat.0=0700-1300
+wireless.1.schedule_sat.1=1400-1530
+wireless.1.schedule_sat.2=1600-2359
+```
+
+With `fw_caps` `0x110` the same schedule came out as `schedule_sat=` three times. A blackout
+covering every whole day came out as `schedule_enabled=enabled` with no day key. Clearing
+the list left `schedule_enabled=disabled` and nothing else.
+
+**What the AP does with it (firmware-confirmed for 4.0.15, 2026-10-11).** `ubntbox`'s
+`do_schedule` runs for every `wireless.<n>` and writes `/var/run/schedules/schedule.<ath>`.
+If `schedule_enabled` is off (`get_bool`), it writes `d=00:00-23:59` for d = 0 to 6. If it
+is on, then for each day (`sun` to `sat`, d = 0 to 6, `date +%w`) it reads the bare key,
+else `.0`, then `.1` up to `.98`, stopping at the first missing one. It
+`sscanf("%2d%2d-%2d%2d")`s each value into `d=HH:MM-HH:MM`, and writes `d=00:01-00:00`,
+which never matches, for a day with no key. The firmware has no `schedule_invert` string.
+`syswrapper.sh`'s `configure_vap` then decides each user or guest VAP:
+`within_schedule` is true if the current minute is in one of today's blocks, with both ends
+included (`-ge from`, `-le to`), and false otherwise. The VAP goes up if true and is
+`ifconfig`'d down if false. Before `ntpclient` has set the clock (`/var/run/ntp.ready`),
+`within_schedule` is always true. `configure_vap` runs on every config apply, from the
+5-minute cron (`schedule-action`), and when br0 comes up once the clock reads past 2017.
+(A selfrun guest VAP with `selfrun_guest_mode=off` is down regardless.)
+
+**openUF (2026-10-11):** claims `fw_caps` `0x1000`, not `0x400000`, so it gets the
+firmware's form. The parser turns a VAP's keys into the firmware's lines
+(`wlansched.lines`, same rules and limits), and `apply_config` stores them on the
+`wifi-iface` as the openUF-only option `openuf_schedule`. The option is absent when there
+is no schedule, and `wlan_clear` drops it with the section. On every heartbeat,
+`_sched_resync` reads them back (`ucihelper.schedule_vaps`: enabled openUF VAPs, their BSS
+netdevs including an OWE transition's open BSS, not a PPSK VLAN netdev) and takes down a
+BSS outside its on-times with `ip link set <bss> down`. A ledger, `st.sched_vaps_down` in
+state.json, brings it back up when the on-time starts, the schedule is removed or the WLAN
+goes away, also across a restart: `ip link set <bss> up`, then `hostapd_cli -i <bss> raw
+STOP_AP` and `update_beacon` to start that BSS's beacon again (see the hardware result
+below). If the beacon does not start, the link goes down again and the next heartbeat
+retries. A BSS that a wifi reload
+recreated up is taken down again on the next heartbeat. A guest BSS that
+`selfrun_guest_mode=off` holds down is not brought up by the schedule, and selfrun's
+return does not bring up one the schedule holds. The `schedule-action` cron job is not
+installed (`sysconf.CRON_IN_DAEMON`): the heartbeat does that check, so a WLAN changes
+within one heartbeat instead of at the next 5-minute mark. OpenWrt's ntpd leaves no
+`ntp.ready`. openUF instead writes `/var/run/openuf.clock-ok` once a controller answer's
+`server_time_in_utc` is within 60 s of the local clock. Until then `_sched_resync` changes
+nothing (after a boot every BSS starts up, the firmware's "always up").
+
+By its source, upstream hostapd (`driver_nl80211.c` / `drv_callbacks.c`) handles a BSS
+netdev's link going down per BSS (`bss->ctx`): it frees that BSS's stations and, on up,
+restarts its beacon (`reenable_beacon`). OpenWrt 25.12's hostapd did not (hardware, below).
+netifd keeps a bridge member that went down in the bridge (`bridge.c`:
+`DEV_EVENT_LINK_DOWN` acts only with `auth`).
+
+Lab (10.4.57): the pushes above were stored and removed, 0 `handle_response` failures, and
+the clock mark was written. The lab has no radios, so nothing was taken down there.
+Hardware (2026-10-11, the real UCG Ultra on 10.6, both APs, a temporary WLAN
+`openuf-sched-test` on both bands, deleted afterwards). The push had the lab's form
+(`wireless.4.schedule_sun.0=0000-0818`, `.1=0826-2359`, the other days `0000-2359`; the
+`schedule-action` job next to `11k-scan`). It was stored on both radios of both APs, and no
+crontab line was added. First window (blackout 08:18 for 8 min): the four test BSSes (ath10k
+and ath9k on the Archer C5, mt76 on both AX3000T radios) went down at 08:19:12 to 08:19:17
+and their links came back at 08:26. Home LAN, Home IoT and their clients stayed as they
+were. **But the BSSes came back without a beacon.** `iw dev <bss> info` showed no SSID or
+channel, the bridge port stayed disabled, and hostapd logged "Failed to set beacon
+parameters": it still treated the beacon as set and only updated it, which mac80211 refuses
+once the netdev going down has stopped the AP. `hostapd_cli raw STOP_AP` (which clears
+hostapd's beacon-set flag) and then `update_beacon` (now a `START_AP`) put each one back on
+the air. That step is now part of the bring-up. Second window (08:44 for 4 min, fixed code):
+down at 08:45:02 (.3) and 08:45:04 (.4), back at 08:48:11 on both with SSID, channel and a
+forwarding bridge port on all three drivers. The other SSIDs and their clients were
+untouched.
+
+The trade: while a BSS is down, hostapd logs "Failed to set beacon parameters" about every
+6 s for each downed BSS. usteer calls `rrm_nr_set` on every BSS (`ubus monitor`: 130 calls
+in 13 s across the BSSes), and hostapd rebuilds that BSS's beacon each time.
+`ieee802_11_update_beacons` checks `beacon_set_done && started`, not the link. It is
+harmless, but a long blackout pushes older lines out of logread's ring (128 KB here). The
+per-BSS alternative, dropping the BSS from hostapd's config through netifd
+(`disabled` + `wifi reload`), restarts the whole radio when the WLAN is the radio's first
+BSS, which is worse. Not observed: a client on a WLAN as its blackout starts (the test WLAN
+had none). The firmware does the same `ifconfig down` there.
+
 ### `wireless.<n>.btm_disassoc.*` — Roaming Assistant
 
 A per-WLAN, per-band setting (Settings → WiFi → *WLAN* → Advanced; REST
@@ -2088,7 +2201,7 @@ Everything openUF sends. Names were audited against the controller's own Device 
 | **`system-stats`** | Hyphenated key, `{cpu, mem, uptime}` — all three **strings**, cpu/mem as percentages. `cpu` is `0` on the very first inform (delta-sampling `/proc/stat` has no prior sample). |
 | **`sys_stats`** | Sent beside `system-stats`, as UniFi firmware does: `loadavg_1/5/15` as `/proc/loadavg`'s strings, `mem_total`, `mem_used` (total − free), `mem_buffer` in bytes. The UI's **Load Average**. See [VAP, device and radio fields](#vap-device-and-radio-fields-2026-10-10). |
 | `connect_request_ip`, `connect_request_port` | Both **strings**, as the firmware sends them (the UCG's own record carries the port as a string too): the mapped address of the AP's STUN socket. Sent only while STUN runs and once a Binding Response has come back. See [STUN wake-up](#stun-wake-up-2026-10-10). |
-| **`fw_caps`** | `0x110` — see [capability bitmasks](#capability-bitmasks) |
+| **`fw_caps`** | `0x1110` — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps`** | `0xC`, plus `0x20` (Airtime Fairness) and `0x100000` (Private Pre-Shared Keys) where the device can do them — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps2`** | `0x60` — see [capability bitmasks](#capability-bitmasks) |
 | `spectrum_scanning` | **Device-level**, not per-radio (the per-radio fields are `spectrum_table`/`spectrum_table_time`). `spectrum_scan_timestamp` is controller-owned: it stamps it itself (ms) from quick-scan results, and nothing reads it from an inform, so openUF does not send it |
@@ -2145,8 +2258,8 @@ Gates that drop or weaken a feature openUF could implement (claimed ones are lis
 
 | Field | Bit | Predicate | Effect while unclaimed |
 |---|---|---|---|
-| `fw_caps` | `0x1000` | `supportMultiBlockWlanSchedule()` | A WLAN Schedule with several blocks per day goes out as one `wireless.<n>.schedule_<day>` key per block, all under the same name, so the last one wins. With the bit set they become `schedule_<day>.<i>` |
-| `fw_caps` | `0x400000` | `supportWlanScheduleInvert()` | The controller inverts a schedule itself instead of sending `schedule_invert` |
+| `fw_caps` | `0x1000` | `supportMultiBlockWlanSchedule()` | **Claimed since 2026-10-11** (WiFi Blackout Schedule). Without it, a schedule with several blocks per day goes out as one `wireless.<n>.schedule_<day>` key per block, all under the same name, so the last one wins. With the bit set they become `schedule_<day>.<i>` |
+| `fw_caps` | `0x400000` | `supportWlanScheduleInvert()` | The controller inverts a schedule itself instead of sending `schedule_invert`. Left unclaimed on purpose: that is the form the 4.0.15 firmware reads |
 
 **`wifi_caps` `0x4` + `0x8` (device-level Band Steering): CLAIMED, confirmed in the lab 2026-09-27.**
 Predicates: `supportBandsteering()` = `hasWifiCapability(4)` and
@@ -2389,9 +2502,10 @@ The captured WPA3-only block replays through `_parse_wifi_system_cfg` + `apply_c
 a stub `/usr/share/ucode/wifi/ap.uc` in its Dockerfile, since `sysinfo.sae_supported()`
 reads that file. Hardware tier (FT-SAE roam on a WPA3-only WLAN): not yet run.
 
-The two schedule bits are not claimed because openUF implements no WLAN Schedule: the
-`schedule_*` keys are emitted whenever a WLAN has a schedule, regardless of any bit, and
-openUF parses none of them. Claim both when the feature is built.
+`fw_caps` `0x1000` is claimed since the WiFi Blackout Schedule was built (see
+[`wireless.<n>.schedule_*`](#wirelessnschedule_--wifi-blackout-schedule)). `0x400000`
+(`schedule_invert`) stays unclaimed on purpose: without it the controller inverts the
+blackout windows itself, the form the 4.0.15 firmware reads.
 
 Gated, and not to be claimed:
 - **No OpenWrt equivalent, or out of scope:**
@@ -3362,7 +3476,7 @@ them for measured values.
 | `spectrum_scanning` | `true` only in the inform between the spectrum-scan cmd and its sweep; see [Airtime Scan](#airtime-scan-spectrum-scan) |
 | `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
 | `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
-| `fw_caps` = `0x110`, `wifi_caps2` = `0x60` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
+| `fw_caps` = `0x1110`, `wifi_caps2` = `0x60` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
 | `ucihelper` `wps_device_name` / `ap_setup_locked` | Standards-based rather than Ubiquiti-derived — see the beacon row in the [feature matrix](#feature-matrix) |
 | ~~`usteer.lua`'s `USTEER_DEFAULTS`~~ | ✅ **Resolved 2026-09-10.** Verified against the installed package (usteer 2025.10.04) on the Archer C5. `band_steering_threshold` is a real option — it is in the init script's own list of keys fed to `ubus call usteer set_config`. The named `local` section is read too: the loader does `config_foreach uci_usteer usteer`, which visits every section of type `usteer`, named or anonymous. `network` is read from `uci get usteer.@usteer[-1].network`, the last section of that type — openUF's — so both writes reach the daemon. **Corrected 2026-09-27:** reaching the daemon is not the same as doing anything. usteer's source (`policy.c` `below_assoc_threshold`) reads `band_steering_threshold` only when `load_balancing_threshold` is non-zero, and it is 0 on both APs (`ubus call usteer get_config`). So openUF's 5/0 toggle switched nothing. The real switch is `band_steering_interval` (`band_steering.c`: 0 disables, otherwise a BSS Transition request to each steerable 2.4 GHz client every interval). Its default in 2025.10.04 is 120000 ms, read live on both APs, so a running usteer always steered. That included Roaming Assistant with Band Steering off. openUF now writes `band_steering_interval=0` for off and deletes it for on, so the daemon default that steered a real client (#25) applies, and removes the old threshold. |
 

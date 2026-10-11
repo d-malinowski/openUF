@@ -5492,4 +5492,219 @@ return {
 			assert_true(closed and left == nil, "listener closed")
 		end
 	},
+	{
+		name = "inform packet: a WiFi Blackout Schedule is parsed, stored on the wifi-iface and removed when off",
+		fn = function()
+			-- The lab push (10.4.57, fw_caps 0x1110, 2026-10-10): blackout 22:00
+			-- for 540 min Mon-Fri, 13:00 for 60 and 15:30 for 30 on Saturday.
+			-- Clearing schedule_with_duration left schedule_enabled=disabled
+			-- and no schedule_* key.
+			local ucihelper, db = new_apply_env()
+			local base = "aaa.1.ssid=net\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "wireless.1.ssid=net\nwireless.1.parent=radio0\n"
+			local on_blob = base .. "wireless.1.schedule_enabled=enabled\n"
+				.. "wireless.1.schedule_sun.0=0000-2359\n"
+				.. "wireless.1.schedule_mon.0=0000-2200\nwireless.1.schedule_mon.1=0000-2200\n"
+				.. "wireless.1.schedule_tue.0=0700-2200\nwireless.1.schedule_tue.1=0700-2200\n"
+				.. "wireless.1.schedule_wed.0=0700-2200\nwireless.1.schedule_wed.1=0700-2200\n"
+				.. "wireless.1.schedule_thu.0=0700-2200\nwireless.1.schedule_thu.1=0700-2200\n"
+				.. "wireless.1.schedule_fri.0=0700-2200\nwireless.1.schedule_fri.1=0700-2200\n"
+				.. "wireless.1.schedule_sat.0=0700-1300\nwireless.1.schedule_sat.1=1400-1530\n"
+				.. "wireless.1.schedule_sat.2=1600-2359\n"
+			local off_blob = base .. "wireless.1.schedule_enabled=disabled\n"
+			local function iface()
+				for _, sec in pairs(db.wireless or {}) do
+					if sec[".type"] == "wifi-iface" and sec.ssid == "net" then return sec end
+				end
+			end
+
+			local rt, vt = inform._parse_wifi_system_cfg(on_blob)
+			assert_eq(#vt[1].schedule_lines, 14, "seven days, fourteen lines")
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_eq(iface().openuf_schedule, "0=00:00-23:59 1=00:00-22:00 1=00:00-22:00 "
+				.. "2=07:00-22:00 2=07:00-22:00 3=07:00-22:00 3=07:00-22:00 4=07:00-22:00 "
+				.. "4=07:00-22:00 5=07:00-22:00 5=07:00-22:00 6=07:00-13:00 6=14:00-15:30 "
+				.. "6=16:00-23:59", "push 1: stored")
+
+			rt, vt = inform._parse_wifi_system_cfg(off_blob)
+			assert_eq(vt[1].schedule_lines, false, "push 2: no schedule")
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_nil(iface().openuf_schedule, "push 2: removed")
+		end
+	},
+	{
+		name = "inform packet: _sched_resync follows the schedule once the clock is trusted, with a ledger",
+		fn = function()
+			local ws = inform._wlansched
+			local orig = {uci = inform._ucihelper, time = inform._time, save = inform._state.save,
+				ct = inform._clock_trusted, exec = ws._exec, read = ws._read_file, popen = ws._popen}
+			ws._popen = function() return "OK\n" end
+			local links = {["phy0-ap1"] = true}
+			ws._read_file = function(p)
+				local n = p:match("^/sys/class/net/(.-)/flags$")
+				if links[n] == nil then return nil end
+				return links[n] and "0x1003\n" or "0x1002\n"
+			end
+			ws._exec = function(c)
+				local n, how = c:match("^ip link set dev (%S+) (%a+)")
+				links[n] = (how == "up")
+				return 0
+			end
+			local lines = {"0=00:00-23:59", "1=00:00-22:00", "2=07:00-22:00", "3=07:00-22:00",
+				"4=07:00-22:00", "5=07:00-22:00", "6=07:00-23:59"}
+			local vaps = {{ifnames = {"phy0-ap1"}, lines = lines}}
+			inform._ucihelper = {schedule_vaps = function() return vaps end}
+			local trusted = false
+			inform._clock_trusted = function() return trusted end
+			local saves = 0
+			inform._state.save = function() saves = saves + 1 end
+			-- 2026-10-12 is a Monday; os.time and os.date both use local time.
+			local now
+			inform._time = function() return now end
+			local mon_2300 = os.time({year = 2026, month = 10, day = 12, hour = 23, min = 0})
+			local tue_0700 = os.time({year = 2026, month = 10, day = 13, hour = 7, min = 0})
+			local ok, err = pcall(function()
+				local st = {}
+				now = mon_2300
+				local log = with_stderr(function() assert_false(inform._sched_resync(st), "clock unknown") end)
+				assert_true(links["phy0-ap1"], "unknown clock: left up")
+				assert_eq(log, "", "quiet")
+				trusted = true
+				-- Monday 06:00 is inside Monday's 00:00-22:00 but outside
+				-- Tuesday's 07:00-22:00: pins the weekday (os.date's wday is 1-based).
+				now = os.time({year = 2026, month = 10, day = 12, hour = 6, min = 0})
+				assert_false(inform._sched_resync(st), "Monday 06:00: on-time, nothing to do")
+				assert_true(links["phy0-ap1"], "still up")
+				now = mon_2300
+				log = with_stderr(function() assert_true(inform._sched_resync(st), "changed") end)
+				assert_false(links["phy0-ap1"], "Monday 23:00: down")
+				assert_eq(table.concat(st.sched_vaps_down, " "), "phy0-ap1", "ledger")
+				assert_eq(saves, 1, "saved")
+				assert_true(log:find("down: phy0-ap1", 1, true) ~= nil, "said so")
+				assert_false(inform._sched_resync(st), "again: nothing")
+				assert_eq(saves, 1, "nothing saved")
+				now = tue_0700
+				log = with_stderr(function() assert_true(inform._sched_resync(st), "changed") end)
+				assert_true(links["phy0-ap1"], "Tuesday 07:00: up")
+				assert_nil(st.sched_vaps_down, "ledger cleared")
+				assert_eq(saves, 2, "saved")
+				assert_true(log:find("up: phy0-ap1", 1, true) ~= nil, "said so")
+
+				-- selfrun_guest_mode=off holds it too: the schedule's end leaves it down.
+				now = mon_2300
+				with_stderr(function() inform._sched_resync(st) end)
+				st.guest_vaps_down = {"phy0-ap1"}
+				now = tue_0700
+				with_stderr(function() inform._sched_resync(st) end)
+				assert_false(links["phy0-ap1"], "selfrun still holds it")
+				assert_nil(st.sched_vaps_down, "but the schedule no longer does")
+				st.guest_vaps_down = nil
+
+				-- The schedule removed while it held a WLAN down: brought back up.
+				now = mon_2300
+				links["phy0-ap1"] = true
+				with_stderr(function() inform._sched_resync(st) end)
+				assert_false(links["phy0-ap1"], "down")
+				vaps = {}
+				with_stderr(function() inform._sched_resync(st) end)
+				assert_true(links["phy0-ap1"], "no schedule any more: up")
+				assert_nil(st.sched_vaps_down, "ledger cleared")
+				local n = saves
+				assert_false(inform._sched_resync(st), "no schedule, no ledger: nothing")
+				assert_eq(saves, n, "nothing saved")
+			end)
+			inform._ucihelper, inform._time, inform._state.save, inform._clock_trusted =
+				orig.uci, orig.time, orig.save, orig.ct
+			ws._exec, ws._read_file, ws._popen = orig.exec, orig.read, orig.popen
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: the clock is trusted once the controller's time agrees, via a /var/run mark",
+		fn = function()
+			local orig = {time = inform._time, read = inform._read_file, touch = inform._touch}
+			local files = {}
+			inform._read_file = function(p) return files[p] end
+			inform._touch = function(p) files[p] = "" end
+			inform._time = function() return 1791664111 end
+			inform._clock_ok = false
+			local ok, err = pcall(function()
+				assert_false(inform._clock_trusted(), "no mark yet")
+				inform._note_server_time({server_time_in_utc = "1791660000000"})
+				assert_false(inform._clock_trusted(), "68 minutes apart: not trusted")
+				inform._note_server_time({})
+				assert_false(inform._clock_trusted(), "no server time: not trusted")
+				inform._note_server_time({server_time_in_utc = "1791664106669"})
+				assert_true(inform._clock_trusted(), "5 s apart: trusted")
+				assert_eq(files[inform.CLOCK_OK_FILE], "", "marked")
+				-- A restart of openUF (not a reboot) finds the mark.
+				inform._clock_ok = false
+				assert_true(inform._clock_trusted(), "after a restart")
+				files = {}
+				inform._clock_ok = false
+				assert_false(inform._clock_trusted(), "after a reboot: unknown again")
+			end)
+			inform._time, inform._read_file, inform._touch = orig.time, orig.read, orig.touch
+			inform._clock_ok = false
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: handle_response notes the controller's clock",
+		fn = function()
+			local orig = inform._note_server_time
+			local seen
+			inform._note_server_time = function(resp) seen = resp.server_time_in_utc end
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"noop","interval":10,"server_time_in_utc":"1791664106669"}',
+					sample_state(), nil)
+			end)
+			inform._note_server_time = orig
+			if not ok then error(err, 0) end
+			assert_eq(seen, "1791664106669", "passed on")
+		end
+	},
+	{
+		name = "inform packet: selfrun's return leaves a WLAN its blackout schedule holds down",
+		fn = function()
+			local orig = {gp = inform._guestportal, save = inform._state.save}
+			local ups
+			inform._guestportal = {
+				set_vaps_up = function(names, up) if up then ups = table.concat(names, " ") end end,
+				set_selfrun = function() end,
+			}
+			inform._state.save = function() end
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			local ok, err = pcall(function()
+				local st = {guest_portal = {enabled = true}, guest_selfrun = "off",
+					guest_vaps_down = {"phy0-ap1", "phy1-ap1"}, sched_vaps_down = {"phy1-ap1"}}
+				with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(ups, "phy0-ap1", "only the one the schedule does not hold")
+				assert_nil(st.guest_vaps_down, "selfrun's ledger cleared")
+				assert_eq(table.concat(st.sched_vaps_down, " "), "phy1-ap1", "the schedule's kept")
+			end)
+			inform._guestportal, inform._state.save = orig.gp, orig.save
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: every heartbeat runs the schedule check",
+		fn = function()
+			local orig = {sr = inform._sched_resync, rl = inform._reload_if_changed, rrm = inform._rrm_tick,
+				bj = inform.build_json}
+			local ran = 0
+			inform._sched_resync = function() ran = ran + 1 end
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() error("stop here") end
+			local ok, err = pcall(function()
+				with_stderr(function() inform._tick({}, nil, nil, {interval = 10}) end)
+			end)
+			inform._sched_resync, inform._reload_if_changed, inform._rrm_tick, inform.build_json =
+				orig.sr, orig.rl, orig.rrm, orig.bj
+			if not ok then error(err, 0) end
+			assert_eq(ran, 1, "before build_json")
+		end
+	},
 }

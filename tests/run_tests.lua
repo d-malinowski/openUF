@@ -139,6 +139,7 @@ local test_files = {
 	"tests/test_satisfaction.lua",
 	"tests/test_minrssi.lua",
 	"tests/test_loadbalance.lua",
+	"tests/test_wlansched.lua",
 	"tests/test_stun.lua",
 	"tests/test_inform_json.lua",
 	"tests/test_led.lua",

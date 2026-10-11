@@ -148,6 +148,20 @@ return {
 		end
 	},
 	{
+		name = "state: sched_vaps_down (the WiFi Blackout Schedule's ledger) round-trips",
+		fn = function()
+			with_tmp(function()
+				local st = state.load()
+				st.adopted = true
+				st.sched_vaps_down = {"phy0-ap1", "phy1-ap1"}
+				state.save(st)
+				local loaded = state.load()
+				assert_eq(table.concat(loaded.sched_vaps_down or {}, " "), "phy0-ap1 phy1-ap1",
+					"kept for a restart")
+			end)
+		end
+	},
+	{
 		name = "state: blocked_stas and upgrade_requested_* round-trip type-checked",
 		fn = function()
 			-- These load() type-checks existed but were never exercised: a

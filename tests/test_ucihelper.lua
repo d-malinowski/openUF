@@ -1030,6 +1030,44 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: schedule_vaps reads back each enabled scheduled WLAN's BSS netdevs and lines",
+		fn = function()
+			with_ucihelper(function(db)
+				local mock = ucihelper._uci.cursor()
+				local function iface(name, ssid, id, sched, disabled)
+					mock:set("wireless", name, "wifi-iface")
+					mock:set("wireless", name, "device", "radio0")
+					mock:set("wireless", name, "ssid", ssid)
+					if id then mock:set("wireless", name, "openuf_wlanconf_id", id) end
+					if sched then mock:set("wireless", name, "openuf_schedule", sched) end
+					if disabled then mock:set("wireless", name, "disabled", "1") end
+				end
+				iface("openuf_radio0_kids", "Kids", "w1", "0=00:00-23:59 1=07:00-21:00")
+				iface("openuf_radio0_home", "Home", "w2")
+				iface("openuf_radio0_off", "Off", "w3", "0=00:00-23:59", true)
+				iface("default_radio0", "OpenWrt", nil, "0=00:00-23:59")
+				iface("openuf_radio0_gone", "Gone", "w4", "0=00:00-23:59")
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper._vlan_parent["phy0-ap1-10"] = "phy0-ap1"
+				ucihelper.get_ifnames_for_vap = function(_, ssid)
+					if ssid == "Kids" then return {"phy0-ap1", "phy0-ap2", "phy0-ap1-10"} end
+					if ssid == "Gone" then return {} end
+					return {"phy0-ap0"}
+				end
+				local ok, err = pcall(function()
+					local got = ucihelper.schedule_vaps()
+					assert_eq(#got, 1, "only the enabled openUF WLAN with a schedule that is live")
+					assert_eq(table.concat(got[1].ifnames, " "), "phy0-ap1 phy0-ap2",
+						"its BSS and OWE netdevs, not a PPSK VLAN netdev")
+					assert_eq(table.concat(got[1].lines, " "), "0=00:00-23:59 1=07:00-21:00", "its lines")
+				end)
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._vlan_parent["phy0-ap1-10"] = nil
+				if not ok then error(err, 0) end
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config records the blocker on the section and reconciles nft",
 		fn = function()
 			with_ucihelper(function(db)

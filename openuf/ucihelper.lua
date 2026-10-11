@@ -1432,6 +1432,12 @@ function M.apply_config(resp, cfg, opts)
 				-- so switching it off in the controller leaves nothing behind.
 				extra.openuf_roam_assist = tostring(vap.roam_assist_rssi or -75)
 			end
+			if vap.schedule_lines then
+				-- "WiFi Blackout Schedule": the firmware's schedule lines,
+				-- read back by schedule_vaps for inform's heartbeat check
+				-- (wlansched.lua). Absent means no schedule, as above.
+				extra.openuf_schedule = table.concat(vap.schedule_lines, " ")
+			end
 			if vap.bcfilt_enabled ~= nil then
 				-- "Multicast and Broadcast Blocker". Recorded on the section so
 				-- the configured state is visible in `uci show` and survives to
@@ -1998,6 +2004,28 @@ function M.wlanconf_ifnames(ids)
 		for _, ifname in ipairs(ifnames) do
 			out[#out + 1] = {ifname = ifname, ssid = s.ssid}
 		end
+	end)
+	return out
+end
+
+-- Every enabled openUF VAP with a WiFi Blackout Schedule, as {ifnames =,
+-- lines =}: its BSS netdevs (its own and an OWE transition's open BSS; a
+-- private pre-shared key's VLAN netdev goes with its BSS) and the schedule
+-- lines apply_config stored.
+function M.schedule_vaps()
+	local out = {}
+	local cursor = get_uci().cursor()
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		if s.disabled == "1" or not s.openuf_wlanconf_id or not s.openuf_schedule then return end
+		local ok_if, ifnames = pcall(M.get_ifnames_for_vap, s.device, s.ssid)
+		if not ok_if or #ifnames == 0 then return end
+		local bss = {}
+		for _, n in ipairs(ifnames) do
+			if not M._vlan_parent[n] then bss[#bss + 1] = n end
+		end
+		local lines = {}
+		for l in s.openuf_schedule:gmatch("%S+") do lines[#lines + 1] = l end
+		out[#out + 1] = {ifnames = bss, lines = lines}
 	end)
 	return out
 end

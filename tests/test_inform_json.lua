@@ -2074,7 +2074,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: fw_caps sets the QCA-switch and OWRT-switch bits (0x110)",
+		name = "inform json: fw_caps sets the QCA-switch, OWRT-switch and multi-block schedule bits (0x1110)",
 		fn = function()
 			-- Confirmed via decompiled controller 10.4.57: Device.hasQCASwitch()
 			-- is hasFirmwareCapability(16) (gates the Ports view's projection
@@ -2082,9 +2082,12 @@ return {
 			-- hasFirmwareCapability(256) (without it, the REST API's per-port
 			-- VLAN validator rejects any port assignment with
 			-- api.err.VlanTaggingUnsupportedByDevice -- see PROTOCOL-VALIDATION.md
-			-- section 18).
+			-- section 18). supportMultiBlockWlanSchedule() is
+			-- hasFirmwareCapability(4096): a day's schedule blocks as
+			-- schedule_<day>.<i> (wlansched.lua); schedule_invert (0x400000)
+			-- stays unclaimed.
 			local d = build()
-			assert_eq(d.fw_caps, 0x110, "fw_caps bits 0x10 | 0x100 set")
+			assert_eq(d.fw_caps, 0x1110, "fw_caps bits 0x10 | 0x100 | 0x1000 set")
 		end
 	},
 	{

@@ -258,6 +258,20 @@ return {
 		end
 	},
 	{
+		name = "sysconf: the WiFi Blackout Schedule's schedule-action job is left to the inform loop, quietly",
+		fn = function()
+			-- Lab capture (10.4.57): a WLAN with a schedule adds this job.
+			local _, cmds, files = fresh(system_db("IST-5:30", nil, nil))
+			local cron = sysconf.parse("cron.status=enabled\ncron.1.status=enabled\ncron.1.user=root\n"
+				.. "cron.1.job.1.status=enabled\ncron.1.job.1.schedule=1-59/5 * * * *\n"
+				.. "cron.1.job.1.cmd=syswrapper.sh schedule-action\n").cron
+			local out = with_stderr(function() assert_false(sysconf.apply_cron(cron), "nothing to install") end)
+			assert_nil(files[sysconf.CRONTAB], "no crontab line")
+			assert_eq(#cmds, 0, "crond not touched")
+			assert_eq(out, "", "and nothing logged")
+		end
+	},
+	{
 		name = "sysconf: apply_cron removes the managed block when the push stops carrying jobs",
 		fn = function()
 			local _, cmds, files = fresh(system_db("IST-5:30", nil, nil))
