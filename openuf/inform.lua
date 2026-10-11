@@ -163,17 +163,13 @@ local RRM_MAX_AGE = 30
 -- radio_stats()/sta_table() which are also recomputed rather than stored.
 M._spectrum_cache = {}
 
--- In-memory only: previous {rx_bytes, tx_bytes, time} sample per client MAC,
--- used to delta-sample a throughput estimate the same way M._sysinfo's
--- cpu_percent() delta-samples /proc/stat between calls (first sample for a
--- given MAC has no prior delta, so throughput is reported as 0 that time).
--- It also carries each station's WiFi Experience window (satisfaction.lua).
+-- In-memory only, keyed by client MAC: each station's WiFi Experience window
+-- (satisfaction.lua) and when it was last seen.
 M._sta_stats_cache = {}
 -- ...and how long an unseen station stays in it. See the sweep in build_json.
 M.STA_STATS_FORGET_AFTER = 600
 
--- Injectable: override in tests to control elapsed time deterministically
--- (used by the sta_table throughput delta-sample below).
+-- Injectable: override in tests to control elapsed time deterministically.
 M._time = os.time
 
 -- Injectable: override in tests to return fixture command output
@@ -1191,8 +1187,7 @@ function M.build_json(st, cfg, ufhw)
 			-- only per-station ones). rx_dropped/rx_errors/tx_errors/
 			-- have no source data anywhere in iw's output (ARQ retry/failure
 			-- counters are inherently TX-side only) -- left unset rather than
-			-- invented, matching sta_table's existing linkscore/multicast
-			-- precedent.
+			-- invented.
 			local vap_rx_bytes, vap_tx_bytes = 0, 0
 			local vap_rx_packets, vap_tx_packets = 0, 0
 			local vap_tx_retries, vap_tx_dropped = 0, 0
@@ -1256,20 +1251,7 @@ function M.build_json(st, cfg, ufhw)
 						threshold = vap.roam_assist_rssi,
 					}
 				end
-				-- throughput: delta-sampled byte rate (bytes/sec), same
-				-- approach as M._sysinfo.cpu_percent()'s /proc/stat delta
-				-- sampling -- 0 on the first sample for a given MAC, since
-				-- there's no prior sample to diff against yet.
-				local throughput = 0
 				local prev = M._sta_stats_cache[sta.mac]
-				if prev then
-					local dt = now - prev.time
-					if dt > 0 then
-						throughput = math.floor(
-							((sta.rx_bytes or 0) - prev.rx_bytes + (sta.tx_bytes or 0) - prev.tx_bytes) / dt
-						)
-					end
-				end
 				-- wifi_tx_attempts: total transmission attempts (successful +
 				-- retried), i.e. tx_packets + tx_retries -- both already
 				-- parsed from iw. wifi_tx_retries_percentage: retries as a
@@ -1290,12 +1272,7 @@ function M.build_json(st, cfg, ufhw)
 					packets = sta.tx_packets, retries = sta.tx_retries,
 					dropped = failed_is_dropped and sta.tx_failed or 0,
 				}, now)
-				M._sta_stats_cache[sta.mac] = {
-					rx_bytes   = sta.rx_bytes or 0,
-					tx_bytes   = sta.tx_bytes or 0,
-					time       = now,
-					sat_window = win,
-				}
+				M._sta_stats_cache[sta.mac] = { time = now, sat_window = win }
 				local mov = win.mov or {}
 				local satisfaction_now, satisfaction_reason, anomalies = sat.score{
 					snr = sat.snr(sta.signal_avg or sta.signal, noise),
@@ -1333,14 +1310,10 @@ function M.build_json(st, cfg, ufhw)
 					-- holds a Fast BSS Transition AKM.
 					is_11r     = M._sysinfo.akm_is_ft
 						and M._sysinfo.akm_is_ft(akms[sta.mac:lower()]) or nil,
-					-- capacity: best-effort proxy from the negotiated PHY tx
-					-- rate (Mbps). linkscore/multicast: no local source
-					-- exists at all (not in iw output, not in any public
-					-- reference checked) -- placeholders, not measurements.
-					capacity   = sta.tx_bitrate and math.floor(sta.tx_bitrate) or 0,
-					throughput = throughput,
-					linkscore  = 0,
-					multicast  = 0,
+					-- No capacity/throughput/linkscore/multicast: UniFi
+					-- firmware sends none of them (fill_stainfo_json,
+					-- firmware-confirmed for 3.9.27 to 4.0.15), and the 10.x
+					-- controller reads them only off a mesh uplink's entry.
 					-- Cumulative per-client counters -- confirmed real field
 					-- names via the decompiled vapInformProcessor
 					-- (com.ubnt.service.devmgr.c.KHUkYjHujLgFBD), which

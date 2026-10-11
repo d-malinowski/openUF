@@ -868,15 +868,15 @@ return {
 			assert_eq(sta_table[2].state, 0, "awake station: state 0")
 			assert_eq(sta_table[1].is_11r, true, "FT-SAE AKM: is_11r")
 			assert_eq(sta_table[2].is_11r, nil, "PSK AKM: is_11r absent, as the firmware omits it")
-			assert_eq(sta_table[1].capacity, 144, "capacity from tx_bitrate floor(144.4)")
-			assert_eq(sta_table[1].throughput, 0, "throughput 0 on first sample (no prior delta)")
-			assert_eq(sta_table[1].linkscore, 0, "linkscore has no local source -- placeholder")
-			assert_eq(sta_table[1].multicast, 0, "multicast has no local source -- placeholder")
+			-- UniFi firmware sends none of these, and the controller reads
+			-- them only off a mesh uplink's entry: absent, not invented.
+			for _, k in ipairs({"capacity", "throughput", "linkscore", "multicast"}) do
+				assert_eq(sta_table[1][k], nil, k .. " is not sent")
+			end
 			-- Cumulative per-client counters -- confirmed real field names via
 			-- the decompiled vapInformProcessor (com.ubnt.service.devmgr.c.
 			-- KHUkYjHujLgFBD), which copies these straight off each incoming
-			-- sta_table entry and computes its own deltas between informs
-			-- (unlike throughput, which openUF pre-computes).
+			-- sta_table entry and computes its own deltas between informs.
 			assert_eq(sta_table[1].rx_bytes, 45678, "rx_bytes from station dump")
 			assert_eq(sta_table[1].tx_bytes, 98765, "tx_bytes from station dump")
 			assert_eq(sta_table[1].rx_packets, 312, "rx_packets from station dump")
@@ -980,47 +980,12 @@ return {
 		end
 	},
 	{
-		name = "inform json: sta_table throughput delta-samples between calls",
-		fn = function()
-			inform._sta_stats_cache = {}
-			local orig_time = inform._time
-			inform._time = function() return 1000 end
-			build({with_uci = true, with_clients = true})  -- first sample, seeds the cache
-
-			-- Bypass build()'s inject_sysinfo() (it would reset _run_cmd to
-			-- the standard fixture) so this call can use a custom fixture
-			-- with advanced byte counters for the same client.
-			inject_ucihelper()
-			inform._sysinfo._run_cmd = function(cmd)
-				if cmd:find("station dump") then
-					return "Station aa:bb:cc:dd:ee:ff (on wlan0)\n" ..
-						"\trx bytes:\t55678\n\ttx bytes:\t108765\n" ..
-						"\tsignal:  \t-62 dBm\n\ttx bitrate:\t144.4 MBit/s MCS 15 short GI\n"
-				end
-				return ""
-			end
-			inform._time = function() return 1010 end  -- 10s later
-			local st = {
-				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
-				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
-				ip = "192.168.1.100", hostname = "testap",
-			}
-			local d = cjson.decode(inform.build_json(st, nil, ufhw))
-			-- delta = (55678-45678) + (108765-98765) = 20000 bytes over 10s = 2000 B/s
-			assert_eq(d.vap_table[1].sta_table[1].throughput, 2000,
-				"throughput = byte delta / elapsed seconds")
-
-			inform._time = orig_time
-			inform._sta_stats_cache = {}
-		end
-	},
-	{
-		name = "inform json: the throughput cache forgets a station that left",
+		name = "inform json: the per-station cache forgets a station that left",
 		fn = function()
 			-- _sta_stats_cache is keyed by CLIENT MAC and was never emptied,
 			-- so on a daemon that runs for months in a place with transient
 			-- clients it only ever grew. A station back after the window is a
-			-- fresh association, and its 0-throughput first sample is honest.
+			-- fresh association and starts a fresh WiFi Experience window.
 			inform._sta_stats_cache = {}
 			local orig_time = inform._time
 			inform._time = function() return 1000 end

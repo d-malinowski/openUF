@@ -3081,7 +3081,7 @@ Nested, **not** a flat top-level `user_table`.
 | **`is_11n`, `is_11ac`, `is_11ax`, `is_11be`** | What the **live** display actually uses — see below |
 | `wifi_tx_attempts`, `wifi_tx_retries_percentage` | `attempts = tx_packets + tx_retries` |
 | `satisfaction`, `satisfaction_now`, `satisfaction_reason`, `anomalies` | The firmware's own formula — see below |
-| `capacity`, `throughput`, `linkscore`, `multicast` | Best-effort / placeholders — see below |
+| ~~`capacity`, `throughput`, `linkscore`, `multicast`~~ | **Not sent** (since 2026-10-11). UniFi firmware's `fill_stainfo_json` sends none of the four (firmware-confirmed for 3.9.27 to 4.0.15). The 10.x controller reads `capacity`/`throughput`/`linkscore` only in `devmgr.c.KHUkYjHujLgFBD`'s `active_sta_table` builder, which runs only for a mesh **uplink** VAP's entry (it also maps `airmax.link_quality`/`link_capacity` onto them). `multicast` is read per client as a sub-document (`getX`), and a number came back `null`. On the live 10.6 controller none of the four showed up in `stat/sta` or `stat/device`. openUF used to send a tx-rate proxy, a byte-rate delta and two `0` placeholders |
 | `name` | Omitted — controller/admin-assigned, no local source |
 
 The attribute list `KHUkYjHujLgFBD` copies verbatim off each incoming entry is exactly:
@@ -3624,9 +3624,6 @@ them for measured values.
 
 | Field | Status |
 |---|---|
-| `sta_table[].capacity` | Negotiated `tx_bitrate` (Mbps, floored) as a proxy for "available bandwidth to this client" |
-| `sta_table[].throughput` | Delta-sampled byte rate (bytes/sec); `0` on first sample for a given MAC |
-| `sta_table[].linkscore`, `.multicast` | `0` placeholders — **no local source and no public reference found for either.** Neither `paultyng/go-unifi`'s `User` model nor `unpoller/unifi`'s `clients.go` has them at all. Still needs live-capture verification. |
 | `sta_table[].satisfaction` | The firmware's formula (see *The formula is the firmware's*). Its TCP-loss, TCP-latency and WiFi-latency terms are always 100: mac80211 has no source for them |
 | `spectrum_table[].width` | Each 20 MHz reading is repeated once per width the band offers; the UI averages them over a bonded block. No live-scan source measures a bonded block directly |
 | `spectrum_table[].interference` | Noise-floor dBm passed through; `iw survey dump` has no interference metric of its own. Falls back to the pre-sweep reading for any frequency whose post-scan noise comes back `0` (see [the first real-hardware run](#the-first-real-hardware-run)) |
@@ -3908,8 +3905,9 @@ through the real UI with the resulting wire payload captured or the effect verif
 
 - ~~**`setdefault` is never dispatched.**~~ ✅ Resolved 2026-10-11: 10.4.57 sent it on a
   Forget (`delete-device`) of a connected, L3-adopted device. See matrix #10.
-- **`linkscore` and `multicast`** have no known source or reference; currently `0`. Needs a
-  live capture from real hardware.
+- ~~**`linkscore` and `multicast`** have no known source or reference.~~ ✅ Resolved 2026-10-11:
+  the firmware sends neither, and the controller reads them only off a mesh uplink. They are no longer sent,
+  and neither are `capacity` or `throughput` (see the sta_table field table).
 - **`bootrom_version`** has no counterpart in the device schema. Probably ignored.
 - ~~**openUF's `usteer` config option names**~~ — ✅ resolved 2026-09-10, verified against the
   installed package; the option names and the named `local` section are both correct.

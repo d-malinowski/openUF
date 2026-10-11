@@ -1474,7 +1474,7 @@ the LLDP neighbour list), so it overstates what openUF pays every ten seconds.
 Add `payload` as an argument to also print the payload on stdout, which is how
 you show a change is behaviour-neutral — build one before and after, and diff
 them with the live counters (`time`, `uptime`, byte/packet counts, `signal`,
-`tx_mcs`, `capacity`, `throughput`, `satisfaction_now`, `idletime`) scrubbed.
+`tx_mcs`, `satisfaction_now`, `idletime`) scrubbed.
 
 The probe measures the *build* half only. To confirm the daemon is still
 informing, count outbound TCP connections — an AP originates almost nothing
