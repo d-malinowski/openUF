@@ -2097,6 +2097,13 @@ local function _wire_bool(v)
 	return v == "1" or v == "true" or v == "enabled"
 end
 
+-- A whole number of seconds (aaa.<n>.wpa.group_rekey), as a string for UCI;
+-- nil when absent or malformed.
+local function _wire_group_rekey(v)
+	if type(v) ~= "string" or not v:match("^%d+$") or #v > 9 then return nil end
+	return tostring(tonumber(v))
+end
+
 -- Tri-state read of a `status` key for the radio/VAP disable controls:
 --   nil       -> the key was absent; leave whatever UCI already has alone
 --   false     -> explicitly enabled
@@ -2569,6 +2576,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 				iapp_key              = type(a.iapp_key) == "string"
 					and #a.iapp_key == 32 and a.iapp_key:match("^%x+$")
 					and a.iapp_key:lower() or nil,
+				-- aaa.<n>.wpa.group_rekey: GTK rekey interval in seconds, from
+				-- the wlanconf's group_rekey (default 3600; 0 for WDS/element
+				-- WLANs), sent only in the WPA branch (10.x generator
+				-- eWivisHeQsnaqDtx). UniFi firmware writes it to hostapd as
+				-- wpa_group_rekey= (firmware-confirmed for 4.0.15). 0 = off.
+				group_rekey           = _wire_group_rekey(a["wpa.group_rekey"]),
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
 				-- {key=, vid=} per private pre-shared key, in wire order;

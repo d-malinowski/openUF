@@ -1357,6 +1357,8 @@ function M.apply_config(resp, cfg, opts)
 			-- U-APSD. `uapsd` is hostapd.sh's option and, on 25.12, a schema
 			-- alias of uapsd_advertisement_enabled, so one name covers both.
 			if vap.uapsd ~= nil then extra.uapsd = vap.uapsd and "1" or "0" end
+			-- GTK rekey interval (s, 0 = off); hostapd's own default is 86400.
+			if vap.group_rekey then extra.wpa_group_rekey = vap.group_rekey end
 			if vap.qbssload ~= nil then
 				-- "Force WiFi 4 Mode" (IoT Optimization) sends
 				-- wireless.<n>.qbssload=disabled alongside iot=enabled. The

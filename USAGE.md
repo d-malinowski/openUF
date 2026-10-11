@@ -494,6 +494,7 @@ Settings carried through from the controller:
 | Roaming Assistant (per WLAN, 5 GHz) | `openuf_roam_assist=<dBm>` on the 5 GHz section (openUF's own marker, absent when off); enforced by openUF over hostapd's ubus, not by a hostapd option — see below |
 | Auto/Custom DTIM Period | `dtim_period` |
 | U-APSD | `uapsd` (`0`/`1`; on 25.12 an alias of `uapsd_advertisement_enabled`). Off unless the WLAN enables it, the controller's default |
+| Group Rekey Interval | `wpa_group_rekey` (seconds, `0` = never). WPA WLANs only. Without it hostapd's default (86400) applies. A WLAN may store 0, which means no rotation |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
 | Multicast and Broadcast Blocker | nftables rules, not a hostapd option. `openuf_bcfilt`/`openuf_bcfilt_macs` on the section are the persisted record: the ruleset dies with a reboot, so openUF rebuilds it from those two options on every start |

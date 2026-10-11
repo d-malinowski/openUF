@@ -2541,6 +2541,21 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes wpa_group_rekey and leaves it alone when absent",
+		fn = function()
+			for _, c in ipairs({{"3600", "3600"}, {"0", "0"}, {nil, nil}}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", group_rekey = c[1]},
+					}}, nil)
+					assert_eq(db.wireless.openuf_radio0_corp.wpa_group_rekey, c[2],
+						"group_rekey=" .. tostring(c[1]))
+				end)
+			end
+		end
+	},
+	{
 		name = "ucihelper: apply_config omits the Force WiFi 4 options when the vap has neither",
 		fn = function()
 			with_ucihelper(function(db)

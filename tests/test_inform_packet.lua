@@ -1634,6 +1634,20 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.wpa.group_rekey",
+		fn = function()
+			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			for _, c in ipairs({{"3600", "3600"}, {"0", "0"}, {"0600", "600"},
+					{"-1", nil}, {"1h", nil}, {"9999999999", nil}}) do
+				local _, v = inform._parse_wifi_system_cfg(base .. "aaa.1.wpa.group_rekey=" .. c[1] .. "\n")
+				assert_eq(v[1].group_rekey, c[2], "group_rekey=" .. c[1])
+			end
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_eq(none[1].group_rekey, nil, "no group_rekey key -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=1\n"
