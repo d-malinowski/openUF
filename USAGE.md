@@ -493,6 +493,7 @@ Settings carried through from the controller:
 | Airtime Fairness (device panel) | Not UCI: `/sys/kernel/debug/ieee80211/phy*/airtime_flags`, `3` (TX+RX, the kernel default) for on and `0` for off, from `atf.mode`. Kept as `atf_enabled` in `state.json` and rewritten at every start, because debugfs resets to `3` on reboot. Forgetting the device puts `3` back. Depends on openUF advertising `wifi_caps` bit `0x20`, which it does when that debugfs file exists |
 | Roaming Assistant (per WLAN, 5 GHz) | `openuf_roam_assist=<dBm>` on the 5 GHz section (openUF's own marker, absent when off); enforced by openUF over hostapd's ubus, not by a hostapd option — see below |
 | Auto/Custom DTIM Period | `dtim_period` |
+| U-APSD | `uapsd` (`0`/`1`; on 25.12 an alias of `uapsd_advertisement_enabled`). Off unless the WLAN enables it, the controller's default |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
 | Multicast and Broadcast Blocker | nftables rules, not a hostapd option. `openuf_bcfilt`/`openuf_bcfilt_macs` on the section are the persisted record: the ruleset dies with a reboot, so openUF rebuilds it from those two options on every start |

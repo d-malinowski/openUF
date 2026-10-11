@@ -1620,6 +1620,20 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.uapsd both ways",
+		fn = function()
+			-- 10.x always emits it, from wlanconf uapsd_enabled (default false).
+			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, off = inform._parse_wifi_system_cfg(base .. "wireless.1.uapsd=disabled\n")
+			assert_eq(off[1].uapsd, false, "uapsd=disabled -> false")
+			local _, on = inform._parse_wifi_system_cfg(base .. "wireless.1.uapsd=enabled\n")
+			assert_eq(on[1].uapsd, true, "uapsd=enabled -> true")
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_eq(none[1].uapsd, nil, "no uapsd key -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=1\n"

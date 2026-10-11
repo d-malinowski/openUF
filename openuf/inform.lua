@@ -2646,6 +2646,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- BSS's beacons, which some legacy clients mis-parse.
 				iot                   = _wire_bool(w.iot),
 				qbssload              = _wire_bool(w.qbssload),
+				-- wireless.<n>.uapsd: WMM power save (U-APSD), from the
+				-- WLAN's uapsd_enabled, default false (10.x generator). Always
+				-- on the wire. UniFi firmware passes it straight to the driver
+				-- (`iwpriv <ath> uapsd 0|1`, firmware-confirmed for 4.0.15), so
+				-- "disabled" turns U-APSD off; OpenWrt's own default is on.
+				uapsd                 = _wire_bool(w.uapsd),
 				-- wireless.<n>.no2ghz_oui: CONFIRMED live 2026-07-15 --
 				-- this, not a per-device mgmt_cfg key, is Band Steering's
 				-- real wire representation (toggled "Band Steering" in the

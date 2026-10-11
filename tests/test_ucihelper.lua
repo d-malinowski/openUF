@@ -2526,6 +2526,21 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes uapsd 0/1 and leaves it alone when absent",
+		fn = function()
+			for _, c in ipairs({{false, "0"}, {true, "1"}, {nil, nil}}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", uapsd = c[1]},
+					}}, nil)
+					assert_eq(db.wireless.openuf_radio0_corp.uapsd, c[2],
+						"uapsd=" .. tostring(c[1]))
+				end)
+			end
+		end
+	},
+	{
 		name = "ucihelper: apply_config omits the Force WiFi 4 options when the vap has neither",
 		fn = function()
 			with_ucihelper(function(db)
