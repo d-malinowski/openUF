@@ -5397,7 +5397,7 @@ return {
 				handle_response = inform.handle_response,
 				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
 				stderr = io.stderr, gp = inform._guestportal, vaps = inform._guest_vaps,
-				save = inform._state.save,
+				save = inform._state.save, ws = inform._wlansched,
 			}
 			local logged = {}
 			io.stderr = {write = function(_, s) logged[#logged + 1] = s end}
@@ -5410,12 +5410,16 @@ return {
 			local saves = 0
 			inform._state.save = function() saves = saves + 1 end
 			local calls, links = {}, {}
-			inform._guestportal = {
-				set_selfrun = function(pass) calls[#calls + 1] = pass end,
-				set_vaps_up = function(names, up)
-					links[#links + 1] = (up and "up " or "down ") .. table.concat(names, " ")
+			inform._guestportal = {set_selfrun = function(pass) calls[#calls + 1] = pass end}
+			local link = {["phy0-ap1"] = true, ["phy1-ap1"] = true}
+			inform._wlansched = setmetatable({
+				set_bss = function(n, up)
+					links[#links + 1] = (up and "up " or "down ") .. n
+					link[n] = up
+					return true
 				end,
-			}
+				is_up = function(n) return link[n] end,
+			}, {__index = orig.ws})
 			inform._guest_vaps = function() return {{ifname = "phy0-ap1"}, {ifname = "phy1-ap1"}} end
 			inform._inform_fails, inform._guest_selfrun_on, inform._guest_built = 0, false, "phy0-ap1=x"
 			local ok, err = pcall(function()
@@ -5444,19 +5448,19 @@ return {
 				tick(false); tick(false)
 				assert_eq(#links, 0, "off: nothing before the third failure")
 				tick(false)
-				assert_eq(links[1], "down phy0-ap1 phy1-ap1", "off: the guest WLANs go down")
+				assert_eq(table.concat(links, ", "), "down phy0-ap1, down phy1-ap1", "off: the guest WLANs go down")
 				assert_eq(#calls, 2, "off never opens the portal")
 				assert_eq(table.concat(st.guest_vaps_down, " "), "phy0-ap1 phy1-ap1", "kept for a restart")
 				local saved = saves
 				assert_true(saved > 0, "the ledger is saved")
 				tick(false); tick(false)
-				assert_eq(#links, 1, "once")
+				assert_eq(#links, 2, "once")
 				-- a daemon restart while down: module state is fresh, the ledger is not
 				inform._inform_fails, inform._guest_selfrun_on = 0, false
 				tick(false)
-				assert_eq(#links, 1, "still no controller after the restart: they stay down")
+				assert_eq(#links, 2, "still no controller after the restart: they stay down")
 				tick(true)
-				assert_eq(links[2], "up phy0-ap1 phy1-ap1", "the answer brings them back up")
+				assert_eq(links[3] .. ", " .. links[4], "up phy0-ap1, up phy1-ap1", "the answer brings them back up")
 				assert_nil(st.guest_vaps_down, "ledger cleared")
 				assert_eq(#calls, 2, "and the portal was never opened")
 
@@ -5480,7 +5484,7 @@ return {
 				inform._reload_if_changed, inform._rrm_tick, inform._guestportal =
 				orig.build_json, orig.build_packet, orig.http_post,
 				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm, orig.gp
-			inform._guest_vaps, inform._state.save = orig.vaps, orig.save
+			inform._guest_vaps, inform._state.save, inform._wlansched = orig.vaps, orig.save, orig.ws
 			inform._inform_fails, inform._guest_selfrun_on, inform._guest_built = 0, false, nil
 			if not ok then error(err, 0) end
 		end
@@ -5777,23 +5781,66 @@ return {
 	{
 		name = "inform packet: selfrun's return leaves a WLAN its blackout schedule holds down",
 		fn = function()
-			local orig = {gp = inform._guestportal, save = inform._state.save}
-			local ups
-			inform._guestportal = {
-				set_vaps_up = function(names, up) if up then ups = table.concat(names, " ") end end,
-				set_selfrun = function() end,
-			}
+			local orig = {ws = inform._wlansched, save = inform._state.save}
+			local ups = {}
+			inform._wlansched = setmetatable({
+				set_bss = function(n, up) if up then ups[#ups + 1] = n end return true end,
+				is_up = function() return false end,
+			}, {__index = orig.ws})
 			inform._state.save = function() end
 			inform._inform_fails, inform._guest_selfrun_on = 0, false
 			local ok, err = pcall(function()
 				local st = {guest_portal = {enabled = true}, guest_selfrun = "off",
 					guest_vaps_down = {"phy0-ap1", "phy1-ap1"}, sched_vaps_down = {"phy1-ap1"}}
 				with_stderr(function() inform._guest_selfrun(st, true) end)
-				assert_eq(ups, "phy0-ap1", "only the one the schedule does not hold")
+				assert_eq(table.concat(ups, " "), "phy0-ap1", "only the one the schedule does not hold")
 				assert_nil(st.guest_vaps_down, "selfrun's ledger cleared")
 				assert_eq(table.concat(st.sched_vaps_down, " "), "phy1-ap1", "the schedule's kept")
 			end)
-			inform._guestportal, inform._state.save = orig.gp, orig.save
+			inform._wlansched, inform._state.save = orig.ws, orig.save
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: selfrun's return retries a guest WLAN whose beacon did not restart",
+		fn = function()
+			local orig = {ws = inform._wlansched, save = inform._state.save}
+			local link = {["phy0-ap1"] = false, ["phy1-ap1"] = false, ["phy0-ap2"] = true}
+			local beacon_ok, tried = {["phy0-ap1"] = true, ["phy1-ap1"] = false}, {}
+			inform._wlansched = setmetatable({
+				set_bss = function(n, up)
+					tried[#tried + 1] = n
+					if up and beacon_ok[n] then link[n] = true return true end
+					return false
+				end,
+				is_up = function(n) return link[n] end,
+			}, {__index = orig.ws})
+			local saves = 0
+			inform._state.save = function() saves = saves + 1 end
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			local ok, err = pcall(function()
+				local st = {guest_portal = {enabled = true}, guest_selfrun = "off",
+					guest_vaps_down = {"phy0-ap1", "phy1-ap1", "phy0-ap2", "gone0"}}
+				local log = with_stderr(function() assert_true(inform._guest_selfrun(st, true), "changed") end)
+				assert_eq(table.concat(tried, " "), "phy0-ap1 phy1-ap1", "only the ones still down")
+				assert_eq(table.concat(st.guest_vaps_down, " "), "phy1-ap1", "the failure stays in the ledger")
+				assert_eq(saves, 1, "saved")
+				assert_true(log:find("back up (phy0-ap1)", 1, true) ~= nil, "said what came up")
+				assert_true(log:find("on the air (phy1-ap1)", 1, true) ~= nil, "said what did not")
+				tried = {}
+				log = with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(table.concat(tried, " "), "phy1-ap1", "retried")
+				assert_nil(log:find("on the air", 1, true), "said once, not on every retry")
+				tried, beacon_ok["phy1-ap1"] = {}, true
+				with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(table.concat(tried, " "), "phy1-ap1", "the next answer retries it")
+				assert_nil(st.guest_vaps_down, "then the ledger is gone")
+				tried = {}
+				with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(#tried, 0, "and nothing more is done")
+			end)
+			inform._wlansched, inform._state.save = orig.ws, orig.save
 			inform._inform_fails, inform._guest_selfrun_on = 0, false
 			if not ok then error(err, 0) end
 		end

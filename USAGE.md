@@ -32,7 +32,7 @@ the device has.
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
 | `kmod-nft-bridge` | The Multicast/Broadcast Blocker, the L2 hardening (`bridge openuf_l2guard`) and the guest portal (`bridge openuf_guest`, lab-validated only). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
-| `hostapd-utils` | `hostapd_cli` — each client's AKM for `is_11r`, a blocked client's entry in hostapd's deny list on every SSID, immediate deauth of a just-blocked wireless client, the controller's Client → Reconnect (`kick-sta`), client kick (Roaming Assistance), Minimum RSSI's 30 s kick, and restarting a WLAN's beacon when its WiFi Blackout Schedule ends |
+| `hostapd-utils` | `hostapd_cli` — each client's AKM for `is_11r`, a blocked client's entry in hostapd's deny list on every SSID, immediate deauth of a just-blocked wireless client, the controller's Client → Reconnect (`kick-sta`), client kick (Roaming Assistance), Minimum RSSI's 30 s kick, and restarting a WLAN's beacon when its WiFi Blackout Schedule ends or guest selfrun (`off`) is over |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced. Its `htb`, `fq_codel`, `u32`, `mirred` and `police` are all openUF uses |
 | `kmod-ifb` | The **upload** half of WiFi Speed Limit, queued: each SSID's incoming frames are redirected to an IFB device (`oufb<ifindex>`) and shaped there. Without it upload falls back to dropping the excess (tc `police`), which TCP handles far worse (lab: 0.78 Mbit/s under a 2 Mbit/s limit with a tight bucket). openUF logs `no IFB device (install kmod-ifb)` once |
 | `kmod-sched-act-police` | Only for that fallback, when `kmod-ifb` is missing. `police` is a tc *action*, a separate module absent from a stock filogic image |
@@ -1164,13 +1164,17 @@ answer, and it only does anything while the portal is on.
   and the AP itself stay behind the portal's rules. Nobody could log in meanwhile, because
   the portal is the controller's. The first answer empties the chain again.
 - **`off`:** the guest WLANs are taken down (`ip link set <vap> down`) and brought back up
-  with the first answer. Their names are kept in `st.guest_vaps_down`, so a daemon restart
-  in between leaves them down until the controller answers, and then brings them up.
+  with the first answer: the netdev comes up and hostapd is told to start its beacon again
+  (`hostapd_cli raw STOP_AP` + `update_beacon`, as when a Blackout Schedule ends). Their
+  names are kept in `st.guest_vaps_down`, so a daemon restart in between leaves them down
+  until the controller answers, and then brings them up. One whose beacon does not restart
+  goes down again and stays in that list, and every later answer tries again.
 - One deliberate difference: when the controller comes back, UniFi firmware forgets every
   authorized guest and waits for the controller to re-authorize them. openUF keeps its
   list, and the controller re-sends `authorize-guest` for the same guests anyway.
-- ⚠️ `off` is lab-tested on dummy interfaces only. That hostapd brings a BSS back when its
-  netdev comes back up is hostapd's documented behaviour, but no radio has shown it here.
+- `off` is tested on hardware (ath9k, ath10k, mt76) on its own, with a temporary WLAN; the
+  rest of the guest portal has not run on hardware. Without `hostapd-utils` the WLANs cannot
+  come back on the air: they stay down, and the log says so once.
 
 The daemon also reports a random `guest_token`. Without one, the controller refuses
 every portal login on the AP and logs "Missing Guest Token in AP[…] during guest

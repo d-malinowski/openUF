@@ -215,4 +215,32 @@ return {
 			assert_eq(#held, 0, "and neither kept")
 		end
 	},
+	{
+		name = "wlansched: set_bss takes one BSS off the air and puts it back with its beacon",
+		fn = function()
+			local cmds, cli, rc, beacon = {}, {}, 0, "OK\n"
+			ws._exec = function(c) cmds[#cmds + 1] = c; return rc end
+			ws._popen = function(c) cli[#cli + 1] = c; return c:find("update_beacon", 1, true) and beacon or "OK\n" end
+			assert_true(ws.set_bss("phy0-ap1", false), "down")
+			assert_eq(table.concat(cmds, " | "), "ip link set dev phy0-ap1 down 2>/dev/null", "the link only")
+			assert_eq(#cli, 0, "no hostapd call going down")
+			cmds = {}
+			assert_true(ws.set_bss("phy0-ap1", true), "up")
+			assert_eq(table.concat(cmds, " | "), "ip link set dev phy0-ap1 up 2>/dev/null", "the link")
+			assert_eq(table.concat(cli, " | "), "hostapd_cli -i phy0-ap1 raw STOP_AP 2>/dev/null | "
+				.. "hostapd_cli -i phy0-ap1 update_beacon 2>/dev/null", "then the beacon")
+			cmds, cli, beacon = {}, {}, "FAIL\n"
+			assert_false(ws.set_bss("phy0-ap1", true), "no beacon")
+			assert_eq(cmds[#cmds], "ip link set dev phy0-ap1 down 2>/dev/null", "down again")
+			cmds, cli, rc = {}, {}, 1
+			assert_false(ws.set_bss("phy0-ap1", true), "the link refused")
+			assert_eq(#cli, 0, "hostapd not asked")
+			assert_false(ws.set_bss("phy0-ap1", false), "refused down")
+			cmds, rc = {}, 0
+			assert_false(ws.set_bss("x; reboot", true), "bad name")
+			assert_false(ws.set_bss("x; reboot", false), "bad name")
+			assert_eq(#cmds, 0, "never run")
+			ws._popen = function() return "OK\n" end
+		end
+	},
 }

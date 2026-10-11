@@ -992,7 +992,7 @@ encrypted. These builds are not, and their selfrun code is identical:
 - `off`: `ifconfig $ath down` for every guest VAP (`/var/run/guest_devnames`). The VAP
   scheduler keeps them down while selfrun lasts. On return, `ifconfig $ath up`.
 
-**openUF's answer (C4, lab-validated only).** It keeps the value as `st.guest_selfrun`,
+**openUF's answer (C4; lab-validated, and `off` hardware-tested).** It keeps the value as `st.guest_selfrun`,
 where only `off` is off. Selfrun starts after 3 failed informs in a row
 (`GUEST_SELFRUN_FAILS`) and ends with the first answer. With `pass`, the `selfrun` chain
 (jumped from `guestin` right after the authorized accept) gets `meta pkttype other accept`,
@@ -1013,8 +1013,22 @@ Lab, with the controller cut off from the AP by an nft `reject` on :8080:
   authorized): closed → HTTP redirected to the portal and :5201 blocked. Open →
   `INTERNET-OK` and :5201 open, while a restricted subnet (10.9.9.9) still timed out.
 - `handle_response failed` = 0.
-- Unverified: that hostapd beacons again on a real radio after its BSS netdev comes back
-  up. hostapd handles that as `INTERFACE_ENABLED`, but the lab has no radio.
+- That run predates the beacon restart below. The lab has no hostapd, so the same run now
+  leaves both dummies DOWN after the answer, with the ledger kept and retried.
+
+**Hardware, 2026-10-11 (both APs, OpenWrt 25.12).** The guess above was wrong: on a real
+radio, `ip link set <bss> up` alone leaves the BSS off the air, as found for the WiFi
+Blackout Schedule (see that section). hostapd does not act on the link going down, so on
+the way up it only updates a beacon mac80211 has already stopped. Reproduced on the living
+room AP's ath10k: after `ip link set phy0-ap1 down; ip link set phy0-ap1 up`, `iw dev
+phy0-ap1 info` showed no SSID and no channel. openUF now brings a guest WLAN back through
+`wlansched.set_bss`: link up, then `hostapd_cli -i <bss> raw STOP_AP` and `update_beacon`.
+A BSS whose beacon does not restart goes down again and stays in `st.guest_vaps_down`, so
+the next answer retries it. On-device run of `_guest_selfrun` (`OPENUF_TEST_MODE`, the
+state save stubbed) against a temporary WPA2 WLAN on both radios of both APs (ath10k ch
+36, ath9k ch 1, mt76 ch 11 and ch 100 DFS): three missed informs → both BSSes DOWN with no
+SSID; one answer → "guest WLANs back up", ledger cleared, and `iw dev <bss> info` showed the
+SSID and its channel on all four. The temporary WLAN was deleted afterwards.
 
 ### Connection tracking notifs (`STA_ASSOC_TRACKER`)
 

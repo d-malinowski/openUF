@@ -165,6 +165,20 @@ local function restart_beacon(ifname)
 	return tostring(M._popen(cli .. "update_beacon 2>/dev/null") or ""):match("^OK") ~= nil
 end
 
+-- Take one BSS off the air (its netdev down) or put it back on (netdev up,
+-- then restart_beacon). Also used by guest selfrun (inform._guest_selfrun).
+-- A BSS whose beacon does not restart goes down again, so a caller that
+-- keeps it in its ledger retries the whole bring-up rather than leaving an
+-- up netdev with no beacon. Returns true if the BSS is now as asked.
+function M.set_bss(ifname, up)
+	if not valid_ifname(ifname) then return false end
+	if not up then return set_link(ifname, false) end
+	if not set_link(ifname, true) then return false end
+	if restart_beacon(ifname) then return true end
+	set_link(ifname, false)
+	return false
+end
+
 -- Make the links match `down` (a set). held: the ifnames this module took
 -- down earlier (a list, persisted). A held one no longer in `down` is
 -- brought back up unless keep_down (a set: selfrun's guest VAPs) still
@@ -188,14 +202,9 @@ function M.reconcile(down, held, keep_down)
 	for _, n in ipairs(held or {}) do
 		if not (down and down[n]) and valid_ifname(n) and not (keep_down and keep_down[n]) then
 			if M.is_up(n) == false then
-				local up = set_link(n, true)
-				if up and restart_beacon(n) then
+				if M.set_bss(n, true) then
 					changed.up[#changed.up + 1] = n
 				else
-					-- Down again and still held, so the next pass retries
-					-- the whole bring-up rather than leaving an up netdev
-					-- with no beacon.
-					if up then set_link(n, false) end
 					new_held[#new_held + 1] = n
 				end
 			end

@@ -276,26 +276,6 @@ return {
 		end
 	},
 	{
-		name = "guestportal: set_vaps_up takes the guest WLANs down and back up",
-		fn = function()
-			local down = with_capture(function()
-				assert_true(gp.set_vaps_up({"phy0-ap1", "phy1-ap1"}, false), "down")
-			end)
-			assert_eq(#down, 2, "one per VAP")
-			assert_true(down[1]:find("ip link set dev phy0-ap1 down", 1, true) ~= nil, "down")
-			local up = with_capture(function() assert_true(gp.set_vaps_up({"phy0-ap1"}, true), "up") end)
-			assert_true(up[1]:find("ip link set dev phy0-ap1 up", 1, true) ~= nil, "up")
-			local bad = with_capture(function()
-				assert_false(gp.set_vaps_up({"x; reboot", "phy1-ap1"}, true), "reported")
-			end)
-			assert_eq(#bad, 1, "malformed never spliced, the rest still done")
-			local refused = with_capture(function()
-				assert_false(gp.set_vaps_up({"phy0-ap1", "phy1-ap1"}, true), "refused")
-			end, "phy0-ap1")
-			assert_eq(#refused, 2, "one refusal does not stop the others")
-		end
-	},
-	{
 		name = "guestportal: bridge_mac reads the master's address",
 		fn = function()
 			local orig = gp._read

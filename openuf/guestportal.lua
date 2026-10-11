@@ -26,7 +26,7 @@
 
 	After the authorized accept, a `selfrun` chain that lets every guest
 	through while the controller is unreachable (set_selfrun); with
-	selfrun_guest_mode=off the guest VAPs go down instead (set_vaps_up).
+	selfrun_guest_mode=off the guest VAPs go down instead (inform._guest_selfrun).
 
 	Deliberate narrowings, all of them stated in README/USAGE:
 	- DNS passes for every guest. The stock firmware answers an unauthorized
@@ -265,21 +265,6 @@ function M.set_selfrun(pass)
 		return nft("add rule " .. M.BRIDGE_TABLE .. " selfrun 'meta pkttype other accept'")
 	end
 	return true
-end
-
--- selfrun_guest_mode=off while the controller is unreachable: the guest
--- WLANs are taken down (ifnames, a list) and brought back up after, as the
--- UniFi firmware does with ifconfig. hostapd re-enables a BSS whose netdev
--- comes back up. Returns false if any interface refused.
-function M.set_vaps_up(ifnames, up)
-	local ok = true
-	for _, n in ipairs(ifnames or {}) do
-		if not (valid_ifname(n) and exec_ok(M._exec("ip link set dev " .. n
-				.. (up and " up" or " down") .. " 2>/dev/null"))) then
-			ok = false
-		end
-	end
-	return ok
 end
 
 -- Rebuild both tables for spec on these VAPs ({ifname=, bridge_mac=}), with
