@@ -2306,6 +2306,10 @@ use the controller's key. Without a key, the md5 fallback still applies.
     then. What that boot did differently is not known. Until hostapd reopens that socket, the AP can neither pull nor
     answer a pull, so a cross-AP FT involving it cannot succeed. Check with
     `/proc/net/packet`: the `88b7` row of hostapd's sockets must carry `br-lan`'s current ifindex.
+    openUF now checks that once a minute and restarts wpad at a cheap moment (`rrbguard.lua`,
+    USAGE § 3). The `-1` marker was reproduced on a real kernel (a container: an `AF_PACKET`
+    socket for `0x88b7` bound to a dummy interface read `Iface 12`, then `-1` after
+    `ip link del`), and `rrbguard.stale()` flagged the second dump and not the first.
   - 2026-10-11, after `/etc/init.d/wpad restart; wifi up` on that AP (its `88b7` socket back on
     `br-lan`'s ifindex): an FT-SAE laptop (`00-0f-ac-9`) that had associated there after the
     restart was steered to the other AP's 5 GHz BSS. A plain `bss_tm_req` was declined

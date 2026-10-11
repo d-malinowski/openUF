@@ -621,6 +621,14 @@ that (seen once, on an AP that had run for weeks; a clean reboot did not reprodu
 ifindex (`cat /sys/class/net/br-lan/ifindex`), not `-1`. Fix it with
 `/etc/init.d/wpad restart; sleep 6; wifi up` (`wifi up` alone does not restart hostapd).
 
+openUF does this itself (`rrbguard.lua`). Once a minute it reads `/proc/net/packet`; two
+readings in a row with the `88b7` row on `-1` log `rrbguard: hostapd's 802.11r key-exchange
+socket (0x88b7) has lost its interface`. The restart takes every SSID on the AP down for about
+10 s, and a DFS radio for another 60 s of channel check, while the fault only makes roams
+slower. So openUF runs it when no client is connected, or otherwise during the 04:00 local
+hour, and at most once every 6 hours. `rrbguard: the 802.11r key-exchange socket is bound
+again` confirms the repair. Nothing is spawned while the socket is healthy.
+
 **VLAN-tagged SSIDs** (assigning a WiFi network to a non-native network) need three
 things on the AP, and openUF builds all three:
 

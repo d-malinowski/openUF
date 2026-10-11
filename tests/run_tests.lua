@@ -146,6 +146,7 @@ local test_files = {
 	"tests/test_airtime.lua",
 	"tests/test_ucihelper.lua",
 	"tests/test_roamassist.lua",
+	"tests/test_rrbguard.lua",
 	"tests/test_usteer.lua",
 	"tests/test_netconfig.lua",
 	"tests/test_firewall.lua",

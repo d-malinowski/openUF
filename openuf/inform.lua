@@ -72,6 +72,7 @@ local loadbalance = _require_sibling("loadbalance")
 local wlansched = _require_sibling("wlansched")
 local stun      = _require_sibling("stun")
 local shaper    = _require_sibling("shaper")
+local rrbguard  = _require_sibling("rrbguard")
 
 local M = {}
 
@@ -103,6 +104,7 @@ M._assoctrack = assoctrack
 M._guestportal = guestportal
 M._satisfaction = satisfaction
 M._stun      = stun
+M._rrbguard  = rrbguard
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -4219,6 +4221,17 @@ end
 -- a restart in between still brings them up. Nothing is done before the
 -- clock is known to be right (_clock_trusted): the firmware keeps every
 -- VAP up until NTP has set the time, and after a boot every VAP starts up.
+-- Once a minute: is hostapd's 802.11r key-exchange socket still bound? See
+-- rrbguard.lua. The night repair window needs a trusted clock; without one
+-- only the no-clients path can repair.
+function M._rrbguard_tick()
+	local g = M._rrbguard
+	if not (g and g.tick) then return nil end
+	local now = M._time()
+	local hour = M._clock_trusted() and os.date("*t", now).hour or nil
+	return g.tick(now, hour)
+end
+
 function M._sched_resync(st)
 	local ufuci = M._ucihelper
 	if not (ufuci and ufuci.schedule_vaps) then return false end
@@ -5267,6 +5280,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._usteer_filter_resync)
 	pcall(M._block_resync, st)
 	pcall(M._sched_resync, st)
+	pcall(M._rrbguard_tick)
 
 	-- Reported as spectrum_scanning = true by this inform; swept below.
 	local spectrum_due = M._spectrum_pending
