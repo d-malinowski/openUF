@@ -487,9 +487,10 @@ end
 --
 -- So every openUF VAP beacons this IE, carrying its device's identity MAC:
 --   dd 0d | 02 6f 55 (OUI) | 6f 55 46 ("oUF") | 01 (version) | 6-byte MAC
--- The OUI is deliberately NOT Ubiquiti's 00:27:22 -- a real UniFi AP parsing
--- our layout as theirs would read garbage -- and the magic makes a collision
--- with any real user of 02:6f:55 harmless in both directions.
+-- The OUI is deliberately NOT a Ubiquiti one (UniFi firmware's own element uses
+-- 00:15:6d, see PROTOCOL-VALIDATION.md) -- a real UniFi AP parsing our layout as
+-- theirs would read garbage -- and the magic makes a collision with any real
+-- user of 02:6f:55 harmless in both directions.
 M.PEER_IE_OUI   = "02:6f:55"
 M.PEER_IE_MAGIC = "6f5546"
 M.PEER_IE_VER   = "01"

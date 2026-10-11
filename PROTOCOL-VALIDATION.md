@@ -1202,8 +1202,8 @@ wlanconf: `wpa3_support: true`, `wpa3_transition: true`, `pmf_mode: optional`. (
 revision of this document claimed the mixed choice left `wpa3_support` false and that a mixed
 WLAN therefore never emits these keys. Wrong: the WLAN-side gate passes; what suppresses the
 whole SAE block is the *per-device radio* capability check described in the WPA3 section.)
-openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`
-(the older name, still the broadly-supported one across the OpenWrt/wpad versions targeted).
+openUF used to map these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`. Neither is a
+wifi-iface UCI option, so the writes were dropped in silence and have been removed (feature 27).
 
 ### `wireless.<n>.*` — per-SSID radio binding and behavior
 
@@ -1214,7 +1214,7 @@ openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`
 | `no2ghz_oui` | **Band Steering's real wire representation.** Not a per-device `mgmt_cfg` field. Toggling Band Steering changes only this key, and only on the 2.4 GHz entry (the 5 GHz entry stays `disabled` — nothing to toggle there). A madwifi/QCA convention: omitting the AP's OUI from 2.4 GHz beacons nudges dual-band clients toward 5 GHz. Mainline mac80211/hostapd has no equivalent, so openUF derives a single device-wide `steering_active` boolean (true if *any* vap has it) and drives `usteer`, which is itself a device-wide daemon. |
 | `mcast.enhance` | Multicast Enhancement / Multicast-to-Unicast. `0`\|`1`. |
 | `uapsd` | **U-APSD** (WMM power save), from wlanconf `uapsd_enabled`, default `false` (10.x WLAN generator `eWivisHeQsnaqDtx`). `enabled`\|`disabled`, always present. Lab-confirmed 2026-10-11: the REST toggle flips exactly this key on both band entries. Hardware 2026-10-11: a real UCG Ultra (10.6) sends `disabled` on every home WLAN, and after a Force Provision all six BSSes on both APs ran `uapsd_advertisement_enabled=0`. UniFi firmware hands it to the driver unchanged (`ubntbox`: `iwpriv <ath> uapsd %d`, firmware-confirmed for 4.0.15), so `disabled` means off. → OpenWrt `uapsd` (hostapd `uapsd_advertisement_enabled`, whose OpenWrt default is 1). |
-| `minrate_data`, `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg` | **Minimum Data Rate Control.** `minrate_data` is the floor in kb/s; `beacon_rate`/`mgmt_rate` simply mirror it. `minrate_cck_rates.status` and `pureg` are derived consequences on 2.4 GHz (a 12 Mbps floor is OFDM, so CCK goes `false` and `pureg` goes `1`). `minrate_below_disable` is the separate "advertising rates" sub-toggle. Emitted per band and **absent entirely** when that band's control is off — not band-gated, which an early reading of a 2.4-GHz-only capture suggested. |
+| `minrate_data`, `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg` | **Minimum Data Rate Control.** `minrate_data` is the floor in kb/s; `beacon_rate`/`mgmt_rate` simply mirror it. `minrate_cck_rates.status` and `pureg` are derived consequences on 2.4 GHz (a 12 Mbps floor is OFDM, so CCK goes `false` and `pureg` goes `1`). `minrate_below_disable` is the separate "advertising rates" sub-toggle: on a UAP it becomes `iwpriv <ath> minrate_nobelow 1` (`ubntbox`), which makes the driver advertise only the legacy rates at or above the floor in beacons, probe responses and association responses (firmware-confirmed for 4.0.15, `umac.ko`: the `minrate_nobelow` setparam sets a VAP flag that `ieee80211_beacon_init`, `ieee80211_send_proberesp` and `ieee80211_setup_assocresp` check before swapping in the rate set `ieee80211_set_minrate_to_rateset_format` built; if no rate left in it is basic, `ieee80211_setminratebasicrates` makes the lowest one basic). That is openUF's `supported_rates` reading. The driver also trims the HT MCS set below the floor (keeping MCS 7/15/23), which OpenWrt has no option for. Emitted per band and **absent entirely** when that band's control is off — not band-gated, which an early reading of a 2.4-GHz-only capture suggested. |
 | `bcfilt.status`, `bcfilt.<k>.mac`, `bcfilt.<k>.status` | **Multicast and Broadcast Blocker** (REST `bc_filter_enabled`/`bc_filter_list`). `status` appears whenever the control is on, including with an empty allow-list; the indexed entries only once it is non-empty. `<k>` is 1-based and does **not** follow the REST list's order — adding a second MAC renumbered the first — so the index means nothing beyond grouping. Emitted on both band entries. |
 | `l2_isolation` | **Client Isolation.** `enabled`\|`disabled`, always present, emitted on both band entries. → OpenWrt `isolate` (hostapd `ap_isolate`). |
 | `devname` | The Ubiquiti-side netdev for this vap (`ath0`…`ath3`). **The join key for the top-level [`macacl.*`](#macacl--mac-address-filter) section**, whose own indices do not line up with `<n>`. Not a name that exists on OpenWrt — enforcement resolves the real netdev via `ubus`. |
@@ -1811,6 +1811,14 @@ The `ath<n>` names are the stock firmware's, and they do not map onto OpenWrt ne
 AP VAPs. A rule of any other shape is logged verbatim and not applied.
 `ebtables.add_vlan.status` is not read.
 
+On a UAP the rules are not interpreted at all (firmware-confirmed for 4.0.15, `ubntbox`'s
+`do_ebtables`): it flushes the `broute`, `nat` and `filter` tables and replays each
+`ebtables.<n>.cmd` as written, into atomic files that are committed together. So the BGA
+drop in and out and the tag drop are the whole of what the controller asks for, and the
+guest rule set (see *Guest portal* above) is the same mechanism. Read back on both APs
+(2026-10-11, `nft list table bridge openuf_l2guard`): the BPDU drop in and out and the
+inbound 802.1Q drop are loaded for every AP VAP, and nothing else is.
+
 ### `system.timezone` / `ntpclient.*` / `cron.*` — system settings
 
 Carried by every full push, and not read by openUF until 2026-09-25. The yesrab/openUF
@@ -1846,6 +1854,12 @@ second, so delays seeded from the clock would match. It used to scan every radio
 on the first heartbeat after 04:00, all at once. (`11k-boot`, two scans within 5 min after a
 config apply, is the same routine and is not implemented: see `11k.status` above.) `cron.<n>.user` is deliberately left
 unrecognized, so it shows in the dropped-key report.
+
+Read back on both APs (2026-10-11, pushed by the real UCG Ultra): `system.timezone` holds the
+site's POSIX string with `openuf_timezone_orig`/`openuf_zonename_orig` stamped beside it,
+`system.ntp.server` holds the four `ubnt.pool.ntp.org` servers with the OpenWrt ones in
+`openuf_ntp_orig`, `date` runs on local time, and root's crontab has the marked block with a
+hand-made line outside it left in place.
 
 ### `connectivity.*`: SSIDs on uplink loss (nothing to do, 2026-10-10)
 
@@ -2371,7 +2385,7 @@ Everything openUF sends. Names were audited against the controller's own Device 
 | `mac`, `serial`, `model`, `platform`, `hostname`, `ip` | `serial` is the MAC with colons stripped |
 | `inform_url`, `cfgversion`, `uptime`, `time` | |
 | **`version`** | **Bare firmware version only — never model-prefixed.** See below. |
-| `required_version`, `bootrom_version`, `country_code` | `bootrom_version` has no counterpart anywhere in the device schema (closest is `boot_time`, a timestamp); likely ignored, left as-is for want of evidence to rename it to. |
+| `required_version`, `bootrom_version`, `country_code` | `bootrom_version` has no counterpart anywhere in the device schema (closest is `boot_time`, a timestamp). A UAP does send it: `mcad` fills it from the `ubootver=` line of `/proc/ubnthal/system.info`, the U-Boot version (firmware-confirmed for 4.0.15). Whether the controller reads it is still unknown, so openUF keeps sending its emulated value. |
 | `mem_total`, **`mem_used`** | Bytes. `mem_used = total − free`; the schema has `mem_used`, not `mem_free`. |
 | **`system-stats`** | Hyphenated key, `{cpu, mem, uptime}` — all three **strings**, cpu/mem as percentages. `cpu` is `0` on the very first inform (delta-sampling `/proc/stat` has no prior sample). |
 | **`sys_stats`** | Sent beside `system-stats`, as UniFi firmware does: `loadavg_1/5/15` as `/proc/loadavg`'s strings, `mem_total`, `mem_used` (total − free), `mem_buffer` in bytes. The UI's **Load Average**. See [VAP, device and radio fields](#vap-device-and-radio-fields-2026-10-10). |
@@ -3611,11 +3625,32 @@ its own vendor IE on every VAP — `dd 0d 02:6f:55 6f:55:46 01 <identity MAC>` v
 `is_unifi` + `serialno`. Not from `iw`: OpenWrt's default iw build strips the printer for
 unknown vendor elements, so the element never appears in `iw scan dump` output, `-u` or not —
 verified live on both boards, where the same cache read over nl80211 held it. The OUI is deliberately not
-Ubiquiti's `00:27:22`: a real UniFi AP would parse our layout as its own. 802.11k-reported
+a Ubiquiti one: a real UniFi AP would parse our layout as its own. 802.11k-reported
 entries are left untagged — a beacon report carries no SSID, so they can never be flagged.
 The yesrab fork saw the same on their mt7986 board (2026-09-28, `40ed2ce`): after a forced
 re-push, `vendor_elements` was in both hostapd configs and on all three VAPs. They had no second
 AP on the build, so no `is_unifi` tag from it.
+
+**The UniFi AP's own element** (firmware-confirmed for 4.0.15). `umac.ko`'s
+`ieee80211_add_ubnt_ie` writes it into every beacon and `libubnt`'s scan parser reads it back;
+`mcad` then reports the parsed fields per scan entry (`is_ubnt`, `is_unifi`, `serialno`,
+`is_default`, `is_locating`, `is_isolated`, `is_vport`, `is_vwire`, `is_meshv3`):
+
+```
+dd <len> | 00 15 6d (OUI) | 00 01 01 (UniFi AP) | <flags> | 01 02 <system id, 2 bytes>
+         | 81 06 <serialno: the device MAC, 6 bytes>
+         | [84 40 <64 bytes>]            only on a vport VAP of an unadopted (default) AP
+         | [82 01 <x>] [83 <n> <bytes>]  only on a vwire VAP; the parser skips both
+flags: 0x01 default (unadopted)  0x02 locating  0x04 vport  0x08 vwire  0x10 isolated  0x20 meshv3
+```
+
+The parser accepts only OUI `00:15:6d` with a body of at least 11 bytes, takes subtype
+`00 01 01` as `is_unifi`, starts the TLVs at offset 13, and logs any tag other than
+`81`-`84`. `mcad` formats `serialno` with `%02X` six times, so 12 uppercase hex digits. `00 00 00` and
+`00 01 00` are other Ubiquiti products (`is_ubnt` only, system id at offset 10). openUF still
+beacons its private element, not this one: a real UAP parsing an openUF beacon would take
+the flags at face value, and `is_vwire`/`is_vport` feed its wireless-uplink choice
+(`find_serialno_vwire_in_uplink_wds_iface_scan_records`).
 
 ### `lldp_table[]` entry
 
@@ -3920,7 +3955,13 @@ through the real UI with the resulting wire payload captured or the effect verif
 - ~~**`linkscore` and `multicast`** have no known source or reference.~~ ✅ Resolved 2026-10-11:
   the firmware sends neither, and the controller reads them only off a mesh uplink. They are no longer sent,
   and neither are `capacity` or `throughput` (see the sta_table field table).
-- **`bootrom_version`** has no counterpart in the device schema. Probably ignored.
+- **`bootrom_version`** has no counterpart in the device schema. The firmware sends it (the
+  U-Boot version, see *Top level*), so keeping it is right. Whether the controller reads it is unknown.
+- **What the plaintext firmware cannot settle.** UAP BZ2 4.0.15 (Jan 2019) predates OWE, PPSK,
+  WPA3 and FT over SAE, Airtime Fairness off, the AP name in the beacon, Roaming Assistant
+  (`btm_disassoc`), `country_beacon`, `tdls_prohibit`, `p2p`, `multicast.inspect` and band
+  steering's Balance mode. Every later build is encrypted, so for these the controller jar and
+  real hardware are the only sources.
 - ~~**openUF's `usteer` config option names**~~ — ✅ resolved 2026-09-10, verified against the
   installed package; the option names and the named `local` section are both correct.
   The option openUF toggled was inert, though. See the corrected `USTEER_DEFAULTS` row: the
