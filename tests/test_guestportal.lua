@@ -178,17 +178,10 @@ return {
 		fn = function()
 			local spec = gp.parse(CAPTURE)
 			local cmds = with_capture(function()
-				assert_eq(gp.reconcile(spec, VAPS, {"de:ad:be:ef:00:02"},
-					{{mac = "de:ad:be:ef:00:02", up = 2048, down = 4096}}, true), 33,
-					"every rule counted (32 in the lab with one bridged VAP)")
+				assert_eq(gp.reconcile(spec, VAPS, {"de:ad:be:ef:00:02"}, true), 31,
+					"every rule counted (30 in the lab with one bridged VAP)")
 			end)
-			local rate_hook = find(cmds, [[pre 'iifname { "phy0-ap1", "phy1-ap1" } jump rate_up']])
-			local in_hook = find(cmds, [[pre 'iifname { "phy0-ap1", "phy1-ap1" } jump guestin']])
-			assert_true(rate_hook ~= nil and rate_hook < in_hook, "rate limits before guestin's accepts")
-			local out_rate = find(cmds, [[post 'oifname { "phy0-ap1", "phy1-ap1" } jump rate_down']])
-			assert_true(out_rate ~= nil and out_rate < find(cmds, "jump guestout"), "and before guestout's")
-			assert_not_nil(find(cmds, "rate_up 'ether saddr de:ad:be:ef:00:02 limit rate over 256000 bytes/second"),
-				"the guest's limit")
+			assert_nil(find(cmds, "rate_"), "rate limits are the shaper's (per-client tc classes)")
 			assert_true(cmds[1]:find("delete table bridge openuf_guest", 1, true) ~= nil, "starts from scratch")
 			assert_true(cmds[2]:find("delete table ip openuf_guest", 1, true) ~= nil, "both tables")
 			assert_not_nil(find(cmds, [[iifname { "phy0-ap1", "phy1-ap1" } jump guestin]]), "ingress hook on both VAPs")
@@ -300,40 +293,6 @@ return {
 				assert_false(gp.set_vaps_up({"phy0-ap1", "phy1-ap1"}, true), "refused")
 			end, "phy0-ap1")
 			assert_eq(#refused, 2, "one refusal does not stop the others")
-		end
-	},
-	{
-		name = "guestportal: set_rates polices each limited guest, per direction",
-		fn = function()
-			local cmds = with_capture(function()
-				assert_true(gp.set_rates({
-					{mac = "DE:AD:BE:EF:00:02", up = 2048, down = 4096},
-					{mac = "de:ad:be:ef:00:03", up = -1, down = 64},
-					{mac = "de:ad:be:ef:00:04"},
-					{mac = "x; reboot", up = 1},
-				}), "applied")
-			end)
-			assert_true(cmds[1]:find("flush chain bridge openuf_guest rate_up", 1, true) ~= nil, "flush first")
-			assert_true(cmds[2]:find("flush chain bridge openuf_guest rate_down", 1, true) ~= nil, "both chains")
-			assert_eq(#cmds, 5, "three limits: up+down for 00:02, down for 00:03")
-			assert_not_nil(find(cmds, "rate_up 'ether saddr de:ad:be:ef:00:02 limit rate over 256000 bytes/second "
-				.. "burst 25600 bytes drop'"), "2048 kbps up = 256000 B/s, 0.1 s of burst")
-			assert_not_nil(find(cmds, "rate_down 'ether daddr de:ad:be:ef:00:02 limit rate over 512000 bytes/second"),
-				"download matches the destination")
-			assert_not_nil(find(cmds, "rate_down 'ether daddr de:ad:be:ef:00:03 limit rate over 8000 bytes/second "
-				.. "burst 24224 bytes drop'"), "a slow limit still bursts a few full frames")
-			assert_eq(find(cmds, "rate_up 'ether saddr de:ad:be:ef:00:03"), nil, "-1: no limit that way")
-			assert_eq(find(cmds, "reboot"), nil, "malformed never spliced")
-			local none = with_capture(function()
-				assert_false(gp.set_rates({{mac = "de:ad:be:ef:00:02", up = 1}}), "no table: nothing to fill")
-			end, "flush chain")
-			assert_eq(#none, 1, "stops after the failed flush")
-			local err = with_stderr(function()
-				with_capture(function()
-					assert_false(gp.set_rates({{mac = "de:ad:be:ef:00:02", up = 1}}), "rejected")
-				end, "limit rate")
-			end)
-			assert_true(err:find("not rate-limited", 1, true) ~= nil, "said")
 		end
 	},
 	{

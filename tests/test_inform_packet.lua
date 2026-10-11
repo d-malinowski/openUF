@@ -3023,8 +3023,7 @@ return {
 				deauth = function(mac, ifnames)
 					kicks[#kicks + 1] = {mac = mac, ifnames = ifnames}; order[#order + 1] = "deauth"
 				end}
-			inform._guestportal = {set_rates = function() end,
-				set_authorized = function() order[#order + 1] = "nft" end}
+			inform._guestportal = {set_authorized = function() order[#order + 1] = "nft" end}
 			inform._ucihelper = bss_mock()
 			inform._guest_kicked = {}
 			local ok, err = pcall(function()
@@ -5120,8 +5119,8 @@ return {
 			inform._guestportal = {
 				parse = real.parse, is_guest_rule = real.is_guest_rule, PORT = real.PORT,
 				bridge_mac = function(ifname) return ifname == "phy0-ap1" and "02:00:00:00:00:aa" or nil end,
-				reconcile = function(spec, vaps, macs, rates, selfrun)
-					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs, rates = rates,
+				reconcile = function(spec, vaps, macs, selfrun)
+					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs,
 						selfrun = selfrun}
 					return 1
 				end,
@@ -5146,8 +5145,7 @@ return {
 					st, {net = {lan_cpueth = "eth0"}})
 			end
 			local ok, err = pcall(function()
-				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1},
-					guest_rates = {["de:ad:be:ef:00:02"] = {up = 2048}, ["de:ad:be:ef:00:09"] = {up = 1}}})
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
 				push(st, "enabled")
 				assert_true(st.guest_portal and st.guest_portal.enabled, "the portal's facts kept")
 				assert_eq(st.guest_portal.unknown, nil, "the report is not persisted")
@@ -5158,8 +5156,6 @@ return {
 				assert_eq(#r.vaps, 2, "both guest netdevs")
 				assert_eq(r.vaps[1].bridge_mac, "02:00:00:00:00:aa", "with their bridge MAC")
 				assert_eq(table.concat(r.macs, ","), "de:ad:be:ef:00:02", "and the ledger")
-				assert_eq(#r.rates, 1, "and the rate limits of authorized guests only")
-				assert_eq(r.rates[1].up, 2048, "kbps as received")
 				assert_false(r.selfrun, "the controller is there: no selfrun")
 				inform._guest_selfrun_on = true
 				inform._guest_enforce(st)
@@ -5209,47 +5205,161 @@ return {
 		end
 	},
 	{
-		name = "inform packet: rate-update keeps a per-guest limit while the guest is authorized",
+		-- The controller sends rate-update for any client with a WiFi Speed
+		-- Limit profile of its own, not only portal guests: each time it
+		-- connects, roams or reconnects (the qos_policy_applied latch) and
+		-- when the profile changes. update_sta_qosrate takes it for any
+		-- associated station, and -1 lifts that station's cap.
+		name = "inform packet: rate-update keeps a per-client limit for any associated client",
 		fn = function()
-			local real = inform._guestportal
-			local rates
-			inform._guestportal = {set_authorized = function() end, set_rates = function(r) rates = r end}
 			local save, saves = inform._state.save, 0
 			inform._state.save = function() saves = saves + 1 end
+			local real_sh, synced = inform._shaper, {}
+			inform._shaper = {sync = function(d) synced[#synced + 1] = d end}
 			local ok, err = pcall(function()
-				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				local st = sample_state({})
+				inform._shape_obs = {complete = true,
+					by_ifname = {wlan0 = {down = 5000, macs = {"de:ad:be:ef:00:02"}}},
+					where = {["de:ad:be:ef:00:02"] = "wlan0"}, conn = {["de:ad:be:ef:00:02"] = 30}}
 				local function upd(mac, ul, dl)
 					inform.handle_response(cjson.encode({_type = "cmd", cmd = "rate-update", mac = mac,
 						ul_max = ul, ul_min = 64, dl_max = dl, dl_min = 64}), st)
 				end
-				inform._guest_built = "phy0-ap1=x"
 				upd("DE:AD:BE:EF:00:02", 2048, 4096)
-				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].up, 2048, "upload kbps")
-				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].down, 4096, "download kbps")
-				assert_eq(saves, 1, "persisted: sent once per authorization")
-				assert_eq(#rates, 1, "applied")
-				assert_eq(rates[1].mac, "de:ad:be:ef:00:02", "to that guest")
+				assert_eq(st.sta_rates["de:ad:be:ef:00:02"].up, 2048, "upload kbps")
+				assert_eq(st.sta_rates["de:ad:be:ef:00:02"].down, 4096, "download kbps")
+				assert_eq(saves, 1, "persisted")
+				assert_eq(#synced, 1, "applied at once")
+				assert_eq(synced[1].wlan0.down.stas["de:ad:be:ef:00:02"], 4096, "replacing the WLAN's 5000")
 				upd("de:ad:be:ef:00:02", 2048, 4096)
 				assert_eq(saves, 1, "a repeat changes nothing")
+				assert_eq(#synced, 1, "and applies nothing")
 				upd("de:ad:be:ef:00:02", -1, 4096)
-				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].up, nil, "-1: no upload limit")
+				assert_eq(st.sta_rates["de:ad:be:ef:00:02"].up, -1, "-1 is kept: it lifts the cap")
+				upd("de:ad:be:ef:00:02", nil, 0)
+				assert_eq(st.sta_rates["de:ad:be:ef:00:02"].down, -1, "missing or 0 is -1 too")
+				assert_eq(synced[#synced].wlan0.down.stas["de:ad:be:ef:00:02"], 0, "uncapped under the WLAN limit")
+				local before = saves
 				upd("de:ad:be:ef:00:03", 2048, 4096)
-				assert_eq(st.guest_rates["de:ad:be:ef:00:03"], nil, "not authorized: not kept")
+				assert_nil(st.sta_rates["de:ad:be:ef:00:03"], "not associated here: ignored, as the firmware does")
+				assert_eq(saves, before, "not even stored")
 				upd("x;reboot", 1, 1)
-				inform.handle_response('{"_type":"cmd","cmd":"unauthorize-guest","mac":"de:ad:be:ef:00:02"}', st)
-				assert_eq(next(st.guest_rates), nil, "leaves with the authorization")
-				assert_eq(#rates, 0, "and from the kernel")
-				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"de:ad:be:ef:00:02"}', st)
-				upd("de:ad:be:ef:00:02", 512, 512)
-				upd("de:ad:be:ef:00:02", -1, -1)
-				assert_eq(next(st.guest_rates), nil, "-1 both ways: no limit at all")
-				inform._guest_built = nil
-				rates = nil
-				upd("de:ad:be:ef:00:02", 512, 512)
-				assert_eq(st.guest_rates["de:ad:be:ef:00:02"].down, 512, "no portal built: the ledger only")
-				assert_eq(rates, nil, "nothing to apply it to")
+				assert_nil(st.sta_rates["x;reboot"])
+				inform._shape_obs = nil
+				upd("de:ad:be:ef:00:04", 512, 512)
+				assert_eq(st.sta_rates["de:ad:be:ef:00:04"].down, 512, "before the first heartbeat: kept")
 			end)
-			inform._guestportal, inform._state.save, inform._guest_built = real, save, nil
+			inform._state.save, inform._shaper, inform._shape_obs = save, real_sh, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: _shaper_resync shapes each listed client at its WLAN's limit or its own",
+		fn = function()
+			local save = inform._state.save
+			inform._state.save = function() end
+			local real_sh, got = inform._shaper, nil
+			inform._shaper = {sync = function(d) got = d end}
+			local ok, err = pcall(function()
+				local A, B, C = "de:ad:be:ef:00:0a", "de:ad:be:ef:00:0b", "de:ad:be:ef:00:0c"
+				local st = sample_state({sta_rates = {[B] = {up = 300, down = -1}, [C] = {up = -1, down = 200}}})
+				inform._sta_conn = {}
+				inform._shape_obs = {complete = true,
+					by_ifname = {
+						wlan0 = {down = 5000, up = 1000, macs = {A, B}},
+						wlan1 = {macs = {C}},
+						wlan2 = {macs = {"de:ad:be:ef:00:0d"}},
+					},
+					where = {[A] = "wlan0", [B] = "wlan0", [C] = "wlan1", ["de:ad:be:ef:00:0d"] = "wlan2"},
+					conn = {[A] = 10, [B] = 10, [C] = 10}}
+				assert_true(inform._shaper_resync(st))
+				assert_eq(got.wlan0.down.default, 5000, "the WLAN's limit for new clients")
+				assert_eq(got.wlan0.down.stas[A], 5000, "A at the WLAN's limit, in its own class")
+				assert_eq(got.wlan0.up.stas[A], 1000)
+				assert_eq(got.wlan0.down.stas[B], 0, "B's own -1: uncapped")
+				assert_eq(got.wlan0.up.stas[B], 300, "B's own upload limit")
+				assert_eq(got.wlan1.down.stas[C], 200, "a client's download limit alone, on an unlimited WLAN")
+				assert_nil(got.wlan1.down.default)
+				assert_nil(got.wlan2, "no limit anywhere: not shaped")
+			end)
+			inform._state.save, inform._shaper, inform._shape_obs = save, real_sh, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a client's own limit lasts one association",
+		fn = function()
+			local save, saves = inform._state.save, 0
+			inform._state.save = function() saves = saves + 1 end
+			local real_sh = inform._shaper
+			inform._shaper = {sync = function() end}
+			local ok, err = pcall(function()
+				local A, B = "de:ad:be:ef:00:0a", "de:ad:be:ef:00:0b"
+				local st = sample_state({sta_rates = {[A] = {up = 300, down = 300}, [B] = {up = 1, down = 1}}})
+				inform._sta_conn = {}
+				local function obs(complete, conn)
+					local where, macs = {}, {}
+					for m in pairs(conn) do where[m] = "wlan0"; macs[#macs + 1] = m end
+					inform._shape_obs = {complete = complete, by_ifname = {wlan0 = {macs = macs}},
+						where = where, conn = conn}
+				end
+				obs(true, {[A] = 100, [B] = 100})
+				inform._shaper_resync(st)
+				assert_true(st.sta_rates[A] and st.sta_rates[B], "both still connected")
+				assert_eq(saves, 0, "nothing changed")
+				obs(true, {[A] = 110})
+				inform._shaper_resync(st)
+				assert_nil(st.sta_rates[B], "B left: its limit goes")
+				assert_eq(saves, 1, "persisted")
+				obs(false, {})
+				inform._shaper_resync(st)
+				assert_true(st.sta_rates[A] ~= nil, "a listing that failed proves nothing: A's kept")
+				obs(true, {[A] = 5})
+				inform._shaper_resync(st)
+				assert_nil(st.sta_rates, "A's connected time dropped: a new association, the limit goes")
+			end)
+			inform._state.save, inform._shaper, inform._shape_obs = save, real_sh, nil
+			inform._sta_conn = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: build_json hands each netdev's stations and limits to the shaper",
+		fn = function()
+			local orig_si, orig_uci = inform._sysinfo, inform._ucihelper
+			local ok, err = pcall(function()
+				inform._sysinfo = setmetatable({sta_table = function(ifname)
+					if ifname == "wlan0" then return {{mac = "DE:AD:BE:EF:00:0A", connected_sec = 42}} end
+					if ifname == "wlan0.10" then return {{mac = "de:ad:be:ef:00:0b", connected_sec = 7}} end
+					error("iw failed")
+				end}, {__index = orig_si})
+				inform._ucihelper = setmetatable({
+					get_vap_table = function()
+						return {
+							{name = "a", essid = "corp", radio_name = "radio0", radio = "ng", usage = "user",
+							 ratelimit_down = 5000, ratelimit_up = 1000},
+							{name = "b", essid = "iot", radio_name = "radio0", radio = "ng", usage = "user"},
+						}
+					end,
+					get_ifnames_for_vap = function(_, essid)
+						if essid == "corp" then return {"wlan0", "wlan0.10"} end
+						return {"wlan1"}
+					end,
+				}, {__index = orig_uci})
+				local out = cjson.decode(inform.build_json(sample_state({adopted = true}), {}, nil))
+				local o = inform._shape_obs
+				assert_eq(o.by_ifname.wlan0.down, 5000, "the WLAN's limits on each of its netdevs")
+				assert_eq(o.by_ifname["wlan0.10"].up, 1000, "a VLAN netdev's too")
+				assert_eq(o.by_ifname.wlan0.macs[1], "de:ad:be:ef:00:0a", "lower-cased")
+				assert_eq(o.where["de:ad:be:ef:00:0b"], "wlan0.10", "shaped where it is listed")
+				assert_eq(o.conn["de:ad:be:ef:00:0a"], 42)
+				assert_false(o.complete, "wlan1's listing failed")
+				for _, v in ipairs(out.vap_table or {}) do
+					assert_nil(v.ratelimit_down, "internal: never sent")
+					assert_nil(v.ratelimit_up)
+				end
+			end)
+			inform._sysinfo, inform._ucihelper, inform._shape_obs = orig_si, orig_uci, nil
 			if not ok then error(err, 0) end
 		end
 	},
@@ -5705,6 +5815,30 @@ return {
 				orig.sr, orig.rl, orig.rrm, orig.bj
 			if not ok then error(err, 0) end
 			assert_eq(ran, 1, "before build_json")
+		end
+	},
+	{
+		name = "inform packet: every heartbeat applies the speed limits after build_json, not without it",
+		fn = function()
+			local orig = {sh = inform._shaper_resync, rl = inform._reload_if_changed, rrm = inform._rrm_tick,
+				bj = inform.build_json, bp = inform.build_packet}
+			local order = {}
+			inform._shaper_resync = function() order[#order + 1] = "shaper" end
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() order[#order + 1] = "build_json"; return "{}" end
+			inform.build_packet = function() error("stop here") end
+			local ok, err = pcall(function()
+				with_stderr(function() inform._tick({}, nil, nil, {interval = 10}) end)
+				assert_eq(table.concat(order, ","), "build_json,shaper", "on the stations it just listed")
+				order = {}
+				inform.build_json = function() error("no payload") end
+				with_stderr(function() inform._tick({}, nil, nil, {interval = 10}) end)
+				assert_eq(#order, 0, "no fresh listing: nothing applied")
+			end)
+			inform._shaper_resync, inform._reload_if_changed, inform._rrm_tick, inform.build_json,
+				inform.build_packet = orig.sh, orig.rl, orig.rrm, orig.bj, orig.bp
+			if not ok then error(err, 0) end
 		end
 	},
 }

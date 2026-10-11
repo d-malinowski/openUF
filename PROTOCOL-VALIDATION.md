@@ -913,7 +913,7 @@ VAP's bridge.
 |---|---|
 | `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above (openUF: into `st.guest_authorized`). A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
 | `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above. openUF: out of `st.guest_authorized`, then a deauth on every BSS (see below) |
-| `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per authorization (`qos_policy_applied` latch), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's user group rate is sent instead (same sender) |
+| `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per association (`qos_policy_applied` latch, reset on roam and reconnect), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's own WiFi Speed Limit profile is sent instead, if it is not the site default (same sender). openUF applies it per client, see "`qos.*` — WiFi Speed Limit" |
 
 **`unauthorize-guest` disconnects the guest (lab-validated only, 2026-10-10).** UniFi
 firmware drops the MAC from `/var/run/guest.authorized` and the authorized ipset, then
@@ -1580,8 +1580,69 @@ qos.ebt.1.cmd=PREROUTING --in-interface ath0 -j mark --mark-or 0x1000 ...
 |---|---|
 | Units | **kbps**. The UI's Mbps value × 1000. |
 | Discriminator | **Presence of `maxspeed`.** Not `qos.status` (global), and *not the block itself*: an unlimited vap still gets a `qos.vap.<m>` block carrying only `minspeed`, set to that radio's raw `devspeed` (570 on 2.4 GHz, 2400 on 5 GHz here). Treating the block as "limited" would cap every WLAN at its own PHY rate. |
-| Scope | A **per-VAP aggregate** cap, not per-client — there is no per-station structure on the wire. All clients on the SSID share the ceiling, which is what makes one qdisc per VAP sufficient. |
-| `qos.ebt.<n>.cmd` | Literal ebtables fragments the stock firmware would replay to fwmark each VAP. openUF implements the intent with `tc` instead (`shaper.lua`), since ebtables is not a given on OpenWrt while `tc` ships in the base iproute2. |
+| Scope | **Per client.** Corrected 2026-10-11: this row used to say "per-VAP aggregate", inferred from the wire having no per-station structure. The firmware shows otherwise (below): `maxspeed` is each station's cap. |
+| `qos.ebt.<n>.cmd` | Literal ebtables fragments that fwmark each VAP's frames both ways (`PREROUTING --in-interface ath0` and `POSTROUTING --out-interface ath0`, `--mark-or 0x1000` for VAP 1, `0x2000` for VAP 2). openUF matches on MAC addresses with `tc` instead (`shaper.lua`). |
+| `qos.if.<n>` | The interfaces to build an HTB tree on (`eth0` typed `uplink`, then each VAP) with their link speed in Mbit/s (`devspeed`). |
+
+**What the firmware does with it (firmware-confirmed for 4.0.15).** `ubntbox`'s `do_qos`
+writes a script that runs `qosLinkInit.sh 1 <devname> <devspeed>` per `qos.if` (an HTB root
+with default class `1:9000`, sfq, ceil = link speed) and
+`qosLinkAddVap.sh <devname> <id> <devspeed> <devspeed> <min> <max> <maxclient>` per VAP. The
+VAP's class `1:<id>` gets ceil = **link speed**, not `maxspeed`. `maxspeed` is passed down as
+the per-station default (`STA_RATE_MAX`, kbps), and the script's own per-station class line
+is commented out. The per-station classes come from `libubnt`'s `config_sta_qosrule`
+(`add_sta_qosrule` on association, `remove_sta_qosrule` on disassociation): `tc class add
+dev <vap> parent 1:<id> classid 1:<(id << 11) + associd> htb rate <min> ceil <dl_maxspeed>
+prio <id> quantum 1500` plus an sfq leaf, and the same on the uplink device read from
+`/var/run/system.uplink` (`eth0`) with `ul_maxspeed`. It skips a VAP whose `maxspeed` equals
+its link speed (no limit). The fw filter maps the VAP mark plus the driver's associd bits to
+that classid, so broadcast and multicast (no station) fall to the unshaped default class.
+Both directions are queued (HTB egress on the VAP and on `eth0`), nothing is policed.
+`update_sta_qosrate` (`rate-update`) runs `tc class change` on one station's classes, adding
+them when the VAP had none; a negative `dl_max`/`ul_max` sets that station's ceil to the
+link speed, i.e. lifts its cap even on a limited VAP. The controller's UI text agrees: "The
+maximum amount of data that can be transferred to a device" (10.4.57 locale,
+`SETTINGS_PROFILES_WIFI_SPEED_LIMIT_FORM_DESCRIPTION_LIMIT_BANDWIDTH_DOWNLOAD`).
+
+**`rate-update` is any client's own profile, not only a guest's.** The controller (10.6,
+`TtZhv`) builds `{"cmd":"rate-update","mac","ul_max","ul_min":64,"dl_max","dl_min":64}`
+from a WiFi Speed Limit profile (`qos_rate_max_up/_down`, `-1` = none). It sends it when a
+client's profile is changed while it is online, for every online client of a profile that is
+edited, and from the station processor's `qos_policy_applied` latch: once per association
+for a guest with `qos_overwrite` or **any client whose profile is not the site default**.
+The latch resets when the client roams to another AP or its reported uptime drops
+(reconnect). A client moved back to Default gets the Default profile's `-1/-1`.
+
+**openUF (`shaper.lua`, `inform._shaper_resync`)**: per netdev that lists stations, one HTB
+class per station matched on its MAC (u32: destination at -14/-12 for download, source at
+-8/-4 on an IFB device the netdev's ingress is redirected to for upload), an fq_codel leaf
+each, a catch-all class at the WLAN's rate for unicast to (or from) a station not yet seen,
+and group-addressed frames unshaped. `rate-update` for any associated MAC goes into
+`st.sta_rates` and replaces the WLAN's rate for that client (`-1`: uncapped); it is dropped
+when the client leaves or its connected time drops, as the firmware's class is. Changes are
+incremental: a station joining or leaving adds or removes only its class and filter.
+
+Evidence, 2026-10-11:
+- Docker kernel + iproute2, veth "stations" behind one "VAP", iperf3 both at once:
+  per-client classes held 4.72 and 2.80 Mbit/s under 5 and 3 Mbit/s. The police fallback
+  held 2.10 and 1.05 under 2 and 1 with openUF's burst, but only 0.78 Mbit/s under 2 with a
+  0.1 s bucket. A `-1` override took that client to 9.19 Gbit/s; an unchanged input ran 0
+  commands; a client leaving ran 3. u32 keys must be 4-byte aligned (`match u32 ... at -14`
+  is `Illegal "match"`).
+- Lab, 10.4.57: a 4000/2000 profile on the WLAN pushed `qos.vap.<m>.dwnlink.maxspeed=4000`
+  and `uplink.1.maxspeed=2000`; openUF built one 4 Mbit class per mock station. Giving one
+  client an 8000/-1 profile brought `rate-update` with `dl_max 8000, ul_max -1` within one
+  heartbeat; only that client's class changed, and its upload became `action pass`.
+  Dropping its connected time (a simulated reconnect) brought the same `rate-update` again
+  on the next heartbeat. Moving it back to Default sent `-1/-1`, which lifted its cap. Removing the
+  WLAN's profile tore everything down. `handle_response failed` = 0 throughout.
+- Hardware, UCG Ultra 10.6, a temporary SSID with a 5000/2000 profile: the tree built on
+  both APs with `tc-tiny` (ath10k and ath9k on the Archer C5, mt76 on the AX3000T), each
+  SSID netdev's ingress redirected to its own `oufb<ifindex>`. A phone on 2.4 GHz got class
+  `1:10` in both directions; sampled each second at the AP, its upload ran 1.97 Mbit/s over
+  the whole 25 s upload window (1.94 over the middle 14 s) and its download 4.54 Mbit/s;
+  fast.com showed 4.7/2.1 (a first run showed 2.6 up, which the AP's counters do not bear
+  out). The home SSIDs were never shaped; deleting the SSID removed every class and IFB.
 
 ### `netconf.*` / `dhcpc.*` / `route.*` / `resolv.*` — IP settings
 
@@ -3735,7 +3796,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 35 | Multicast and Broadcast Blocker | `wireless.<n>.bcfilt.status` + `bcfilt.<k>.mac`/`.status` | ✅ Wire format confirmed live 2026-07-18 across four diffs (on with one MAC, with two MACs, on with an empty list, off). Two keys already on the wire were **excluded** as candidates by the same diffs: `radio.<n>.bcmc_l2_filter.status` (sits at `enabled` with the control off) and `wireless.<n>.multicast.inspect` — neither moved. ✅ Enforcement confirmed on real hardware 2026-09-02 (AX3000T, nftables 1.1.6, kernel 6.12), measured with counter-only probe rules carrying the same predicate: broadcast sourced onto the VLAN from a second AP and flooded out the IoT VAP matched the drop rule **14 of 14** times with that sender absent from the allow-list, and **0 of 15** times after adding it through the controller — both halves of the control, and the `bcfilt.<k>.mac` parse, end to end. ⚠️ Requires `kmod-nft-bridge`: the drop rule is openUF's only bridge-family `meta` match, `nft_meta_bridge` is absent from stock filogic and ath79 images alike, and without it the kernel returns a bare `Could not process rule: No such file or directory` **only for that rule** — table, chain and allow-list set all build, so the control appeared enabled everywhere while filtering nothing. `firewall.lua`'s block-sta matches on `ether saddr` alone, needs no module, and worked throughout, which is what hid this. |
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
 | 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
-| 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname` | ✅ Wire format confirmed live 2026-07-18 by creating a speed-limit profile (33/17 Mbps) and assigning it to a WLAN. Values are **kbps**, and the discriminator is the presence of `maxspeed` — an unlimited vap still gets a block, carrying only `minspeed` set to its raw `devspeed`. The cap is a **per-VAP aggregate**, not per-client. Requires a profile to exist before the per-WLAN toggle does anything. ⚠️ Enforcement is openUF's own `tc` ruleset (`shaper.lua`), since no hostapd/OpenWrt option expresses a throughput cap: HTB on egress for downlink, ingress policing for uplink. Every generated command is verified against real tc (iproute2 6.9.0), but the on-air throughput is unverified (no real radios). |
+| 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname`; a client's own profile as `rate-update` | ✅ Wire format confirmed live 2026-07-18 (kbps; the discriminator is the presence of `maxspeed`; needs a profile to exist). **Per client**, both directions queued (firmware-confirmed for 4.0.15; corrected 2026-10-11 from "per-VAP aggregate"). openUF: one HTB class per client per direction (upload on an IFB), live on both APs 2026-10-11: a phone held 1.97 Mbit/s up under 2 and 4.5 down under 5. See "`qos.*` — WiFi Speed Limit" |
 | 39 | Ports view Connection column on an **uplink** port | `port_table[]` with **no** `mac_table` field on `is_uplink` ports | ✅ Blank (or a retained stale value) is the CORRECT state, verified 2026-09-12. Reporting the one MAC on the other end of the cable is tempting — openUF knows it, since finding it is how the uplink socket is identified, and a real UniFi gateway visibly does it on its own uplink port — but it would invert the topology map: the controller files a known device seen alone on a port into this device's `downlink_table`, and the `isUplinkMac` guard against that is ANDed with `!is_uplink`, so it disables itself on exactly the port where it is needed. The gateway would hang beneath every AP that reported it. A real gateway escapes it only because the ISP's router is not an adopted device. Live proof of the correct shape: both APs' `downlink_table` empty, the gateway's holding both APs. The stale text persists because `last_connection` is never recomputed when a port sends no `mac_table` field (and only ever recomputed when a port reports exactly **one** MAC) — clear it with the Ports view's **Clear Last Seen Device**. |
 | 40 | Roaming Assistant | `wifi_caps2` bit `0x20` → `wireless.<n>.btm_disassoc.status`/`.threshold` | ✅ Wire format, gate and teardown confirmed live in the lab (10.4.57) and against a real UCG Ultra (Network 10.6), 2026-09-26: the keys arrive on the 5 GHz WLAN entry only, and switching off removes openUF's stamp on both APs. **Steering confirmed on real radios:** a client at −80 dBm on one AP, heard at −52 by the other, got a BTM request, answered `BSS-TM-RESP status_code=4` (refused), was disassociated 16 s later by openUF, and reassociated on the other AP within 1 s at −61 dBm. Its hostapd `extended_capabilities` did not advertise BSS Transition, yet it answered, so the capability bytes do not predict which clients reply. It stayed put for all 30 one-minute samples, with no further actions. The no-better-AP rule is unit-tested only: no qualifying client was present. |
 

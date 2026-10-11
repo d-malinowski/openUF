@@ -121,9 +121,9 @@ M.FIELDS = {
 	-- one-shot cmds, so both have to outlive a restart.
 	guest_wlans               = "table",
 	guest_authorized          = "table",
-	-- Per-guest rate limits from rate-update ({mac = {up=, down=}} kbps),
-	-- sent once per authorization.
-	guest_rates               = "table",
+	-- Per-client WiFi Speed Limits from rate-update ({mac = {up=, down=}}
+	-- kbps, -1 = none), one association each (inform._shaper_resync).
+	sta_rates                 = "table",
 	-- The portal's enforcement facts (guestportal.parse) while it is on;
 	-- the nft tables are rebuilt from it at startup.
 	guest_portal              = "table",

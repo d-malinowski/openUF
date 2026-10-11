@@ -24,8 +24,7 @@
 	       tcp 80 -> local answer; everything else -> drop
 	  out: DHCP reply, ARP -> accept; IPv6, other broadcast, multicast -> drop
 
-	ahead of both, a per-guest rate limit from rate-update (set_rates), and
-	after the authorized accept a `selfrun` chain that lets every guest
+	After the authorized accept, a `selfrun` chain that lets every guest
 	through while the controller is unreachable (set_selfrun); with
 	selfrun_guest_mode=off the guest VAPs go down instead (set_vaps_up).
 
@@ -255,45 +254,6 @@ function M.set_authorized(macs)
 	return true
 end
 
--- One rate_up/rate_down rule set per limited guest, from rate-update
--- ({mac=, up=kbps, down=kbps}; nil, 0 or -1 = no limit that way). Policed
--- with nft `limit`, not queued: the per-VAP WiFi Speed Limit (shaper.lua)
--- owns the VAP's tc root qdisc, and a guest's frames cross this table in
--- both directions anyway. Excess is dropped and TCP backs off. ul_min /
--- dl_min (a 64 kbps floor) need queueing and are not applied.
-M.RATE_BURST_S = 0.1
-M.RATE_BURST_MIN = 16 * 1514
-local function rate_rule(dir, mac, kbps)
-	local bytes = math.floor(kbps * 125)
-	local burst = math.max(math.floor(bytes * M.RATE_BURST_S), M.RATE_BURST_MIN)
-	return "ether " .. dir .. " " .. mac .. " limit rate over " .. string.format("%.0f", bytes)
-		.. " bytes/second burst " .. string.format("%.0f", burst) .. " bytes drop"
-end
-local function limited(kbps)
-	kbps = tonumber(kbps)
-	return kbps and kbps > 0 and kbps < 1e7 and kbps or nil
-end
-
-function M.set_rates(rates)
-	local T = M.BRIDGE_TABLE
-	if not nft("flush chain " .. T .. " rate_up 2>/dev/null") then return false end
-	nft("flush chain " .. T .. " rate_down 2>/dev/null")
-	local ok = true
-	for _, r in ipairs(rates or {}) do
-		if is_mac(r.mac) then
-			local mac = r.mac:lower()
-			local up, down = limited(r.up), limited(r.down)
-			if up and not nft("add rule " .. T .. " rate_up '" .. rate_rule("saddr", mac, up) .. "'") then ok = false end
-			if down and not nft("add rule " .. T .. " rate_down '" .. rate_rule("daddr", mac, down) .. "'") then ok = false end
-		end
-	end
-	if not ok then
-		io.stderr:write("openuf: guestportal: nft rejected a guest rate limit (nft_limit?); "
-			.. "some guests are not rate-limited\n")
-	end
-	return ok
-end
-
 -- selfrun_guest_mode=pass while the controller is unreachable (the firmware's
 -- AUTHORIZED_GUESTS ACCEPT-all): every guest
 -- is let through as an authorized one would be (to other hosts only, and
@@ -323,10 +283,10 @@ function M.set_vaps_up(ifnames, up)
 end
 
 -- Rebuild both tables for spec on these VAPs ({ifname=, bridge_mac=}), with
--- macs authorized, rates (see set_rates) and selfrun (see set_selfrun) applied. Returns the number of
+-- macs authorized and selfrun (see set_selfrun) applied. Returns the number of
 -- rules installed (0, tables gone, when there is nothing to enforce or
 -- nothing to enforce it on).
-function M.reconcile(spec, vaps, macs, rates, selfrun)
+function M.reconcile(spec, vaps, macs, selfrun)
 	M._exec("nft delete table " .. M.BRIDGE_TABLE .. " 2>/dev/null")
 	M._exec("nft delete table " .. M.NAT_TABLE .. " 2>/dev/null")
 	if type(spec) ~= "table" or not spec.enabled then return 0 end
@@ -353,15 +313,10 @@ function M.reconcile(spec, vaps, macs, rates, selfrun)
 	nft("add chain " .. T .. " guestin")
 	nft("add chain " .. T .. " guestout")
 	nft("add chain " .. T .. " redirect_http")
-	nft("add chain " .. T .. " rate_up")
-	nft("add chain " .. T .. " rate_down")
 	nft("add chain " .. T .. " selfrun")
 
 	local rules = {
-		-- Rate limits first: guestin/guestout end in accept.
-		{"pre",  "iifname " .. set .. " jump rate_up"},
 		{"pre",  "iifname " .. set .. " jump guestin"},
-		{"post", "oifname " .. set .. " jump rate_down"},
 		{"post", "oifname " .. set .. " jump guestout"},
 		{"guestin", "ether type 0x888e accept"},
 	}
@@ -415,7 +370,6 @@ function M.reconcile(spec, vaps, macs, rates, selfrun)
 			.. "the bridge family need kmod-nft-bridge. The guest portal is NOT fully enforced.\n")
 	end
 	M.set_authorized(macs)
-	M.set_rates(rates)
 	M.set_selfrun(selfrun)
 
 	-- The marked frames reach the bridge's own stack; send them to M.PORT.

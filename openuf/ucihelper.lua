@@ -16,7 +16,6 @@ M._uci        = nil  -- override with a mock UCI table; nil = require("uci")
 -- tests can capture the reconciled rules without shelling out to real nft.
 M._bcfilter   = nil  -- nil = load openuf/bcfilter.lua on first use
 -- "WiFi Speed Limit" enforcement (tc). Injectable for the same reason.
-M._shaper     = nil  -- nil = load openuf/shaper.lua on first use
 -- Minimum RSSI's constants (wire offset, refusal margin).
 M._minrssi    = nil  -- nil = load openuf/minrssi.lua on first use
 M._run_cmd    = function(cmd) return os.execute(cmd) end
@@ -90,7 +89,6 @@ local function get_sibling(name, override)
 end
 
 local function get_bcfilter() return get_sibling("bcfilter", M._bcfilter) end
-local function get_shaper()   return get_sibling("shaper",   M._shaper)   end
 local function get_minrssi()  return get_sibling("minrssi",  M._minrssi)  end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
@@ -1173,18 +1171,16 @@ end
 --       Beacon"); defaults to "openUF" if nil. opts.peer_ie is the
 --       vendor_elements hex every VAP beacons so sibling openUF APs can tell
 --       it is not a rogue (sysinfo.peer_ie_hex); nil removes it.
--- Drive the two kernel-resident features from one normalized list of
--- {ifname, bcfilt_enabled, bcfilt_macs, down_kbps, up_kbps} entries, so the
--- setparam path and the startup reapply below cannot drift apart.
+-- Drive the Multicast and Broadcast Blocker from one normalized list of
+-- {ifname, bcfilt_enabled, bcfilt_macs} entries, so the setparam path and the
+-- startup reapply below cannot drift apart.
 --
--- Both are reconciled unconditionally, even with an empty list: each rebuilds
--- from scratch rather than diffing, so turning a control off in the controller
+-- Reconciled unconditionally, even with an empty list: it rebuilds from
+-- scratch rather than diffing, so turning the control off in the controller
 -- tears the previous ruleset down instead of leaving it in place -- the same
--- contract firewall.lua keeps. That is also why EVERY managed VAP is passed to
--- the shaper and not just the capped ones: shaper.reconcile clears each
--- interface it is handed before reshaping it, so a VAP whose limit was just
--- removed has to appear here, with both rates nil, to get its old qdisc torn
--- down.
+-- contract firewall.lua keeps. (WiFi Speed Limit is per client, so it needs
+-- the stations: inform's _shaper_resync applies it every heartbeat from the
+-- openuf_ratelimit_* stamps, see shaper.lua.)
 local function reconcile_runtime(entries)
 	local bcfilter = get_bcfilter()
 	if bcfilter then
@@ -1195,19 +1191,6 @@ local function reconcile_runtime(entries)
 			end
 		end
 		bcfilter.reconcile(rules)
-	end
-
-	local shaper = get_shaper()
-	if shaper then
-		local rules = {}
-		for _, e in ipairs(entries) do
-			rules[#rules + 1] = {
-				ifname    = e.ifname,
-				down_kbps = e.down_kbps,
-				up_kbps   = e.up_kbps,
-			}
-		end
-		shaper.reconcile(rules)
 	end
 end
 
@@ -1497,10 +1480,10 @@ function M.apply_config(resp, cfg, opts)
 				extra.macfilter = M.DELETE
 				extra.maclist   = M.DELETE
 			end
-			-- "WiFi Speed Limit". Recorded on the section so the configured
-			-- state shows up in `uci show`; the actual enforcement is tc, done
-			-- after the wifi reload below (see shaper.lua for why no hostapd or
-			-- OpenWrt option can express it). Values are kbps, as pushed.
+			-- "WiFi Speed Limit", kbps as pushed. Read back by get_vap_table
+			-- for inform's _shaper_resync, which enforces it per client with
+			-- tc (shaper.lua: no hostapd or OpenWrt option expresses it).
+			-- Absent means no limit: wlan_clear drops the section first.
 			if vap.ratelimit_down_kbps then
 				extra.openuf_ratelimit_down = vap.ratelimit_down_kbps
 			end
@@ -1628,23 +1611,19 @@ function M.apply_config(resp, cfg, opts)
 	M._ws_cache   = nil
 	M._pass_cache = nil
 
-	-- "Multicast and Broadcast Blocker" (nftables) and "WiFi Speed Limit" (tc)
-	-- enforcement. Deliberately after the reload: the rules key off each VAP's
-	-- live netdev name, which only exists (and can change) once netifd has
-	-- brought the interfaces back up.
+	-- "Multicast and Broadcast Blocker" (nftables) enforcement. Deliberately
+	-- after the reload: the rules key off each VAP's live netdev name, which
+	-- only exists (and can change) once netifd has brought the interfaces
+	-- back up.
 	local entries = {}
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
-			-- Resolved once per VAP and shared by both features -- this used to
-			-- be two lookups per VAP through the same ubus status call. An OWE
-			-- transition VAP has two netdevs, and both get the rules.
+			-- An OWE transition VAP has two netdevs, and both get the rules.
 			for _, ifname in ipairs(M.get_ifnames_for_vap(vap.radio, vap.ssid)) do
 				entries[#entries + 1] = {
 					ifname         = ifname,
 					bcfilt_enabled = vap.bcfilt_enabled,
 					bcfilt_macs    = vap.bcfilt_macs,
-					down_kbps      = vap.ratelimit_down_kbps,
-					up_kbps        = vap.ratelimit_up_kbps,
 				}
 			end
 		end
@@ -1652,19 +1631,17 @@ function M.apply_config(resp, cfg, opts)
 	reconcile_runtime(entries)
 end
 
--- Reapply both kernel-resident WiFi features from UCI.
+-- Reapply the Multicast and Broadcast Blocker from UCI.
 --
--- The blocker is an nftables ruleset and the speed limit is a tc qdisc: both
--- are LIVE KERNEL STATE that a reboot discards, and neither has a UCI option
--- OpenWrt itself understands. apply_config() only ever runs on a setparam, and
--- after a reboot there is no setparam to run it -- cfgversion is persisted, so
--- it matches on the first inform and the controller replies noop with no
--- system_cfg at all. Both features therefore stayed switched off indefinitely
--- while the controller UI went on showing them as on.
+-- It is an nftables ruleset: LIVE KERNEL STATE that a reboot discards, with no
+-- UCI option OpenWrt itself understands. apply_config() only ever runs on a
+-- setparam, and after a reboot there is no setparam to run it -- cfgversion is
+-- persisted, so it matches on the first inform and the controller replies noop
+-- with no system_cfg at all. The blocker therefore stayed switched off
+-- indefinitely while the controller UI went on showing it as on.
 --
--- The four openuf_bcfilt/openuf_ratelimit_* options wlan_add stamps onto each
--- managed section are the record this reads back; before this they were
--- written and never read by anything.
+-- The openuf_bcfilt* options wlan_add stamps onto each managed section are
+-- the record this reads back.
 --
 -- Called at startup by inform.M.run, alongside the blocked-client and LED
 -- reconciliation, and for the same reason. Returns the number of managed VAPs
@@ -1691,8 +1668,6 @@ function M.reapply_runtime_rules()
 				ifname         = ifname,
 				bcfilt_enabled = (s.openuf_bcfilt == "1"),
 				bcfilt_macs    = macs,
-				down_kbps      = tonumber(s.openuf_ratelimit_down),
-				up_kbps        = tonumber(s.openuf_ratelimit_up),
 			}
 		end
 	end)
@@ -2123,6 +2098,10 @@ function M.get_vap_table()
 			-- Internal, never serialized: build_json consumes it for
 			-- Roaming Assistant and removes it.
 			roam_assist_rssi = tonumber(s.openuf_roam_assist),
+			-- Internal, never serialized: WiFi Speed Limit (kbps), for
+			-- inform's _shaper_resync.
+			ratelimit_down = tonumber(s.openuf_ratelimit_down),
+			ratelimit_up   = tonumber(s.openuf_ratelimit_up),
 		}
 	end)
 	return vaps

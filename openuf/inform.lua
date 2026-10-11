@@ -71,6 +71,7 @@ local minrssi   = _require_sibling("minrssi")
 local loadbalance = _require_sibling("loadbalance")
 local wlansched = _require_sibling("wlansched")
 local stun      = _require_sibling("stun")
+local shaper    = _require_sibling("shaper")
 
 local M = {}
 
@@ -94,6 +95,7 @@ M._roamassist = roamassist
 M._minrssi    = minrssi
 M._loadbalance = loadbalance
 M._wlansched  = wlansched
+M._shaper     = shaper
 M._airtime    = airtime
 M._sysconf    = sysconf
 M._l2guard    = l2guard
@@ -1104,6 +1106,9 @@ function M.build_json(st, cfg, ufhw)
 		local minrssi_obs = {}
 		-- Load balance: every station on a radio that has it on.
 		local lb_obs = {}
+		-- WiFi Speed Limit: what each netdev lists and its WLAN's limits,
+		-- for _shaper_resync after this inform is built.
+		local shape_obs = {complete = true, by_ifname = {}, where = {}, conn = {}}
 		for _, vap in ipairs(vap_table) do
 			local live = radio_live_by_name[vap.radio_name]
 			if live then
@@ -1157,10 +1162,23 @@ function M.build_json(st, cfg, ufhw)
 				if ok_sta then
 					local bss = ufuci.bss_ifname and ufuci.bss_ifname(ifname) or ifname
 					if vap.name then M._vap_by_ifname[bss] = vap.name end
+					-- Stations are shaped on the netdev that lists them: a
+					-- private pre-shared key's VLAN netdev carries its
+					-- stations' frames, not the VAP's.
+					local so = {down = vap.ratelimit_down, up = vap.ratelimit_up, macs = {}}
+					shape_obs.by_ifname[ifname] = so
 					for _, sta in ipairs(rv2) do
 						stas[#stas + 1] = sta
 						sta_ifname[#stas] = bss
+						if type(sta.mac) == "string" then
+							local m = sta.mac:lower()
+							so.macs[#so.macs + 1] = m
+							shape_obs.where[m] = ifname
+							shape_obs.conn[m] = tonumber(sta.connected_sec)
+						end
 					end
+				else
+					shape_obs.complete = false
 				end
 			end
 			vap.num_sta = #stas
@@ -1479,7 +1497,10 @@ function M.build_json(st, cfg, ufhw)
 				vap.cu_interf  = cu.cu_interf
 			end
 			vap.roam_assist_rssi = nil  -- internal, consumed above
+			vap.ratelimit_down, vap.ratelimit_up = nil, nil
+			if not ok_if then shape_obs.complete = false end
 		end
+		M._shape_obs = shape_obs
 		-- Minimum RSSI's kick: one-shot deauth (ucihelper.kick_station), no
 		-- block; hostapd's rssi_reject_assoc_rssi keeps the client from
 		-- coming straight back.
@@ -3748,19 +3769,17 @@ function M.handle_response(json_str, st, cfg)
 			M._state.save(st)
 			if M._guest_built then
 				pcall(M._guestportal.set_authorized, M._guest_macs(st))
-				pcall(M._guestportal.set_rates, M._guest_rate_list(st))
 			end
 			if cmd == "unauthorize-guest" then M._guest_kick(resp.mac) end
 		elseif cmd == "rate-update" then
-			-- Guest portal: {"cmd":"rate-update","mac":...,"ul_max":kbps,
-			-- "dl_max":kbps,...}, right after authorize-guest when the
-			-- guest has a rate limit (PROTOCOL-VALIDATION.md, "Guest
-			-- portal (Hotspot)"). Sent once per authorization.
-			if M._guest_rate(st, resp) then
+			-- {"cmd":"rate-update","mac":...,"ul_max":kbps,"dl_max":kbps,
+			-- ...}: one client's WiFi Speed Limit, its own profile or a
+			-- guest's portal limit, sent each time it connects, roams or
+			-- reconnects and whenever the profile changes
+			-- (PROTOCOL-VALIDATION.md, "qos.* -- WiFi Speed Limit").
+			if M._sta_rate(st, resp) then
 				M._state.save(st)
-				if M._guest_built then
-					pcall(M._guestportal.set_rates, M._guest_rate_list(st))
-				end
+				pcall(M._shaper_resync, st)
 			end
 		elseif cmd == "scan" or cmd == "scan_band" then
 			M._handle_scan_cmd(resp, cfg)
@@ -3863,7 +3882,6 @@ function M._guest_authorize(st, mac, authorized)
 	st.guest_authorized = st.guest_authorized or {}
 	if not authorized then
 		st.guest_authorized[mac] = nil
-		if st.guest_rates then st.guest_rates[mac] = nil end
 		return
 	end
 	st.guest_authorized[mac] = os.time()
@@ -3874,7 +3892,6 @@ function M._guest_authorize(st, mac, authorized)
 	end
 	if n > M.GUEST_LEDGER_MAX then
 		st.guest_authorized[oldest] = nil
-		if st.guest_rates then st.guest_rates[oldest] = nil end
 	end
 end
 
@@ -3906,40 +3923,81 @@ function M._guest_kick(mac)
 	return true
 end
 
--- A rate-update into st.guest_rates ({mac = {up=kbps, down=kbps}}). Only for
--- an authorized guest, so the ledger stays as small as the authorizations
--- and leaves with them; -1 (the controller's "no limit") either way drops
--- the entry. Returns true when the ledger changed.
-function M._guest_rate(st, resp)
+-- A rate-update into st.sta_rates ({mac = {up = kbps, down = kbps}}), for
+-- any client, as the firmware's update_sta_qosrate takes it: a limit of 0
+-- or less, or none, is -1, which lifts that client's cap that way even on a
+-- limited WLAN. Ignored for a MAC no netdev listed at the last heartbeat,
+-- as the firmware ignores one with no association. Returns true when the
+-- ledger changed.
+function M._sta_rate(st, resp)
 	local mac = type(resp.mac) == "string"
 		and resp.mac:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
-	if not (mac and (st.guest_authorized or {})[mac]) then return false end
+	if not mac then return false end
+	local obs = M._shape_obs
+	if obs and obs.complete and not obs.where[mac] then return false end
 	local function kbps(v)
 		v = tonumber(v)
-		return v and v > 0 and math.floor(v) or nil
+		return v and v > 0 and math.floor(v) or -1
 	end
 	local up, down = kbps(resp.ul_max), kbps(resp.dl_max)
-	st.guest_rates = st.guest_rates or {}
-	local cur = st.guest_rates[mac]
-	if not up and not down then
-		st.guest_rates[mac] = nil
-		return cur ~= nil
-	end
+	st.sta_rates = st.sta_rates or {}
+	local cur = st.sta_rates[mac]
 	if cur and cur.up == up and cur.down == down then return false end
-	st.guest_rates[mac] = {up = up, down = down}
+	st.sta_rates[mac] = {up = up, down = down}
 	return true
 end
 
--- The rate ledger as a sorted list, for guestportal.set_rates.
-function M._guest_rate_list(st)
-	local out = {}
-	for mac, r in pairs(st.guest_rates or {}) do
-		if (st.guest_authorized or {})[mac] and type(r) == "table" then
-			out[#out + 1] = {mac = mac, up = r.up, down = r.down}
+-- WiFi Speed Limit, from what the last build_json saw (M._shape_obs): each
+-- netdev's stations and its WLAN's limits, with st.sta_rates on top. A
+-- rate-update lasts one association, as the firmware's per-station class
+-- does: it goes when the client leaves, or when its connected time drops
+-- (it reconnected between two heartbeats; the controller sends a fresh
+-- one if the client still has a profile of its own).
+M._sta_conn = {}
+function M._shaper_resync(st)
+	local obs = M._shape_obs
+	if not obs then return false end
+	local shaper = M._shaper
+	if not shaper then return false end
+	local rates = st.sta_rates or {}
+	local changed = false
+	if obs.complete then
+		for mac in pairs(rates) do
+			local now_c, was_c = obs.conn[mac], M._sta_conn[mac]
+			if not obs.where[mac] or (now_c and was_c and now_c < was_c) then
+				rates[mac] = nil
+				changed = true
+			end
+		end
+		M._sta_conn = obs.conn
+	end
+	local desired = {}
+	for ifname, o in pairs(obs.by_ifname) do
+		local down = {default = o.down, stas = {}}
+		local up = {default = o.up, stas = {}}
+		for _, mac in ipairs(o.macs) do
+			local r = rates[mac]
+			local d, u = o.down, o.up
+			-- An own limit replaces the WLAN's; -1 lifts it (0: uncapped).
+			if r then
+				d = r.down and r.down > 0 and r.down or 0
+				u = r.up and r.up > 0 and r.up or 0
+			end
+			down.stas[mac], up.stas[mac] = d, u
+		end
+		local any = down.default or up.default
+		for _, k in pairs(down.stas) do any = any or (k and k > 0) end
+		for _, k in pairs(up.stas) do any = any or (k and k > 0) end
+		if any then
+			desired[ifname] = {down = down, up = up}
 		end
 	end
-	table.sort(out, function(a, b) return a.mac < b.mac end)
-	return out
+	if changed then
+		st.sta_rates = next(rates) and rates or nil
+		M._state.save(st)
+	end
+	shaper.sync(desired)
+	return true
 end
 
 -- The `authorized` a station on this vap reports: the ledger's word on a
@@ -4002,8 +4060,7 @@ function M._guest_enforce(st, vaps)
 		M._state.save(st)
 	end
 	vaps = vaps or M._guest_vaps(st)
-	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_rate_list(st),
-		M._guest_selfrun_on)
+	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_selfrun_on)
 	M._guest_built = guest_vaps_key(vaps)
 	M._guest_ctx = {url = spec.url, ap = st.mac, vaps = vaps}
 	if not M._guest_server then
@@ -5146,6 +5203,9 @@ function M._tick(st, cfg, ufhw, ctx)
 		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")
 		return ctx.interval
 	end
+	-- On the stations build_json just listed.
+	local ok_sh, err_sh = pcall(M._shaper_resync, st)
+	if not ok_sh then io.stderr:write("inform: shaper: " .. tostring(err_sh) .. "\n") end
 
 	local ok_p, pkt = pcall(M.build_packet, json_str, st)  -- use_gcm read from st.use_gcm
 	if not ok_p then
@@ -5250,14 +5310,14 @@ function M.run(cfg, ufhw)
 	-- account reconciliation just above).
 	M._firewall.reconcile(st.blocked_stas)
 	-- Same category, one level out: the "Multicast and Broadcast Blocker" is an
-	-- nftables ruleset and the "WiFi Speed Limit" is a tc qdisc, so both die
-	-- with the reboot, and neither has a UCI option OpenWrt itself applies.
-	-- They are only ever built inside apply_config, which runs on a setparam --
-	-- and after a reboot there is no setparam: cfgversion matches on the first
-	-- inform and the controller replies noop, carrying no system_cfg at all.
-	-- Both controls therefore stayed off indefinitely while the UI showed them
-	-- on. Rebuilt here from the openuf_bcfilt/openuf_ratelimit_* options
-	-- wlan_add stamps onto each managed section.
+	-- nftables ruleset, so it dies with the reboot, and has no UCI option
+	-- OpenWrt itself applies. It is only ever built inside apply_config, which
+	-- runs on a setparam -- and after a reboot there is no setparam: cfgversion
+	-- matches on the first inform and the controller replies noop, carrying no
+	-- system_cfg at all. It therefore stayed off indefinitely while the UI
+	-- showed it on. Rebuilt here from the openuf_bcfilt options wlan_add stamps
+	-- onto each managed section. (The WiFi Speed Limit is rebuilt by every
+	-- heartbeat's _shaper_resync from openuf_ratelimit_*.)
 	--
 	-- pcall'd because it reaches ubus for each VAP's live netdev name: no
 	-- radios, no wifi up yet, no ubus at all are ordinary outcomes on a board
@@ -5265,7 +5325,7 @@ function M.run(cfg, ufhw)
 	if M._ucihelper and M._ucihelper.reapply_runtime_rules then
 		local ok_rt, err_rt = pcall(M._ucihelper.reapply_runtime_rules)
 		if not ok_rt then
-			io.stderr:write("inform: could not reapply blocker/speed-limit rules: "
+			io.stderr:write("inform: could not reapply the blocker rules: "
 				.. tostring(err_rt) .. "\n")
 		end
 	end

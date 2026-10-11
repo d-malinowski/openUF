@@ -355,13 +355,14 @@ case "$ACTION" in
 		# shaper.lua shells out to `tc` for the WiFi Speed Limit, and nothing
 		# installed it -- busybox has no tc. tc-tiny is enough (htb + fq_codel).
 		try_optional tc-tiny       "WiFi Speed Limit (tc)"
-		# ...and the DOWNLINK half needs sch_htb while the UPLINK half needs the
-		# act_police action, which is a separate module and is not in every
-		# image. A filogic board has sch_htb, sch_ingress, act_gact, act_mirred
-		# and act_skbedit but NO act_police: `tc filter ... police` fails with
-		# "Failed to load TC action module", so the download cap applies and the
-		# upload cap silently does not. Half a feature reporting success.
-		try_optional kmod-sched-act-police "WiFi Speed Limit, upload half (tc police)"
+		# ...and the UPLINK half is queued on an IFB device the SSID's ingress
+		# is redirected to (sch_ingress + act_mirred, both in kmod-sched-core).
+		# Without kmod-ifb it falls back to policing, which needs the act_police
+		# action: a separate module, and not in every image (a filogic board has
+		# no act_police, so `tc filter ... police` fails with "Failed to load TC
+		# action module").
+		try_optional kmod-ifb "WiFi Speed Limit, upload half (queued)"
+		try_optional kmod-sched-act-police "WiFi Speed Limit, upload fallback (tc police)"
 		# inform.lua detects an out-of-process state.json write (syswrapper's
 		# SSH set-adopt, a manual reset-inform) with `stat -c %Y`. Some builds
 		# ship no stat applet at all -- confirmed on a real WDR3500 -- and

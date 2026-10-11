@@ -162,6 +162,21 @@ return {
 		end
 	},
 	{
+		name = "state: sta_rates (per-client WiFi Speed Limits) round-trips",
+		fn = function()
+			with_tmp(function()
+				local st = state.load()
+				st.adopted = true
+				st.sta_rates = {["de:ad:be:ef:00:02"] = {up = 2048, down = -1}}
+				state.save(st)
+				local loaded = state.load()
+				local r = (loaded.sta_rates or {})["de:ad:be:ef:00:02"] or {}
+				assert_eq(r.up, 2048, "kept for a restart")
+				assert_eq(r.down, -1, "-1 too: it lifts the WLAN's cap")
+			end)
+		end
+	},
+	{
 		name = "state: blocked_stas and upgrade_requested_* round-trip type-checked",
 		fn = function()
 			-- These load() type-checks existed but were never exercised: a
