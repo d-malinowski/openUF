@@ -1297,18 +1297,23 @@ refused.
 logged as `not a command this build provides` and never written: crond runs it as
 root. The pushed `cron.<n>.user` is ignored, since that account does not exist here.
 
-`syswrapper.sh 11k-scan` does not scan by itself. It leaves a dated request in
-`/tmp/openuf-scan-request`, and the inform daemon consumes it on its next heartbeat. It
+`syswrapper.sh 11k-scan` does not scan by itself. As UniFi firmware does (`elevenk_scan`),
+it picks two scan times within the next hour: the first 10 s plus a random delay out,
+the second 10 s plus another random delay after that. It writes them, one epoch per
+line, to `/tmp/openuf-scan-request`, replacing any request still pending. On the first
+heartbeat after a time falls due, the inform daemon
 runs `iw dev <if> scan ap-force` on every reported radio right before building the
 payload, so that inform's `scan_table` carries the fresh results. (`ap-force` sweeps
 the same channels as a plain scan on both tested boards, and it guards against a
 driver that refuses to scan on a beaconing AP.) A radio where iw refuses logs
-`iw refused to scan <if>`, and the count leaves it out. A request older than ten minutes
-(say, one left behind by a stopped daemon) is discarded rather than fired at boot.
-You can run it by hand to trigger a scan:
+`iw refused to scan <if>`, and the count leaves it out. A scan time more than ten minutes
+in the past (say, one left behind by a stopped daemon) is dropped rather than fired at
+boot. Running `syswrapper.sh 11k-scan` by hand schedules the same two scans within the hour
+(it prints both delays). To scan on the next heartbeat instead, write the current time
+as the only line:
 
 ```sh
-syswrapper.sh 11k-scan
+date +%s > /tmp/openuf-scan-request
 logread -e openuf | grep 11k-scan   # "11k-scan requested -- scanned 2 radio(s)"
 ```
 

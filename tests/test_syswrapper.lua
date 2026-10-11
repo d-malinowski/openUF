@@ -175,22 +175,62 @@ return {
 		end
 	},
 	{
-		name = "syswrapper: 11k-scan leaves a dated request file for the inform daemon",
+		name = "syswrapper: 11k-scan leaves two due times inside the hour, spread as UniFi firmware does",
 		fn = function()
 			local FILE = "/tmp/openuf_test_sysw_scan"
 			os.remove(FILE)
 			sw._set_scan_request_file(FILE)
-			local real = io.stdout
-			io.stdout = {write = function() end}
-			local ok = sw.cmd_11k_scan()
-			io.stdout = real
-			assert_true(ok, "succeeds")
-			local f = io.open(FILE, "r")
-			assert_not_nil(f, "request written")
-			local body = f:read("*a"); f:close()
-			local at = tonumber(body:match("%d+"))
-			assert_true(at ~= nil and math.abs(os.time() - at) < 5, "carries the current epoch")
+			sw._set_clock(function() return 1000000 end)
+			local asked = {}
+			local function run(pick)
+				asked = {}
+				sw._set_rand(function(n) asked[#asked + 1] = n; return pick(n) end)
+				local real = io.stdout
+				io.stdout = {write = function() end}
+				local ok = sw.cmd_11k_scan()
+				io.stdout = real
+				local f = io.open(FILE, "r")
+				local body = f and f:read("*a")
+				if f then f:close() end
+				local due = {}
+				for d in (body or ""):gmatch("%d+") do due[#due + 1] = tonumber(d) end
+				return ok, due
+			end
+
+			local ok, low = run(function() return 0 end)
+			local asked_low = asked
+			local _, high = run(function(n) return n - 1 end)
+			local asked_high = asked
+			local _, mid = run(function() return 1000 end)
+
+			-- The real source: in range, and not constant.
+			local seen, inrange = {}, true
+			for _ = 1, 50 do
+				local v = sw._urandom_below(3590)
+				if v < 0 or v >= 3590 or v ~= math.floor(v) then inrange = false end
+				seen[v] = true
+			end
+			local distinct = 0
+			for _ in pairs(seen) do distinct = distinct + 1 end
+
 			os.remove(FILE)
+			sw._set_rand(nil)
+			sw._set_clock(nil)
+
+			assert_true(ok, "succeeds")
+			assert_eq(#low, 2, "two scans")
+			assert_eq(low[1], 1000010, "the earliest is 10 s out")
+			assert_eq(low[2], 1000020, "the second 10 s after the first")
+			assert_eq(asked_low[1], 3590, "the first delay is drawn from the hour less 10 s")
+			assert_eq(asked_low[2], 3580, "the second from what is left, less 10 s")
+			assert_eq(high[1], 1000000 + 10 + 3589, "the latest first scan is just inside the hour")
+			assert_eq(asked_high[2], 1, "which leaves the second no room to wander")
+			assert_true(high[2] <= 1000000 + sw.SCAN_WINDOW + 10, "but it still lands at the window's end")
+			assert_eq(mid[1], 1001010, "10 s + the random delay")
+			assert_eq(mid[2], 1002020, "then 10 s + another")
+			assert_true(inrange, "/dev/urandom gives integers in [0, n)")
+			assert_true(distinct > 10, "that vary")
+
 			-- An unwritable path fails loudly rather than pretending.
 			sw._set_scan_request_file("/nonexistent-dir/x")
 			local err = ""

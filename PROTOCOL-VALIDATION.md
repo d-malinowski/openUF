@@ -1832,7 +1832,19 @@ cron.1.job.1.cmd=syswrapper.sh 11k-scan
 
 The cron job is how the controller schedules the nightly neighbour scan: it runs through
 the AP's own crond at 04:00 device-local time. That is why the timezone matters. See USAGE
-§ 6 for what `sysconf.lua` does with each block. `cron.<n>.user` is deliberately left
+§ 6 for what `sysconf.lua` does with each block.
+
+What the job does on a UAP (firmware-confirmed for 4.0.15, `/usr/etc/syswrapper.sh`):
+`11k-scan` → `elevenk_scan` → `elevenk_sched 3600 2 nightly all`. That kills any pending
+run and starts `elevenk_run` in the background, which does two `syswrapper.sh scan`s in one
+hour. Before each scan it sleeps 10 s plus `rand % left`, where `left` starts at 3600, loses
+10 s before each draw and loses each random delay after it. So the first scan lands
+uniformly in 10 s to 1 h and the second one after it, still inside the hour (or 10 s past it
+at worst). The randomness is from `/dev/urandom`. openUF copies that arithmetic in
+`hook/syswrapper.lua` and also draws from `/dev/urandom`: every AP's crond fires at the same
+second, so delays seeded from the clock would match. It used to scan every radio of every AP
+on the first heartbeat after 04:00, all at once. (`11k-boot`, two scans within 5 min after a
+config apply, is the same routine and is not implemented: see `11k.status` above.) `cron.<n>.user` is deliberately left
 unrecognized, so it shows in the dropped-key report.
 
 ### `connectivity.*`: SSIDs on uplink loss (nothing to do, 2026-10-10)

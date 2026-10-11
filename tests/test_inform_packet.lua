@@ -4219,6 +4219,82 @@ return {
 		end
 	},
 	{
+		name = "inform: an 11k-scan request with two due times fires each once when it falls due",
+		fn = function()
+			local FILE = "/tmp/openuf_test_scan_request2"
+			local orig = {file = inform.SCAN_REQUEST_FILE, time = inform._time,
+				scan = inform._scan_all_radios, stderr = io.stderr}
+			io.stderr = {write = function() end}
+			local scans = 0
+			inform._scan_all_radios = function() scans = scans + 1; return 2 end
+			inform.SCAN_REQUEST_FILE = FILE
+			local now = 1000000
+			inform._time = function() return now end
+			local function request(...)
+				local f = io.open(FILE, "w"); f:write(table.concat({...}, "\n"), "\n"); f:close()
+			end
+			local function left()
+				local f = io.open(FILE, "r")
+				if not f then return nil end
+				local b = f:read("*a"); f:close(); return b
+			end
+
+			-- Due at +100 s and +2000 s.
+			os.remove(FILE)
+			request(now + 100, now + 2000)
+			local early = inform._maybe_service_scan_request({})
+			local early_left = left()
+			now = now + 100
+			local first = inform._maybe_service_scan_request({})
+			local first_left = left()
+			now = now + 10
+			local between = inform._maybe_service_scan_request({})
+			now = now + 1890 + 5
+			local second = inform._maybe_service_scan_request({})
+			local second_gone = left() == nil
+			local scans_two = scans
+
+			-- Both overdue on one heartbeat (a long blocking cycle): one scan.
+			scans = 0
+			request(now - 30, now - 5)
+			local both = inform._maybe_service_scan_request({})
+			local both_gone = left() == nil
+			local scans_both = scans
+
+			-- One stale, one pending: the stale one is dropped, the other kept.
+			scans = 0
+			request(now - 3600, now + 50)
+			local mixed = inform._maybe_service_scan_request({})
+			local mixed_left = left()
+
+			-- Beyond the window (clock stepped back): dropped, not kept for hours.
+			request(now + 7200)
+			local ahead = inform._maybe_service_scan_request({})
+			local ahead_gone = left() == nil
+
+			os.remove(FILE)
+			inform.SCAN_REQUEST_FILE, inform._time, inform._scan_all_radios, io.stderr =
+				orig.file, orig.time, orig.scan, orig.stderr
+
+			assert_false(early, "nothing before the first due time")
+			assert_eq(early_left, (1000000 + 100) .. "\n" .. (1000000 + 2000) .. "\n",
+				"and the file is left untouched")
+			assert_true(first, "the first due time scans")
+			assert_eq(first_left, (1000000 + 2000) .. "\n", "and only the second is kept")
+			assert_false(between, "nothing between the two")
+			assert_true(second, "the second due time scans")
+			assert_true(second_gone, "then the request is gone")
+			assert_eq(scans_two, 2, "two scans in all")
+			assert_true(both, "two overdue times scan")
+			assert_eq(scans_both, 1, "once")
+			assert_true(both_gone, "and both are consumed")
+			assert_false(mixed, "a stale time does not scan")
+			assert_eq(mixed_left, tostring(now + 50) .. "\n", "the pending one survives")
+			assert_false(ahead, "a time beyond the window does not scan")
+			assert_true(ahead_gone, "and is dropped")
+		end
+	},
+	{
 		name = "inform: a setparam's timezone/NTP/cron blocks reach sysconf, and are not reported as dropped",
 		fn = function()
 			local orig = {sysconf = inform._sysconf, dbg = inform._debug_dropped_keys,

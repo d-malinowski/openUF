@@ -13,10 +13,11 @@
 
 	The cron job is the interesting one: the controller schedules a nightly
 	04:00 (device local time) neighbour scan on every AP through the AP's own
-	cron. The verb is added to syswrapper.sh, which asks the running inform
-	daemon to scan on its next heartbeat (inform.lua's _maybe_service_scan_request),
-	so the scan code stays in one place and the result rides out on that
-	heartbeat's scan_table.
+	cron. The verb is added to syswrapper.sh, which, as UniFi firmware does,
+	picks two random times within the next hour and asks the running inform
+	daemon to scan at each (inform.lua's _maybe_service_scan_request), so the
+	scan code stays in one place and each result rides out on that heartbeat's
+	scan_table.
 
 	Timezone -> UCI system.@system[0].timezone (the wire string IS a POSIX TZ
 	string, which is exactly what that option holds); NTP -> system.ntp.server.

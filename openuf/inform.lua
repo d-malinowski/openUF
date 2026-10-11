@@ -5040,12 +5040,17 @@ end
 -- ─── The controller's scheduled neighbour scan ──────────────────────────────
 
 -- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
--- sysconf.lua -- leaves its dated request. Consumed and removed by the next
--- heartbeat; ignored when older than SCAN_REQUEST_MAX_AGE, so a request a
--- stopped daemon never saw does not fire at the next boot in the middle of
--- hostapd's ACS sweep.
+-- sysconf.lua -- leaves its request: one epoch per line, each a time a scan
+-- falls due (two of them, randomised inside SCAN_REQUEST_WINDOW, as UniFi
+-- firmware spreads the job). Each heartbeat fires the scan once when any
+-- time has come and keeps the rest; the file goes when none is left. A due
+-- time more than SCAN_REQUEST_MAX_AGE in the past is dropped unscanned, so a
+-- request a stopped daemon never saw does not fire at the next boot in the
+-- middle of hostapd's ACS sweep; one further ahead than the window (the
+-- clock stepped back) is dropped too.
 M.SCAN_REQUEST_FILE    = "/tmp/openuf-scan-request"
 M.SCAN_REQUEST_MAX_AGE = 600
+M.SCAN_REQUEST_WINDOW  = 3600
 
 -- One blocking off-channel sweep on an AP netdev: `iw dev <if> scan
 -- ap-force`. On both our boards (OpenWrt 25.12, mac80211 6.18 backports:
@@ -5161,19 +5166,34 @@ function M._handle_scan_cmd(resp, cfg)
 	return issued
 end
 
--- True when a fresh 11k-scan request was waiting; the file is removed either
--- way, so a request is served at most once.
+-- True when one of the pending 11k-scan due times has come. The times that
+-- fired or went stale are taken out of the file, so each is served at most
+-- once; the file is removed when nothing is left in it.
 function M._scan_requested()
 	local raw = M._read_file(M.SCAN_REQUEST_FILE)
 	if not raw then return false end
-	os.remove(M.SCAN_REQUEST_FILE)
-	local at = tonumber(raw:match("%d+"))
-	local age = at and (M._time() - at)
-	if not age or age < -60 or age > M.SCAN_REQUEST_MAX_AGE then
-		io.stderr:write("inform: ignoring a stale 11k-scan request\n")
-		return false
+	local now = M._time()
+	local due, stale, keep = false, false, {}
+	for s in raw:gmatch("%d+") do
+		local late = now - tonumber(s)
+		if late > M.SCAN_REQUEST_MAX_AGE or late < -(M.SCAN_REQUEST_WINDOW + 60) then
+			stale = true
+		elseif late >= 0 then
+			due = true
+		else
+			keep[#keep + 1] = s
+		end
 	end
-	return true
+	if stale or not (due or #keep > 0) then
+		io.stderr:write("inform: ignoring a stale 11k-scan request\n")
+	end
+	if #keep == 0 then
+		os.remove(M.SCAN_REQUEST_FILE)
+	elseif due or stale then
+		local f = io.open(M.SCAN_REQUEST_FILE, "w")
+		if f then f:write(table.concat(keep, "\n"), "\n"); f:close() end
+	end
+	return due
 end
 
 -- Serve a pending 11k-scan request. Returns true when radios were scanned.

@@ -129,19 +129,63 @@ end
 -- sysconf.lua): a neighbour scan on every radio. The scan itself is the
 -- inform daemon's job -- it owns the radios' netdev names and the scan
 -- cache, and its next heartbeat carries the result out -- so this only
--- leaves a dated request file that inform.lua's _maybe_service_scan_request
--- picks up within one interval and discards if it is more than ten minutes
--- old (a request left behind by a stopped daemon must not fire at boot).
+-- leaves a request file that inform.lua's _maybe_service_scan_request reads
+-- each heartbeat.
+--
+-- The request holds two due times, as UniFi firmware schedules this job
+-- (syswrapper.sh elevenk_scan -> elevenk_sched 3600 2, firmware-confirmed for
+-- 4.0.15): two scans inside one hour, each 10 s plus a random delay drawn from
+-- what is left of the hour. Every AP's crond fires at 04:00 sharp, so without
+-- the random delay all APs go off-channel at the same second and each one's
+-- sweep finds its neighbours off-channel too. A new request replaces a pending
+-- one, as elevenk_sched kills the previous run. The randomness comes from
+-- /dev/urandom like the firmware's: math.random seeded from the clock would
+-- give two APs started by the same cron second the same delays.
 local scan_request_file = "/tmp/openuf-scan-request"
+local SCAN_WINDOW, SCAN_COUNT, SCAN_DELAY = 3600, 2, 10
+
+-- A uniform integer in [0, n). Injectable for tests.
+local function urandom_below(n)
+	local f = io.open("/dev/urandom", "rb")
+	local b = f and f:read(3)
+	if f then f:close() end
+	if not b or #b < 3 then return math.random(0, n - 1) end
+	-- 24 bits: far more than a 3600 s window needs, and clear of the
+	-- 2^31 limit of the APs' LNUM-patched Lua.
+	return ((b:byte(1) * 256 + b:byte(2)) * 256 + b:byte(3)) % n
+end
+local rand_below = urandom_below
+local now = os.time
+
+-- elevenk_run's arithmetic: the window shrinks by each delay taken, so the
+-- second scan always lands after the first and both inside the window.
+local function scan_due_times(t0)
+	local left, at, due = SCAN_WINDOW, t0, {}
+	for i = 1, SCAN_COUNT do
+		left = left - SCAN_DELAY
+		if left < 1 then left = 1 end
+		local r = rand_below(left)
+		left = left - r
+		at = at + SCAN_DELAY + r
+		due[i] = at
+	end
+	return due
+end
+
 local function cmd_11k_scan()
+	local t0 = now()
+	local due = scan_due_times(t0)
 	local f = io.open(scan_request_file, "w")
 	if not f then
 		io.stderr:write("syswrapper: cannot write " .. scan_request_file .. "\n")
 		return false
 	end
-	f:write(tostring(os.time()), "\n")
+	f:write(table.concat(due, "\n"), "\n")
 	f:close()
-	io.stdout:write("syswrapper: neighbour scan requested; the inform daemon runs it within one heartbeat\n")
+	local ins = {}
+	for i, t in ipairs(due) do ins[i] = tostring(t - t0) .. " s" end
+	io.stdout:write("syswrapper: neighbour scans requested in " .. table.concat(ins, " and ") ..
+		"; the inform daemon runs each on the heartbeat after it falls due\n")
 	return true
 end
 
@@ -182,6 +226,10 @@ return {
 	cmd_reset_inform = cmd_reset_inform,
 	cmd_11k_scan = cmd_11k_scan,
 	_set_scan_request_file = function(p) scan_request_file = p end,
+	_set_rand = function(f) rand_below = f or urandom_below end,
+	_set_clock = function(f) now = f or os.time end,
+	_urandom_below = urandom_below,
+	SCAN_WINDOW = SCAN_WINDOW,
 	is_hex32 = is_hex32,
 	is_url   = is_url,
 	_set_state = function(s) state = s end,
