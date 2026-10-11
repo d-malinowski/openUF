@@ -922,8 +922,12 @@ help every other openUF AP broadcasting your SSID showed up as *"a third-party a
 broadcasting your network's SSID"*. Each openUF VAP therefore beacons a small vendor element
 carrying its device MAC (hostapd `vendor_elements`, which OpenWrt 25.12's wifi scripts pass through), and a scan that
 hears it reports that BSS as a UniFi AP of the site; it then leaves the Environment list, as
-a real UniFi AP's would. Only openUF APs recognise each other this way — a mixed site's
-genuine UniFi APs are still reported as third-party by openUF and vice versa.
+a real UniFi AP's would. openUF also recognises a genuine UniFi AP from the Ubiquiti element
+it beacons (OUI `00:15:6d`, its device MAC in TLV `0x81`), so on a mixed site openUF reports it
+as a UniFi AP of the site. The reverse does not hold: a real UniFi AP still reports openUF APs
+as third-party, since openUF does not beacon Ubiquiti's element. A UniFi AP that belongs to a
+different site is tagged too; the controller finds no such device in this site and falls back
+to its usual SSID check, so it changes nothing there.
 
 openUF closes that gap the way Ubiquiti's Channel AI describes — *"neighbor reports and
 automated RRM scans"* — rather than by scanning. Every `rrm_request_interval` seconds

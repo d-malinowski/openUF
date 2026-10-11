@@ -1033,8 +1033,8 @@ function M.build_json(st, cfg, ufhw)
 							security   = net.security,
 							essid      = net.essid,
 						}
-						-- A sibling openUF AP, identified by the IE it beacons
-						-- (sysinfo.peer_ie_hex). is_unifi + serialno is what
+						-- A sibling openUF or UniFi AP, identified by the IE it
+						-- beacons (sysinfo.peer_ie_hex, peer_match_ucode). is_unifi + serialno is what
 						-- the controller resolves to an adopted device; without
 						-- them every BSS of ours carrying a site SSID was
 						-- listed as an impersonating third-party AP.

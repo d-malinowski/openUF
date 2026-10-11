@@ -1010,11 +1010,35 @@ return {
 			local cmd = sysinfo.peer_scan_cmd("phy0-ap0")
 			local want = hex:sub(5, 18):gsub("(%x%x)", "\\x%1")
 			assert_true(cmd:find('"' .. want .. '"', 1, true) ~= nil, "prefix matches the builder")
-			assert_true(cmd:find("length(d)==13", 1, true) ~= nil, "body length is 0x0d")
+			assert_true(cmd:find("n==13&&substr(d,0,7)==", 1, true) ~= nil, "body length is 0x0d")
 			assert_true(cmd:find('dev:"phy0-ap0"', 1, true) ~= nil, "asks about the right interface")
 			assert_eq(sysinfo.peer_scan_cmd("x'; reboot; '"), nil, "an interface name cannot break out of the quoting")
 			assert_eq(sysinfo.peer_ie_hex(nil), nil, "no identity, no IE")
 			assert_eq(sysinfo.peer_ie_hex("not-a-mac"), nil, "garbage, no IE")
+		end
+	},
+	{
+		name = "sysinfo: peer_scan_cmd() also recognises a real UniFi AP's element",
+		fn = function()
+			-- The matcher is ucode and only runs on a device or in an OpenWrt
+			-- image (tools/peer-ie-vectors.lua executes it against vectors).
+			-- Here: pin the firmware layout it must encode, and that the scan
+			-- command really uses it.
+			local pm = sysinfo.peer_match_ucode()
+			assert_true(pm:find("ord(d,0)!=0||ord(d,1)!=0x15||ord(d,2)!=0x6d", 1, true) ~= nil,
+				"Ubiquiti OUI 00:15:6d")
+			assert_true(pm:find("||ord(d,3)!=0||ord(d,4)!=1||ord(d,5)!=1)", 1, true) ~= nil,
+				"subtype 00 01 01 (a UniFi AP), not other Ubiquiti products")
+			assert_true(pm:find("for(let i=11;i+2<=n;i+=2+ord(d,i+1))", 1, true) ~= nil,
+				"TLVs walked from body offset 11 by their own lengths")
+			assert_true(pm:find("ord(d,i)==0x81&&ord(d,i+1)==6&&i+8<=n", 1, true) ~= nil,
+				"serial TLV 0x81, 6 bytes, bounds-checked")
+			local cmd = sysinfo.peer_scan_cmd("phy0-ap0")
+			assert_true(cmd:find(pm, 1, true) ~= nil, "the scan command embeds the matcher")
+			assert_true(cmd:find("hit=pm(e.data)", 1, true) ~= nil, "and calls it on every vendor element")
+			local inner = cmd:match("^ucode %-e '(.*)' 2>/dev/null$")
+			assert_true(inner ~= nil and not inner:find("'", 1, true),
+				"no single quote inside the shell-quoted script")
 		end
 	},
 	{

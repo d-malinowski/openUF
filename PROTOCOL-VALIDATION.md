@@ -3652,6 +3652,17 @@ beacons its private element, not this one: a real UAP parsing an openUF beacon w
 the flags at face value, and `is_vwire`/`is_vport` feed its wireless-uplink choice
 (`find_serialno_vwire_in_uplink_wds_iface_scan_records`).
 
+openUF **reads** this element, though (`sysinfo.peer_match_ucode`): OUI `00:15:6d`, subtype
+`00 01 01`, then the TLVs walked from body offset 11 to the first `81 06`, whose MAC becomes the
+entry's `serialno`. The flags are ignored. Seen live 2026-10-11 from the living-room AP: a
+neighbour's current-firmware UniFi AP beacons exactly this layout, with flag `0x40` on its
+second BSS (not in 4.0.15) and a TLV `0x89` after `0x81` (36 bytes of ASCII, a UUID). Both of
+its BSSes then went out in a real heartbeat payload with `is_unifi: true` and its base MAC as
+`serialno`, which is the BSSID minus one, as `0x81` carries the device MAC. That AP is
+not in this site, so the controller falls back to its SSID check for it. The ucode cannot run in CI or the lab;
+`tools/peer-ie-vectors.lua` runs the generated matcher against 12 vectors in an OpenWrt
+25.12 rootfs image.
+
 ### `lldp_table[]` entry
 
 Field names from the real DTO (`OXMua`): `chassis_descr`, `chassis_id`, `local_port_name`,

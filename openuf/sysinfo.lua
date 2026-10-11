@@ -514,21 +514,42 @@ end
 -- it is present wherever those are. The script prints "<bssid> <mac>" per
 -- sibling BSS and nothing else; any failure (no ucode, no module) is simply
 -- no siblings.
+--
+-- A real UniFi AP is a sibling too, on a site that mixes the two: without the
+-- tag, openUF reported its BSSes as rogues whenever they carried a site SSID.
+-- UniFi firmware's own element (firmware-confirmed for 4.0.15, umac.ko
+-- ieee80211_add_ubnt_ie + libubnt's scan parser; seen live in 2026 on a
+-- neighbour's current-firmware AP):
+--   dd <len> | 00 15 6d | 00 01 01 (UniFi AP) | flags | 01 02 <system id>
+--            | TLVs from body offset 11: 81 06 <serialno = device MAC>, ...
+-- The TLVs are walked, not indexed: current firmware adds tags 4.0.15 did not
+-- have (0x89, a UUID). Only the tag-0x81 MAC is used; the flags are ignored.
 local function ucode_bytes(hex)
 	return (hex:gsub("(%x%x)", "\\x%1"))
 end
 
+-- The ucode function pm(d): the MAC an element body d announces, or null.
+-- Kept separate so it can be run on a device against fixed inputs.
+function M.peer_match_ucode()
+	local head = ucode_bytes(M.PEER_IE_OUI:gsub(":", "") .. M.PEER_IE_MAGIC .. M.PEER_IE_VER)
+	return 'function mac(d,o){let m=[];for(let i=o;i<o+6;i++)push(m,sprintf("%02x",ord(d,i)));return join(":",m);}'
+		.. 'function pm(d){let n=length(d);'
+		.. 'if(n==13&&substr(d,0,7)=="' .. head .. '")return mac(d,7);'
+		.. 'if(n<11||ord(d,0)!=0||ord(d,1)!=0x15||ord(d,2)!=0x6d'
+		.. '||ord(d,3)!=0||ord(d,4)!=1||ord(d,5)!=1)return null;'
+		.. 'for(let i=11;i+2<=n;i+=2+ord(d,i+1)){'
+		.. 'if(ord(d,i)==0x81&&ord(d,i+1)==6&&i+8<=n)return mac(d,i+2);}'
+		.. 'return null;}'
+end
+
 function M.peer_scan_cmd(ifname)
 	if type(ifname) ~= "string" or not ifname:match("^[%w%.%-_]+$") then return nil end
-	local head = ucode_bytes(M.PEER_IE_OUI:gsub(":", "") .. M.PEER_IE_MAGIC .. M.PEER_IE_VER)
-	local script = 'let nl=require("nl80211");'
+	local script = M.peer_match_ucode()
+		.. 'let nl=require("nl80211");'
 		.. 'let r=nl.request(nl.const.NL80211_CMD_GET_SCAN,nl.const.NLM_F_DUMP,{dev:"' .. ifname .. '"});'
 		.. 'for(let x in (r||[])){let b=x.bss;if(!b)continue;'
 		.. 'for(let l in [b.information_elements||[],b.beacon_ies||[]]){let hit=null;'
-		.. 'for(let e in l){let d=e.data;'
-		.. 'if(e.type==221&&length(d)==13&&substr(d,0,7)=="' .. head .. '"){'
-		.. 'let m=[];for(let i=7;i<13;i++)push(m,sprintf("%02x",ord(d,i)));'
-		.. 'hit=join(":",m);break;}}'
+		.. 'for(let e in l){if(e.type==221){hit=pm(e.data);if(hit)break;}}'
 		.. 'if(hit){print(b.bssid," ",hit,"\\n");break;}}}'
 	return "ucode -e '" .. script .. "' 2>/dev/null"
 end
@@ -553,7 +574,7 @@ end
 -- cache here is cheap and non-disruptive enough to do on every inform,
 -- unlike a real scan).
 -- Each entry: {bssid, essid, freq, channel, signal, security, age, bw,
--- peer_mac} -- peer_mac only for a sibling openUF AP (see peer_ie_hex).
+-- peer_mac} -- peer_mac only for a sibling openUF or UniFi AP (see peer_ie_hex).
 -- `bw` is channel width in MHz. The controller's Environment tab's "Ch. Width"
 -- column reads this field directly and renders nothing at all when it's
 -- missing (confirmed live 2026-07-14) -- default to 20 (legacy-safe, valid
