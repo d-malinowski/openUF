@@ -355,12 +355,14 @@ local SECURITY_MAP = {
 }
 
 -- Deterministic 16-bit id from a string, formatted as 4 hex chars (802.11r
--- mobility domain is a 2-octet field). Used as a stopgap mobility_domain
--- when the controller only sends the high-level fast_roaming_enabled toggle
--- and no raw mobility_domain/r0kh/r1kh (UniFi's admin API has no such fields
--- -- it computes and syncs them internally across all APs on a site). Same
+-- mobility domain is a 2-octet field). The controller never sends a mobility
+-- domain: UniFi firmware derives one from the SSID on the AP itself
+-- (SHA1("salt" .. ssid)), so openUF does the same with its own hash. Same
 -- seed always yields the same domain, so every openUF-emulated AP on the
 -- same network computes it identically without needing to coordinate.
+-- Deliberately NOT UniFi's formula: real UAPs only exchange FT keys with
+-- peers running their patched hostapd, so a matching domain would make
+-- clients attempt a fast transition to them that can only fail.
 function M.derive_mobility_domain(seed)
 	local hash = 0
 	for i = 1, #seed do
@@ -1310,17 +1312,26 @@ function M.apply_config(resp, cfg, opts)
 				-- between two BSSes on the SAME radio, so this was never about
 				-- the APs failing to reach each other.
 				--
-				-- OpenWrt's own default is already right, and better than
-				-- anything worth restating here: hostapd.sh keys it on
-				-- auth_type (psk -> 1, anything else -> 0) and, when it is 0,
-				-- auto-derives wildcard key holders from
-				-- md5(mobility_domain .. "/" .. psk) -- deterministic, so every
-				-- AP sharing an SSID and passphrase computes the same key with
-				-- no coordination, which is the same reasoning behind
-				-- derive_mobility_domain above. Leaving the option unset lets
-				-- that run: FT-PSK keeps local derivation and needs no
-				-- inter-AP traffic, FT-SAE gets the key holders it cannot work
+				-- OpenWrt's own default is already right: hostapd.sh / ap.uc
+				-- key it on auth_type (psk -> 1, anything else -> 0), and
+				-- only when it is 0 do they write r0kh/r1kh at all. FT-PSK
+				-- keeps local derivation and needs no inter-AP traffic, while
+				-- FT-SAE and FT-EAP get the key holders they cannot work
 				-- without.
+				--
+				-- The key-holder secret is the controller's: aaa.<n>.iapp_key,
+				-- 128 random bits per WLAN, the same key UniFi firmware wraps
+				-- its own inter-AP FT frames with. The wildcard forms are the
+				-- ones OpenWrt itself generates, so any openUF AP on the WLAN
+				-- is accepted as a peer. Without the key (an older controller,
+				-- or iapp_enabled off) OpenWrt derives one from
+				-- md5(mobility_domain .. "/" .. psk), which also works, but
+				-- anyone who knows the passphrase can compute that one.
+				if vap.iapp_key then
+					extra.r0kh = { "ff:ff:ff:ff:ff:ff,*," .. vap.iapp_key }
+					extra.r1kh = { "00:00:00:00:00:00,00:00:00:00:00:00,"
+						.. vap.iapp_key }
+				end
 			end
 			if opts and (opts.band_steering_active or opts.roam_assist_active) then
 				-- usteer requires 802.11k (neighbor reports) + BSS

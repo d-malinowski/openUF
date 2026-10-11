@@ -487,7 +487,7 @@ Settings carried through from the controller:
 | Private Pre-Shared Keys | One `wifi-station` section per key (`openuf_<vap>_psk<k>`: `iface` = the VAP's section, `mac` = `00:00:00:00:00:00`, `key`, `vid` unless the key's network is VLAN 1) and one `wifi-vlan` per VLAN (`openuf_<vap>_vlan<vid>`: `name`/`vid` = the VLAN id, `network` = `openuf_vlan<vid>`), plus `dynamic_vlan=1` on the VAP, from `aaa.<n>.wpa.psk_file.<k>.psk`/`.vlanid`. OpenWrt turns them into hostapd's `wpa_psk_file` and `vlan_file`; the client's netdev is `<vap ifname>-<vid>`. The WLAN's own `wpa.psk` (a random passphrase the controller generates) stays the section's `key`. Needs a hostapd with VLAN support (the full `wpad-*` builds have it) and a `lan_cpueth` to build the VLANs on. `psk_radius=2` (keys from RADIUS only) skips the WLAN |
 | WPA-Enterprise (802.1X) | **not supported** — the WLAN is skipped and logged. The wire protocol carries no RADIUS server/port/secret to write, so there is nothing openUF could provision |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
-| Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged. Both keys arrive `disabled` on a WPA3-only WLAN unless openUF advertises `radio_caps2` bit `0x2`, which it does wherever it advertises `0x1` |
+| Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged. Both keys arrive `disabled` on a WPA3-only WLAN unless openUF advertises `radio_caps2` bit `0x2`, which it does wherever it advertises `0x1`. Key holders: `r0kh`/`r1kh` wildcard lists keyed with `aaa.<n>.iapp_key` (see below) |
 | BSS Transition (802.11v) | `bss_transition` — **needs a full `wpad` build** |
 | Band Steering | `usteer` config, not a hostapd option. On when any WLAN's Band Steering is on, or the AP's own setting is Prefer 5G |
 | Airtime Fairness (device panel) | Not UCI: `/sys/kernel/debug/ieee80211/phy*/airtime_flags`, `3` (TX+RX, the kernel default) for on and `0` for off, from `atf.mode`. Kept as `atf_enabled` in `state.json` and rewritten at every start, because debugfs resets to `3` on reboot. Forgetting the device puts `3` back. Depends on openUF advertising `wifi_caps` bit `0x20`, which it does when that debugfs file exists |
@@ -566,12 +566,15 @@ with no coordination) and `ft_over_ds=0` — and deliberately does **not** set
   defaults it to 0 when nothing has overridden it. Setting it to 1 therefore silently
   disables fast roaming for every WPA3 client on a `sae-mixed` WLAN — which is most of them.
 
-Left unset, `hostapd.sh` keys it on the auth type (`psk` → 1, anything else → 0) and, at 0,
-derives wildcard key holders from `md5(mobility_domain/psk)`. That is deterministic, so
-independent APs sharing an SSID and passphrase arrive at the same key — the same reasoning
-behind the derived mobility domain. Worth knowing: that key is therefore derivable by anyone
-who knows the passphrase, i.e. anyone already on the network; a real UniFi controller
-distributes a random one instead.
+Left unset, `hostapd.sh` / `ap.uc` key it on the auth type (`psk` → 1, anything else → 0),
+and only at 0 do they write key holders. openUF supplies those as wildcard `r0kh`/`r1kh`
+lists whose secret is the controller's `aaa.<n>.iapp_key`. That's a random 128-bit key per
+WLAN, the same one UniFi firmware uses for its own inter-AP FT traffic, so every openUF AP on
+the WLAN agrees with no coordination. If the push carries no `iapp_key` (`iapp_enabled` off),
+OpenWrt falls back to deriving the key from `md5(mobility_domain/psk)`. That one works too,
+but anyone who knows the passphrase can compute it. Fast transitions between openUF and real
+UniFi APs are not possible: those learn their peers through a Ubiquiti-only hostapd
+extension (PROTOCOL-VALIDATION.md, "802.11r key holders").
 
 **How to tell whether a transition was actually fast**, since nothing in the controller
 shows it — force one and read the target AP's log:

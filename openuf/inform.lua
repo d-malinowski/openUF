@@ -2557,6 +2557,18 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- WLAN is unaffected. See apply_wifi_config for why the
 				-- two toggles are merged rather than honoured separately.
 				wpa3_fast_roaming_enabled = wpa3_ft,
+				-- aaa.<n>.iapp_key: the WLAN's 802.11r key-holder secret,
+				-- the wlanconf's x_iapp_key -- 128 random bits the
+				-- controller generates per WLAN and sends whenever
+				-- iapp_enabled (default on), whatever ft.status says. UniFi
+				-- firmware hands it to its patched hostapd as iapp_key=,
+				-- which wraps every inter-AP FT frame with it (see
+				-- PROTOCOL-VALIDATION.md, "802.11r key holders"). Only a
+				-- well-formed key is carried; anything else is nil, and
+				-- apply_config falls back to OpenWrt's own derivation.
+				iapp_key              = type(a.iapp_key) == "string"
+					and #a.iapp_key == 32 and a.iapp_key:match("^%x+$")
+					and a.iapp_key:lower() or nil,
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
 				-- {key=, vid=} per private pre-shared key, in wire order;

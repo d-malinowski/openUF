@@ -2280,6 +2280,49 @@ return {
 		end
 	},
 	{
+		-- aaa.<n>.iapp_key is the wlanconf's x_iapp_key, sent on every
+		-- radio's aaa block for the WLAN (seen live from a 10.x UCG Ultra and
+		-- the 10.4.57 lab). It is the 802.11r key-holder secret.
+		name = "inform packet: aaa.<n>.iapp_key reaches UCI as the r0kh/r1kh key",
+		fn = function()
+			local key = "00112233445566778899AABBCCDDEEFF"
+			local function cfg(k)
+				return table.concat({
+					"aaa.1.ft.status=enabled", "aaa.1.id=6ab8c7ecc18fc00c5f8f66ed",
+					k and ("aaa.1.iapp_key=" .. k) or "aaa.1.status=enabled",
+					"aaa.1.ssid=corp", "aaa.1.wpa.1.pairwise=CCMP",
+					"aaa.1.wpa.key.1.mgmt=WPA-PSK", "aaa.1.wpa.psk=hunter22",
+					"aaa.1.wpa3.support=enabled", "aaa.1.wpa3.transition=enabled",
+					"aaa.1.wpa=2",
+					"wireless.1.parent=radio0", "wireless.1.ssid=corp",
+					"wireless.1.usage=user",
+				}, "\n") .. "\n"
+			end
+
+			local _, vt = inform._parse_wifi_system_cfg(cfg(key))
+			assert_eq(vt[1].iapp_key, key:lower(), "key carried, lowercased")
+			for _, bad in ipairs({"0011", key .. "00", "zz" .. key:sub(3)}) do
+				local _, bvt = inform._parse_wifi_system_cfg(cfg(bad))
+				assert_nil(bvt[1].iapp_key, "malformed key dropped: " .. bad)
+			end
+			_, vt = inform._parse_wifi_system_cfg(cfg(nil))
+			assert_nil(vt[1].iapp_key, "absent key -> nil")
+
+			local ucihelper, db = new_apply_env()
+			local rt
+			rt, vt = inform._parse_wifi_system_cfg(cfg(key))
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			local s = db.wireless.openuf_radio0_corp
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.ieee80211r, "1", "FT on")
+			assert_eq(s.r0kh and s.r0kh[1], "ff:ff:ff:ff:ff:ff,*," .. key:lower(),
+				"r0kh carries the controller's key")
+			assert_eq(s.r1kh and s.r1kh[1],
+				"00:00:00:00:00:00,00:00:00:00:00:00," .. key:lower(),
+				"r1kh carries the controller's key")
+		end
+	},
+	{
 		name = "inform packet: wpa3.support without transition is WPA3-only",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

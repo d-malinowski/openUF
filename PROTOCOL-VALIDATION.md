@@ -1149,7 +1149,8 @@ an **absent block means disabled** — there is generally no explicit `status=fa
 | `wpa.key.<k>.mgmt` | AKM set (`WPA-PSK`, `SAE`, …). **This**, not `wpa`, is what distinguishes SAE. |
 | `pmf.status` / `pmf.mode` | 802.11w. `mode` is `0`\|`1`\|`2` (disabled/optional/required), mapping 1:1 onto hostapd's `ieee80211w`. On this madwifi model, **WPA2/WPA3 transition intent is carried entirely by these fields** — dropping them silently collapses mixed mode to plain WPA2. |
 | `pmf.cipher` | `AES-128-CMAC`. Not translated — hostapd's default BIP group-mgmt cipher already is this. |
-| `ft.status` | Fast Roaming (802.11r) for the WLAN. No `mobility_domain`/`r0kh`/`r1kh` on the wire — the controller computes and syncs those internally across the site; `ucihelper.derive_mobility_domain()` fills the gap locally. |
+| `ft.status` | Fast Roaming (802.11r) for the WLAN. No `mobility_domain`/`r0kh`/`r1kh` on the wire: UniFi firmware derives the mobility domain on the AP from the SSID, and openUF does the same with `ucihelper.derive_mobility_domain()`. The key-holder secret is `iapp_key` (next row). See [802.11r key holders](#80211r-key-holders-iapp_key). |
+| `iapp_key` | 32 hex chars, the wlanconf's `x_iapp_key`: 128 random bits the controller generates per WLAN. Sent whenever `iapp_enabled` (default on), **whatever `ft.status` says**, with the same value on every radio's block for the WLAN. openUF writes it as the `r0kh`/`r1kh` key. |
 | `wpa3.ft.status` | FT for the **SAE akm alone**, a separate toggle from `ft.status`, from the wlanconf's `isWpa3SaeFastRoamingEnabled()`. Emitted unconditionally on any SAE push (the first key `OXMua` writes) and absent otherwise. OpenWrt has one `ieee80211r` switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK **and** FT-SAE together, so openUF enables FT if *either* toggle asks and logs the disagreement. Forced to `disabled` unless the radio claims `radio_caps2` bit `0x2` (see [Capability bitmasks](#capability-bitmasks)). |
 | `bss_transition` | 802.11v. Present on every band's block, flips independently of Fast Roaming. |
 | `br.devname` | `br0` untagged, **`br0.<vlan>`** when the WLAN is assigned to a VLAN network — CONFIRMED live 2026-08-01, the first capture of a tagged WLAN on real hardware. This suffix is the *only* per-WLAN VLAN signal; there is no `network_table`/`networkconf_id` join anywhere in the wire format. |
@@ -2194,6 +2195,64 @@ VLAN reversibility ledger, the LED toggle, the locate flag, the static-vs-DHCP g
 the identity MAC that `_warn_identity_change` compares against, which made that entire
 diagnostic unreachable. Surfaced here because this is the first board whose LED idles at
 something other than off, so "the toggle forgets itself on reboot" was finally *visible*.
+
+### 802.11r key holders (`iapp_key`)
+
+openUF used to derive the FT key-holder secret from the passphrase (OpenWrt's
+`md5(mobility_domain/psk)`), on the belief that the controller sends no such secret. It does:
+`aaa.<n>.iapp_key`. It was never reported as dropped because the dropped-key audit treats the
+whole `aaa.<n>.*` namespace as recognized.
+
+**Controller** (10.6 jar, CFR): the wlanconf field `x_iapp_key` is matched against
+`[0-9A-Fa-f]{32}` and filled with 32 random hex chars, both by the database migration and for
+new WLANs. A WLAN created over REST in the lab came back with the key already set. The
+system_cfg emitter writes `aaa.<n>.iapp_key` when `iapp_enabled` is true and the key is
+non-empty, and doesn't check `ft.status`. A migration ("Enable all WLAN iapp_enabled by default")
+switches `iapp_enabled` on everywhere. Seen on the wire from the 10.4.57 lab and from the 10.x
+UCG Ultra: every WLAN except one carried it, with the same value on both radios.
+
+**Firmware** (firmware-confirmed for 3.9.27 to 4.0.15, `ubntbox` and `wpad` disassembled):
+- `ubntbox` writes `iapp_key=<hex>` into the hostapd config and, unconditionally,
+  `wlan_id=<hex(SHA1("salt" ‖ ssid zero-padded to 32 bytes)[0..1])>`. With `ft.status` on it
+  adds `mobility_domain` (`aaa.<n>.mobility_domain` if present, which the controller never
+  sends, else that same hash) and `nas_identifier` (the device MAC). It also adds fixed values:
+  `r0_key_lifetime=10000`, `r1_key_holder=020055424e54`, `reassociation_deadline=3000`,
+  `pmk_r1_push=1`, `ft_over_ds=0`. There are **no `r0kh`/`r1kh` lines and no
+  `ft_psk_generate_local`**.
+- `iapp_key` and `wlan_id` are options only in Ubiquiti's patched hostapd (2.7-devel).
+  - On every association, `wpa_ft_roam` broadcasts an RRB frame (ethertype 0x890d) carrying the
+    STA MAC, a timestamp and the `wlan_id`, AES-key-wrapped with `iapp_key`. A peer with the
+    same `wlan_id` unwraps it and, if it is under 60 s old, disassociates that STA locally.
+  - A second RRB message, also wrapped with `iapp_key`, makes `wpa_ft_rrb_rx` allocate an
+    R0KH and an R1KH entry for an unknown sender, with `iapp_key` as their secret.
+    `pmk_r1_push` then goes to every peer learned this way.
+
+So UniFi APs **learn** their key holders at runtime, and the shared secret is the
+controller's random per-WLAN key.
+
+**openUF** writes the wildcard key holders OpenWrt itself would generate, with that key in
+place of the md5:
+`r0kh = ff:ff:ff:ff:ff:ff,*,<iapp_key>`, `r1kh = 00:00:00:00:00:00,00:00:00:00:00:00,<iapp_key>`.
+OpenWrt reads them only when `ft_psk_generate_local` is 0 (`/usr/share/ucode/wifi/ap.uc`
+`iface_roaming`, and `hostapd.sh` on 24.10), so FT-PSK keeps local derivation and FT-SAE/EAP
+use the controller's key. Without a key, the md5 fallback still applies.
+- Lab: the lab controller's push for a new WLAN reached UCI on both radios with
+  `x_iapp_key` byte-for-byte.
+- Hardware: both APs produced identical `r0kh=`/`r1kh=` lines carrying the gateway's key in
+  `/var/run/hostapd-phy*.conf`.
+- Forced roams with the new key in place:
+  - An FT-SAE client steered with `bss_tm_req` reconnected `auth_alg=ft` with no 4-way
+    handshake. It chose the other radio of the same AP, which needs the PMK-R1 fetched from the
+    key holder just as a cross-AP roam does.
+  - A second FT-SAE client steered across APs was `authenticated` by the target AP with its
+    FT AKM already set before association, i.e. the FT authentication including the PMK-R1
+    fetch succeeded. The client then never acknowledged the response at -74 dBm and fell back.
+  - A third client used PMKSA caching (`auth_alg=open`), which is the client's choice.
+  - A clean cross-AP `auth_alg=ft` with the new key is still to be captured.
+
+The mobility domain deliberately keeps openUF's own hash, not UniFi's. Stock hostapd can't
+speak the learned-peer RRB messages, so FT between openUF and a real UAP can't work. A shared
+mobility domain would only make clients try it.
 
 ### 802.11r was configured, advertised, and not working
 

@@ -721,6 +721,48 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: the controller's iapp_key becomes the FT key-holder secret",
+		fn = function()
+			local key = "00112233445566778899aabbccddeeff"
+			with_ucihelper(function(db)
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+					 x_passphrase = "hunter22", fast_roaming_enabled = true,
+					 iapp_key = key},
+				}}, nil)
+				local s = db.wireless.openuf_radio0_corp
+				-- The wildcard forms OpenWrt itself generates, with the
+				-- controller's key in place of md5(mobility_domain/psk).
+				assert_eq(type(s.r0kh), "table", "r0kh is a UCI list")
+				assert_eq(#s.r0kh, 1, "one wildcard R0KH")
+				assert_eq(s.r0kh[1], "ff:ff:ff:ff:ff:ff,*," .. key, "r0kh carries iapp_key")
+				assert_eq(type(s.r1kh), "table", "r1kh is a UCI list")
+				assert_eq(s.r1kh[1], "00:00:00:00:00:00,00:00:00:00:00:00," .. key,
+					"r1kh carries iapp_key")
+				assert_nil(s.ft_psk_generate_local,
+					"still left to OpenWrt, which only reads r0kh/r1kh when it is 0")
+			end)
+			-- No key: nothing written, so OpenWrt's own derivation runs.
+			with_ucihelper(function(db)
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+					 x_passphrase = "hunter22", fast_roaming_enabled = true},
+				}}, nil)
+				assert_nil(db.wireless.openuf_radio0_corp.r0kh, "no iapp_key -> no r0kh")
+				assert_nil(db.wireless.openuf_radio0_corp.r1kh, "no iapp_key -> no r1kh")
+			end)
+			-- FT off: the key is pushed regardless, but means nothing here.
+			with_ucihelper(function(db)
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+					 x_passphrase = "hunter22", fast_roaming_enabled = false,
+					 iapp_key = key},
+				}}, nil)
+				assert_nil(db.wireless.openuf_radio0_corp.r0kh, "FT off -> no r0kh")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: wpa3.ft.status alone still enables 802.11r",
 		fn = function()
 			with_ucihelper(function(db)
