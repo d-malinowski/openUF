@@ -3549,8 +3549,20 @@ escapes (seen live 2026-09-27), e.g. `Caf\xc3\xa9 Guest`. The controller's evil-
 miss a site SSID written that way. Decoding is unambiguous because iw escapes the backslash
 too. An empty or NUL-filled (hidden) SSID is sent with no `essid`, and the tab shows the BSSID.
 
-**Two Environment columns are the controller's, not the AP's** (10.6 bundle
+**Three Environment columns are the controller's, not the AP's** (10.6 bundle
 `react-app-wrapper`, column list `Wt`):
+
+- **Standard** (`WIFI_STANDARD`) renders `jt[row.radio.toUpperCase()]`, a fixed map whose
+  English strings are `NA` "802.11n/a/be", `NG` "802.11n/b/g/be", `6E` "802.11ax/be",
+  `NA_AC` "802.11n/a/ac", `NA_AX` "802.11n/a/ac/ax" and `AD` "802.11a/d". It describes no
+  neighbour's PHY. The scan ingest (10.6 jar, `com.ubnt.service.aS.qikih`) overwrites every
+  row's `radio` with the **parent** `scan_radio_table[].radio` before storing it, whatever
+  the row sent. Only for the pseudo-radio `scan` does it use the row's `band` instead. So a
+  stored `radio` is always a band name (`na`/`ng`/`6e`), and every 5 GHz row reads
+  "802.11n/a/be", even a 2014 802.11ac router, on a real UniFi AP too. The `NA_AC`/`NA_AX`
+  keys are unreachable through `stat/rogueap`. Sending a per-row standard is impossible, and
+  renaming the parent radio would mislabel every row the same way and break the
+  consumers keyed on `na`/`ng` (Radio AI's band filter, `kFACvOhX`). Established 2026-10-13.
 
 - **AP** (`AP_COUNT`) is not a per-row field. Rows are grouped by `essid`, and the cell shows
   `children.length + 1` only on a group's parent row. A BSS alone under its name is blank, on
