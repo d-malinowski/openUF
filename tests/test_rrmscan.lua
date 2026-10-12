@@ -58,7 +58,264 @@ local function by_bssid(list)
 	return m
 end
 
+-- A Beacon Report element as hex, from its parts. body_ies = nil means no
+-- Reported Frame Body; frag = {num, more} adds a Fragment ID subelement.
+local function hexs(str)
+	return (str:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+local function ie(id, bytes) return string.char(id, #bytes) .. bytes end
+local function report_hex(o)
+	local fixed = string.char(o.op or 115, o.channel or 36) .. string.rep("\0", 8)
+		.. string.char(0, 0, 0, o.rcpi or 122, 0)
+		.. string.char(0x00, 0x00, 0x5e, 0x00, 0x53, o.last or 0x02)
+		.. string.rep("\0", 5)
+	local subs = ""
+	if o.body_ies then
+		local cap = o.privacy and 0x11 or 0x01
+		local body = string.rep("\0", 8) .. string.char(0x64, 0, cap, 0) .. o.body_ies
+		subs = subs .. string.char(1, #body) .. body
+	end
+	if o.frag then
+		subs = subs .. string.char(2, 2, 1, o.frag[1] + (o.frag[2] and 128 or 0))
+	end
+	return hexs(fixed .. subs)
+end
+local RSN = ie(48, string.char(1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0))
+
+local function with_width(fn)
+	local orig = rrmscan._channel_width
+	rrmscan._channel_width = dofile("openuf/sysinfo.lua").channel_width
+	local ok, err = pcall(fn)
+	rrmscan._channel_width = orig
+	if not ok then error(err, 0) end
+end
+
 return {
+	{
+		-- A real BEACON-RESP-RX from the Archer C5's 5 GHz BSS, 2026-10-12
+		-- (MAC and SSID replaced): a 205-byte frame body, cut, holding the
+		-- SSID, RSN, HT and VHT operation of an 80 MHz BSS on channel 36.
+		name = "rrmscan: a control-socket report yields SSID, security, width and primary",
+		fn = function()
+			local line = read_fixture("hostapd_beacon_resp_rx.txt")
+			local hex = line:match("(%x+)%s*$")
+			with_width(function()
+				local r = rrmscan.parse_report(hex)
+				assert_eq(r.bssid, "00:00:5e:00:53:01", "bssid")
+				assert_eq(r.essid, "HomeTest", "SSID from the frame body")
+				assert_eq(r.security, "wpa2", "RSN element")
+				assert_eq(r.bw, 80, "VHT operation width 1")
+				assert_eq(r.channel, 36, "primary channel")
+				assert_eq(r.band, "na", "band")
+				assert_eq(r.signal, -49, "rcpi 122")
+			end)
+			-- Without the shared width function the width is unknown, not guessed.
+			assert_nil(rrmscan.parse_report(hex).bw, "no width function, no width")
+		end
+	},
+	{
+		name = "rrmscan: a report's fields are taken only where the body proves them",
+		fn = function()
+			with_width(function()
+				local P = rrmscan.parse_report
+				-- Hidden SSID: empty or NUL-filled.
+				assert_nil(P(report_hex({body_ies = ie(0, "") .. RSN})).essid, "empty SSID")
+				assert_nil(P(report_hex({body_ies = ie(0, "\0\0\0") .. RSN})).essid, "NUL SSID")
+				-- Privacy bit clear: open, even when the body was cut.
+				assert_eq(P(report_hex({body_ies = ie(0, "x"), frag = {0, true}})).security,
+					"open", "privacy clear is open")
+				-- Privacy set, no RSN/WPA: unknown, flagged cut or not. Clients
+				-- shorten bodies without saying so (seen live), and proving WPA
+				-- absent would take the very end of the beacon.
+				assert_nil(P(report_hex({privacy = true, body_ies = ie(0, "x")})).security,
+					"no RSN in the body is not proof of wep")
+				assert_nil(P(report_hex({privacy = true, body_ies = ie(0, "x"),
+					frag = {0, true}})).security, "nor in a flagged-cut body")
+				-- WPA vendor element.
+				local wpa = ie(221, string.char(0x00, 0x50, 0xf2, 0x01, 1, 0))
+				assert_eq(P(report_hex({privacy = true, body_ies = wpa})).security, "wpa", "WPA")
+				-- The fixed field names the centre channel; HT operation the primary.
+				local ht40 = ie(61, string.char(36, 1) .. string.rep("\0", 20))
+				local tpe  = ie(195, string.char(2, 0x2e, 0x2e, 0x2e))
+				local r = P(report_hex({channel = 38, privacy = true, body_ies = RSN .. ht40 .. tpe}))
+				assert_eq(r.channel, 36, "primary from HT operation")
+				-- HT-only on 5 GHz: the VHT element may just not have been sent,
+				-- and element order proves nothing (seen out of order live).
+				assert_nil(r.bw, "5 GHz HT-only body: width unknown")
+				-- On 2.4 GHz HT operation is the width.
+				local ht40_ng = ie(61, string.char(1, 1) .. string.rep("\0", 20))
+				assert_eq(P(report_hex({channel = 1, privacy = true, body_ies = RSN .. ht40_ng})).bw,
+					40, "2.4 GHz HT40")
+				-- No operation elements at all: unknown, the merge's 20 floor.
+				assert_nil(P(report_hex({privacy = true, body_ies = RSN})).bw, "no op elements")
+				-- A continuation fragment is a report of its own for the same
+				-- BSSID; it must not stand in for fragment 0.
+				assert_nil(P(report_hex({privacy = true, body_ies = ie(0, "x") .. RSN,
+					frag = {1, false}})), "continuation fragment dropped")
+				-- A filtered body (live: SSID + one vendor element, privacy set).
+				local fb = P(report_hex({privacy = true,
+					body_ies = ie(0, "x") .. ie(221, string.char(0x00, 0x10, 0x18, 2, 0))}))
+				assert_nil(fb.security, "filtered body: security unknown")
+				assert_nil(fb.bw, "and width unknown")
+				-- No body at all: what ubus gives, and nothing more.
+				local nb = P(report_hex({channel = 6}))
+				assert_nil(nb.essid, "no body, no SSID")
+				assert_nil(nb.security, "no body, no security")
+				assert_eq(nb.band, "ng", "band from the fixed channel")
+				-- Malformed.
+				assert_nil(P("zz"), "not hex")
+				assert_nil(P("0011"), "too short")
+				assert_nil(P(report_hex({}) .. "0"), "odd length")
+			end)
+		end
+	},
+	{
+		name = "rrmscan: harvest prefers the control-socket record and counts its reporter",
+		fn = function()
+			local ctrl = read_fixture("hostapd_beacon_resp_rx.txt")
+			local ubus = '{ "beacon-report": {"address":"00:00:5e:00:53:11","op-class":81,'
+				.. '"channel":42,"rcpi":120,"bssid":"00:00:5e:00:53:01","rep-mode":0} }\n'
+			with_width(function()
+				with_events(ubus .. ctrl, function()
+					local out, reporters = rrmscan.harvest()
+					assert_eq(#out, 1, "one record per BSSID")
+					assert_eq(out[1].essid, "HomeTest", "the control-socket record wins")
+					assert_eq(out[1].channel, 36, "with its primary channel, not 42")
+					assert_true(reporters["00:00:5e:00:53:10"] == true, "ctrl reporter counted")
+					assert_true(reporters["00:00:5e:00:53:11"] == true, "ubus reporter counted")
+				end)
+			end)
+			-- Fragment 1 of the same BSSID arriving first does not take its place.
+			local hex = ctrl:match("(%x+)%s*$")
+			local cont = "BEACON-RESP-RX 00:00:5e:00:53:10 60 00 " .. hex:sub(1, 52)
+				.. "01020000" .. "02020101\n"
+			with_width(function()
+				with_events(cont .. ctrl, function()
+					local out = rrmscan.harvest()
+					assert_eq(#out, 1, "one record")
+					assert_eq(out[1].essid, "HomeTest", "fragment 0 kept")
+				end)
+			end)
+			-- A non-zero report mode is a refusal on this path too.
+			local refused = ctrl:gsub("BEACON%-RESP%-RX (%S+) (%d+) 00", "BEACON-RESP-RX %1 %2 04")
+			with_events(refused, function()
+				local out, reporters = rrmscan.harvest()
+				assert_eq(#out, 0, "refusal reports nothing")
+				assert_nil(reporters["00:00:5e:00:53:10"], "and is not an answer")
+			end)
+		end
+	},
+	{
+		name = "rrmscan: merge carries proven fields, skips own and sibling BSSIDs",
+		fn = function()
+			local n = {
+				{bssid = "00:00:5e:00:53:01", band = "na", channel = 36, signal = -60,
+					seen_at = 100, essid = "Neighbour", security = "wpa2", bw = 80},
+				{bssid = "00:00:5e:00:53:02", band = "na", channel = 48, signal = -70,
+					seen_at = 100, essid = "SiteNet", security = "wpa2"},
+				{bssid = "00:00:5E:00:53:03", band = "na", channel = 36, signal = -20,
+					seen_at = 100, essid = "SiteNet", security = "wpa2"},
+			}
+			local out = by_bssid(rrmscan.merge_into({}, n, {
+				band = "na", radio = "na", radio_name = "radio0", now = 105,
+				skip = {["00:00:5e:00:53:03"] = true},
+				site_ssids = {SiteNet = true},
+			}))
+			local a = out["00:00:5e:00:53:01"]
+			assert_eq(a.essid, "Neighbour", "essid carried")
+			assert_eq(a.security, "wpa2", "security carried")
+			assert_eq(a.bw, 80, "width carried")
+			local b = out["00:00:5e:00:53:02"]
+			assert_nil(b.essid, "a site SSID from an unknown BSS is withheld")
+			assert_eq(b.security, "wpa2", "its security is still reported")
+			assert_eq(b.bw, 20, "unknown width falls to the 20 MHz floor")
+			assert_nil(out["00:00:5E:00:53:03"], "own/sibling BSSID skipped, any case")
+		end
+	},
+	{
+		name = "rrmscan: siblings are read from usteer's remote nodes",
+		fn = function()
+			with_popen('{"192.0.2.4#hostapd.phy0-ap0": {"bssid": "00:00:5E:00:53:21",'
+				.. '"ssid": "SiteNet"}, "192.0.2.4#hostapd.phy1-ap0": {"bssid":'
+				.. '"00:00:5e:00:53:22"}}', function(seen)
+				local s = rrmscan.sibling_bssids()
+				assert_true(s["00:00:5e:00:53:21"] == true, "lowercased")
+				assert_true(s["00:00:5e:00:53:22"] == true, "second node")
+				assert_true(seen[1]:find("usteer remote_info", 1, true) ~= nil, "asks usteer")
+			end)
+			with_popen(nil, function()
+				assert_true(next(rrmscan.sibling_bssids()) == nil, "no usteer, no siblings")
+			end)
+		end
+	},
+	{
+		name = "rrmscan: one control-socket monitor per BSS, restarted only when missing",
+		fn = function()
+			local orig = rrmscan.ACTION_SCRIPT
+			rrmscan.ACTION_SCRIPT = os.tmpname()
+			os.remove(rrmscan.ACTION_SCRIPT)
+			local ok, err = pcall(function()
+				local ps = ""
+				local answers = function(cmd)
+					if cmd:find("^ls ") then return "global\nphy0-ap0\nphy1-ap0\n" end
+					if cmd:find("^ps ") then return ps end
+					return ""
+				end
+				with_popen(answers, function()
+					with_exec(function(cmds)
+						assert_eq(rrmscan.monitors_ensure(), 2, "one per BSS, not global")
+						local all = table.concat(cmds, "\n")
+						assert_true(all:find("kill $(pgrep -f '[h]ostapd_cli", 1, true) ~= nil,
+							"a new script replaces any old monitor")
+						assert_true(all:find("hostapd_cli -p /var/run/hostapd -i phy1-ap0 -a "
+							.. rrmscan.ACTION_SCRIPT .. " -B", 1, true) ~= nil, "started detached")
+						assert_false(all:find("-i global", 1, true) ~= nil, "global skipped")
+					end)
+				end)
+				ps = " 1 root 1152 S hostapd_cli -p /var/run/hostapd -i phy0-ap0 -a "
+					.. rrmscan.ACTION_SCRIPT .. " -B\n"
+				with_popen(answers, function()
+					with_exec(function(cmds)
+						assert_eq(rrmscan.monitors_ensure(), 1, "only the missing one")
+						assert_true(cmds[1]:find("-i phy1-ap0", 1, true) ~= nil, "phy1-ap0")
+					end)
+				end)
+			end)
+			os.remove(rrmscan.ACTION_SCRIPT)
+			rrmscan.ACTION_SCRIPT = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- The action script is shell, run per event by hostapd_cli as
+		-- "<script> <ifname> <event words...>". Run it for real and feed what
+		-- it writes back through harvest.
+		name = "rrmscan: the action script appends only beacon reports, in a line harvest reads",
+		fn = function()
+			local orig_ev, orig_sc = rrmscan.EVENT_FILE, rrmscan.ACTION_SCRIPT
+			rrmscan.EVENT_FILE, rrmscan.ACTION_SCRIPT = os.tmpname(), os.tmpname()
+			local ok, err = pcall(function()
+				local f = assert(io.open(rrmscan.ACTION_SCRIPT, "w"))
+				f:write(rrmscan.action_script())
+				f:close()
+				local hex = read_fixture("hostapd_beacon_resp_rx.txt"):match("(%x+)%s*$")
+				os.execute("sh " .. rrmscan.ACTION_SCRIPT .. " phy0-ap0 AP-STA-CONNECTED 00:00:5e:00:53:10 2>/dev/null")
+				os.execute("sh " .. rrmscan.ACTION_SCRIPT
+					.. " phy0-ap0 BEACON-RESP-RX 00:00:5e:00:53:10 60 00 " .. hex .. " 2>/dev/null")
+				local g = assert(io.open(rrmscan.EVENT_FILE, "r"))
+				local text = g:read("*a")
+				g:close()
+				assert_false(text:find("AP-STA-CONNECTED", 1, true) ~= nil, "other events ignored")
+				local out = rrmscan.harvest(text)
+				assert_eq(#out, 1, "the report is read back")
+				assert_eq(out[1].essid, "HomeTest", "intact")
+			end)
+			os.remove(rrmscan.EVENT_FILE)
+			os.remove(rrmscan.ACTION_SCRIPT)
+			rrmscan.EVENT_FILE, rrmscan.ACTION_SCRIPT = orig_ev, orig_sc
+			if not ok then error(err, 0) end
+		end
+	},
 	{
 		name = "rrmscan: RCPI converts on the 0.5-dBm scale anchored at -110",
 		fn = function()
@@ -364,6 +621,8 @@ return {
 				assert_false(all:find("pkill", 1, true) ~= nil, "does not rely on pkill")
 				assert_true(all:find("rm -f " .. rrmscan.EVENT_FILE, 1, true) ~= nil,
 					"removes the notification file it was appending to")
+				assert_true(all:find("[h]ostapd_cli", 1, true) ~= nil,
+					"stops the control-socket monitors too")
 			end)
 		end
 	},

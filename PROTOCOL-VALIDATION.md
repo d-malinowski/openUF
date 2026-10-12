@@ -3597,7 +3597,8 @@ acknowledged every request (`BEACON-REQ-TX-STATUS … ack=1`) and never sent a r
 hostapd itself refuses a passive request for such a client with "does not support passive
 beacon report". Table-only is therefore not treated as capable.
 
-Two fields deserve care on the way into `scan_table`, and they are handled differently:
+When a report carries no frame body (see below), two fields deserve care on the way into
+`scan_table`, and they are handled differently:
 
 - **`bw` is set to 20.** Not a guess: every AP occupies at least its 20 MHz primary. It also
   cannot safely be omitted — the tab's unconditional filter indexes
@@ -3613,6 +3614,68 @@ Verified end to end 2026-09-02 on the Archer C5's 5 GHz radio, whose passive cac
 **zero** BSSes: after one beacon request the controller's Environment tab listed **four**,
 at −53/−69/−81/−81 dBm on ch 36/44/48 — one of them `00:00:5e:00:53:05`, the *other* AP's
 5 GHz BSS, which this radio cannot hear from another room but the client could.
+
+#### The frame body: hostapd's control socket, not ubus (2026-10-12)
+
+The AirView WiFi Scanner showed 5 GHz rows named by their BSSID, with no Security, at 20 MHz.
+A real scan had reported the same BSSIDs with SSID, `wpa2` and 80 MHz. The next 802.11k report
+for each BSSID replaced that record. Read-only captures on both APs, OpenWrt 25.12,
+`wpad-mbedtls 2025.08.26~ca266cc2`:
+
+- **ubus has no body.** The `beacon-report` notification carries `address`, `op-class`,
+  `channel`, `start-time`, `duration`, `report-info`, `rcpi`, `rsni`, `bssid`, `antenna-id`,
+  `parent-tsf` and `rep-mode`, and nothing else. OpenWrt's current `ubus.c` adds a base64 `report`
+  with the whole element. This build does not have it: 11 notifications were captured and none carried it.
+- **The control socket has it.** `rrm.c` also emits `BEACON-RESP-RX <sta> <token> <rep_mode hex>
+  <report hex>` to attached monitors. A `hostapd_cli -i <bss>` caught one from a client on the
+  Archer's 5 GHz BSS. Subelement 1 (Reported Frame Body, 205 bytes) held the fixed fields
+  (capability `0x1011`, privacy set) and then these elements: SSID, rates, Country, RSN (AKMs
+  PSK, FT-PSK, PSK-SHA256, SAE, FT-SAE), RM capabilities, HT capabilities, HT operation (primary 36),
+  extended capabilities, VHT capabilities, VHT operation (width 1, centre 42, so 80 MHz) and
+  Tx power envelope. Subelement 2 (Reported Frame Body Fragment ID) was `01 80`: fragment 0
+  with the *more* bit set. The body was cut, and the vendor elements at the end of the beacon were lost.
+- **Why clients send it.** `rrm_beacon_req` includes no Reporting Detail subelement (ubus
+  takes `addr`, `mode`, `op_class`, `channel`, `duration`, `bssid`, `ssid` only), and an absent
+  Reporting Detail means level 2, all fixed fields and elements.
+- **`hostapd_cli -a <script>`** runs `<script> <ifname> <event words…>` for each event, verified
+  on the Archer: `$1=phy0-ap0 $2=BEACON-RESP-RX $3=<sta> <token> <mode> <hex>`. About 0.9 MB RSS per process.
+- **The fixed `channel` field can be the centre channel.** Several 5 GHz BSSes were reported with `op-class 81`
+  or `129` and `channel 42`, including the Archer's own BSS on 36. The HT operation element's
+  primary channel is the reliable one.
+
+- **What a client actually sends varies.** Four bodies captured after the deploy, from one client
+  on the Archer:
+  - 205 bytes, fragment 0 with the more bit set.
+  - 218 bytes, the same.
+  - 218 bytes with a vendor element mid-list and Country after Tx Power Envelope. The beacon's
+    element order does not survive.
+  - **32 bytes holding only the SSID and one vendor element**, privacy set, no fragment
+    subelement. This is a filtered body.
+  The rest of a fragmented body came as a **separate report for the same BSSID**: fragment 1,
+  its body starting mid-beacon. A first parser rule read "privacy, no RSN, not flagged as cut"
+  as `wep`, and the 32-byte body went out as WEP at 20 MHz.
+
+openUF (`rrmscan.parse_report`) therefore treats anything missing from a body as unknown and
+takes each field only from an element that is present:
+- essid: the SSID element (empty or NUL means hidden, nil).
+- security: `wpa2` for RSN, `wpa` for the WPA vendor element, `open` when the privacy bit is
+  clear. Never `wep`.
+- bw: VHT operation on 5 GHz and HT operation on 2.4 GHz, through `sysinfo.channel_width`, the
+  same decision as the scan cache. A 5 GHz body without VHT operation gives no width, and the
+  merge's 20 MHz floor applies.
+- channel: the HT operation primary.
+A continuation fragment returns nil, so it can't take its BSSID's place ahead of fragment 0.
+
+**This AP and its siblings.** Clients report the AP they sit on and its siblings like any
+other BSS. Live: the Archer listed its own BSSIDs at −11 dBm, and the office AP
+listed the Archer's 5 GHz BSS. Once the SSID is filled in, a sibling carrying a site SSID
+without `is_unifi` triggers the controller's rogue check. That happened live: *"This third-party access
+point is broadcasting your network's SSID"* on the Archer's BSS, as reported by the office AP. The
+tag cannot come from a report, because the identity element is a vendor element at the end of the beacon,
+past the cut. So the merge skips this AP's own BSSIDs (`vap_table`) and usteer's
+remote-node BSSIDs (`ubus call usteer remote_info`). If usteer is not answering, a reported BSS carrying
+one of this site's SSIDs is sent without `essid`, so it can't raise a false alert. An evil twin that only a client
+ever saw is then not flagged.
 
 `is_rogue` is much narrower than the tab name suggests: set true only when a neighbouring BSSID
 broadcasts the **same essid as one of the site's own configured networks** (an evil-twin check
@@ -3640,7 +3703,8 @@ its own vendor IE on every VAP — `dd 0d 02:6f:55 6f:55:46 01 <identity MAC>` v
 unknown vendor elements, so the element never appears in `iw scan dump` output, `-u` or not —
 verified live on both boards, where the same cache read over nl80211 held it. The OUI is deliberately not
 a Ubiquiti one: a real UniFi AP would parse our layout as its own. 802.11k-reported
-entries are left untagged — a beacon report carries no SSID, so they can never be flagged.
+entries are never tagged: the element sits past where a client's frame body is cut. Siblings are
+skipped instead (see *The frame body* above).
 The yesrab fork saw the same on their mt7986 board (2026-09-28, `40ed2ce`): after a forced
 re-push, `vendor_elements` was in both hostapd configs and on all three VAPs. They had no second
 AP on the build, so no `is_unifi` tag from it.

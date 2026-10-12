@@ -950,13 +950,23 @@ empty 5 GHz list from 0 neighbours to 4, one of them an AP the radio cannot hear
 | `rrm_enrichment` | `true` by default. Set `false` to never send a beacon request. Switching it off also tears down the background collector on the next cycle, and `/etc/init.d/openuf stop` does the same |
 | `rrm_request_interval` | Seconds between requests, across all radios and clients combined — they are asked one at a time, round-robin |
 
-Reports are collected by a detached `ubus subscribe hostapd.*` child that parks them in
-`/tmp/openuf-rrm.jsonl`; openUF drains and truncates that file on every inform. Because the
-child is reparented to init it outlives the daemon, so openUF kills it explicitly — on
-service stop, on uninstall, and when `rrm_enrichment` is turned off. If you ever find it
-running with openUF stopped (`pgrep -f 'ubus subscribe hostapd'`), nothing is draining the
-file and it will grow: `kill $(pgrep -f '[u]bus subscribe hostapd')` and delete it (busybox
-on OpenWrt 25.12 has no `pkill`).
+Reports are collected two ways, into one spool, `/tmp/openuf-rrm.jsonl`, which openUF
+drains and truncates on every inform:
+
+- A detached `ubus subscribe hostapd.*` child. hostapd's ubus notification carries only the
+  BSSID, channel and signal.
+- One `hostapd_cli -i <bss> -a /tmp/openuf-bresp.sh` per BSS (from `hostapd-utils`, already a
+  dependency). hostapd's **control socket** sends the whole report as `BEACON-RESP-RX`,
+  including the neighbour's own beacon as the client heard it. That is where the SSID,
+  security and channel width come from. A monitor exits when hostapd restarts (a
+  `wifi reload`), and openUF starts a new one within a minute. Each uses about 0.9 MB.
+
+Both are reparented to init, so they outlive the daemon. openUF kills them explicitly on
+service stop, on uninstall, and when `rrm_enrichment` is turned off. If you ever find the
+subscriber running with openUF stopped (`pgrep -f 'ubus subscribe hostapd'`), nothing is
+draining the file and it will grow: `kill $(pgrep -f '[u]bus subscribe hostapd')
+$(pgrep -f '[h]ostapd_cli .*-a /tmp/openuf-bresp.sh')` and delete it (busybox on OpenWrt
+25.12 has no `pkill`).
 
 Only clients advertising **active or passive** beacon measurement are ever asked. Clients
 advertising *beacon-table* only are skipped on purpose: the one real example acknowledged
@@ -976,14 +986,30 @@ such a station is indistinguishable from one that never answers — after two un
 requests it is left alone for six hours, then tried once more. Any report at all puts it
 straight back into the rotation.
 
-Rows sourced this way show a **blank WiFi Name and Security** (the controller renders the
-BSSID instead of a name). That is deliberate: a beacon report carries a BSSID, a channel
-and an RCPI, and nothing else. openUF will not invent a security mode it did not measure —
-an earlier draft defaulted it to `open` and told the operator that four WPA2 neighbours
-were unencrypted.
+Rows sourced this way carry what the client's report proves, and no more:
 
-To see the machinery: `pgrep -f 'ubus subscribe hostapd'` is the collector that receives
-the reports (hostapd delivers them as ubus *notifications*, so `ubus listen` shows nothing
+- **WiFi Name** comes from the SSID element. A hidden network, or a report that arrived only
+  over ubus, has none, and the controller then shows the BSSID.
+- **Security** is `wpa2` (RSN element), `wpa` (WPA element) or `open` (privacy bit clear).
+  Clients cut long beacons short, sometimes without saying so, and some send only a few
+  elements, so a missing RSN element is unknown, not absent. In that case the cell stays blank: openUF never reports `wep` and
+  will not invent a security mode it did not measure. An earlier draft defaulted to `open`
+  and told the operator that four WPA2 neighbours were unencrypted.
+- **Ch. Width** comes from VHT operation on 5 GHz and HT operation on 2.4 GHz, decided exactly
+  as for the AP's own scan. Clients may send only some elements, so a 5 GHz body without VHT
+  operation gives no width. If unknown, the width is 20 MHz (every BSS occupies at least that much).
+- **Channel** is the primary from HT operation. Clients put an 80 MHz BSS's *centre*
+  channel (42 for a BSS on 36) in the report itself.
+
+Two kinds of reported BSS are left out. One is **this AP's own BSSIDs**, which its clients
+naturally report. The other is **sibling APs** (usteer's remote nodes). A UniFi AP never lists
+either. Once the SSID is known, an untagged sibling carrying the site's SSID is what the
+controller flags as *"a third-party access point broadcasting your network's SSID"*. If usteer
+is not answering, a reported BSS carrying one of this site's SSIDs is listed **without** its
+name, for the same reason. The trade: an evil twin that only a client ever saw is not flagged.
+
+To see the machinery: `pgrep -f 'ubus subscribe hostapd'` and `pgrep -f '[h]ostapd_cli'` are
+the collectors that receive the reports (hostapd delivers them as ubus *notifications*, so `ubus listen` shows nothing
 — only `ubus subscribe` works), `logread | grep BEACON-REQ-TX-STATUS` shows requests going
 out, and `/tmp/openuf-rrm.jsonl` is the spool, drained on every inform.
 

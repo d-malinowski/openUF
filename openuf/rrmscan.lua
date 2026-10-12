@@ -41,11 +41,13 @@
 	then never sent a report. Beacon-table alone is therefore NOT treated as
 	capable here -- see capable_stations().
 
-	A beacon report also carries less than a scan does: a BSSID, a channel and
-	an RCPI, but no SSID, no security and no channel width. Entries that the
-	passive cache already knows keep the cache's richer version; entries only
-	the client can see are reported with what there is. The controller renders
-	a missing WiFi Name as the BSSID, so they are still useful rows.
+	hostapd hands a report over twice. Its ubus notification carries only a
+	BSSID, a channel and an RCPI. Its control socket (BEACON-RESP-RX) carries
+	the whole report, including the neighbour's beacon as the client heard it,
+	and with it SSID, security and channel width (see parse_report). Both are
+	collected, and the control-socket record wins. Entries that the passive
+	cache already knows keep the cache's version, which alone can carry the
+	sibling tag. This AP's own BSSIDs and its siblings' are skipped (merge_into).
 ]]--
 
 local M = {}
@@ -112,6 +114,107 @@ function M.freq_of_channel(ch)
 	if ch >= 1 and ch <= 13 then return 2407 + 5 * ch end
 	if ch >= 32 then return 5000 + 5 * ch end
 	return nil
+end
+
+-- Width from the operation elements, injected by inform.lua as
+-- sysinfo.channel_width so the scan cache and beacon reports decide it the
+-- same way. Unset (a test, or a load-order surprise), a report's width is
+-- simply not known.
+M._channel_width = nil
+
+local WPA_OUI_TYPE = string.char(0x00, 0x50, 0xf2, 0x01)
+
+-- One Beacon Report element as hostapd prints it on its control socket
+-- (BEACON-RESP-RX <sta> <token> <rep_mode> <hex>), hex being the report from
+-- its Operating Class on (IEEE 802.11-2020 9.4.2.22.7). The ubus notification
+-- carries only the fixed fields; this carries the subelements too, and with
+-- them the Reported Frame Body (subelement 1): the neighbour's own beacon,
+-- fixed fields and elements, which is where SSID, security and width are.
+-- Clients include it because the request names no Reporting Detail, and the
+-- standard's default for that is 2, "all fixed fields and elements". Captured
+-- live 2026-10-12: a 205-byte body with SSID, RSN, HT and VHT operation.
+--
+-- A body is cut to fit, sometimes flagged (subelement 2, Reported Frame Body
+-- Fragment ID, "more fragments" bit) and sometimes not, and a client may also
+-- send only some elements: live, one body held just the SSID and a vendor
+-- element, with privacy set and no fragment subelement. Nor is the order
+-- dependable -- another held its Country element after Tx Power Envelope.
+-- What is missing from a body is therefore unknown, never absent, and each
+-- field is taken only where an element present in the body proves it:
+--   essid    -- the SSID element; empty or NUL-filled (hidden) stays nil.
+--   security -- RSN -> wpa2, WPA vendor element -> wpa, privacy bit clear ->
+--               open (the capability field is always there). Privacy with
+--               neither element stays nil -- never wep.
+--   bw       -- VHT operation on 5 GHz, HT operation on 2.4 GHz. A 5 GHz body
+--               with HT but no VHT operation gives no width: the VHT element
+--               may simply not have been sent. nil means the caller's 20 floor.
+--   channel  -- HT operation's primary channel. Clients put an 80 MHz BSS's
+--               CENTRE channel in the fixed field (channel 42 for a BSS on
+--               36, captured live), which plotted it on the wrong channel.
+-- A continuation fragment (fragment number > 0) arrives as a report of its
+-- own for the same BSSID, its body starting mid-beacon. It returns nil: it
+-- repeats fragment 0's fixed fields and nothing in it can be anchored, and
+-- returned, it could take the BSSID's place ahead of fragment 0.
+-- Returns nil for anything malformed.
+function M.parse_report(hex)
+	if type(hex) ~= "string" or #hex < 52 or #hex % 2 ~= 0
+	   or not hex:match("^%x+$") then
+		return nil
+	end
+	local b = hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)
+	local rec = {
+		bssid   = string.format("%02x:%02x:%02x:%02x:%02x:%02x", b:byte(16, 21)),
+		channel = b:byte(2),
+		signal  = M.rcpi_to_dbm(b:byte(14)),
+	}
+	local body, frag_num
+	local i = 27
+	while i + 1 <= #b do
+		local id, len = b:byte(i), b:byte(i + 1)
+		if i + 1 + len > #b then break end
+		local data = b:sub(i + 2, i + 1 + len)
+		if id == 1 then
+			body = data
+		elseif id == 2 and len >= 2 then
+			frag_num = data:byte(2) % 128
+		end
+		i = i + 2 + len
+	end
+	if (frag_num or 0) > 0 then return nil end
+	if body and #body >= 12 then
+		local privacy = body:byte(11) % 32 >= 16  -- capability bit 4
+		local rsn, wpa, ht, ht_prim, ht_sec, vht_w, seg1, seg2
+		local j = 13
+		while j + 1 <= #body do
+			local e, l = body:byte(j), body:byte(j + 1)
+			if j + 1 + l > #body then break end
+			local v = body:sub(j + 2, j + 1 + l)
+			if e == 0 then
+				if l > 0 and v ~= string.rep(string.char(0), l) then rec.essid = v end
+			elseif e == 48 then
+				rsn = true
+			elseif e == 221 and v:sub(1, 4) == WPA_OUI_TYPE then
+				wpa = true
+			elseif e == 61 and l >= 2 then
+				ht, ht_prim = true, v:byte(1)
+				local off = v:byte(2) % 4
+				ht_sec = (off == 1 and "above") or (off == 3 and "below") or "none"
+			elseif e == 192 and l >= 3 then
+				vht_w, seg1, seg2 = v:byte(1), v:byte(2), v:byte(3)
+			end
+			j = j + 2 + l
+		end
+		if rsn then rec.security = "wpa2"
+		elseif wpa then rec.security = "wpa"
+		elseif not privacy then rec.security = "open" end
+		if ht_prim and M.band_of_channel(ht_prim) then rec.channel = ht_prim end
+		local band = M.band_of_channel(rec.channel)
+		if M._channel_width and (vht_w or (ht and band == "ng")) then
+			rec.bw = M._channel_width(vht_w, seg1, seg2, ht_sec)
+		end
+	end
+	rec.band = M.band_of_channel(rec.channel)
+	return rec
 end
 
 -- RM Enabled Capabilities bits (IEEE 802.11-2020 9.4.2.44), as hostapd's
@@ -262,7 +365,77 @@ end
 function M.collector_stop()
 	M._exec("kill $(pgrep -f '[" .. SUBSCRIBE_MATCH:sub(1, 1) .. "]"
 		.. SUBSCRIBE_MATCH:sub(2) .. "') 2>/dev/null")
-	M._exec("rm -f " .. M.EVENT_FILE .. " " .. M.COLLECTOR_SCRIPT .. " 2>/dev/null")
+	M.monitors_stop()
+	M._exec("rm -f " .. M.EVENT_FILE .. " " .. M.COLLECTOR_SCRIPT .. " "
+		.. M.ACTION_SCRIPT .. " 2>/dev/null")
+end
+
+-- The control-socket half of the collector. hostapd's ubus beacon-report
+-- notification carries only the fixed fields; the same report's subelements
+-- -- the neighbour's beacon body -- reach only hostapd's control socket, as
+-- BEACON-RESP-RX. One `hostapd_cli -a` per BSS listens there and runs this
+-- script per event, which appends the beacon reports, uptime-stamped like the
+-- ubus lines, to the same EVENT_FILE, so a single drain() still reads both.
+-- hostapd_cli runs it as "<script> <ifname> <event words...>".
+M.ACTION_SCRIPT   = "/tmp/openuf-bresp.sh"
+M.HOSTAPD_CTRL_DIR = "/var/run/hostapd"
+
+function M.action_script()
+	return table.concat({
+		"#!/bin/sh",
+		"# openUF hostapd control-socket hook -- written by rrmscan.lua, do not edit.",
+		'[ "$2" = BEACON-RESP-RX ] || exit 0',
+		"read -r u _ < /proc/uptime",
+		"printf '%s %s\\n' \"$u\" \"$*\" >> " .. M.EVENT_FILE,
+	}, "\n") .. "\n"
+end
+
+-- Control sockets hostapd has open: one per BSS, plus "global".
+function M.ctrl_ifaces()
+	local out = M._popen("ls " .. M.HOSTAPD_CTRL_DIR .. " 2>/dev/null") or ""
+	local list = {}
+	for name in out:gmatch("[^\n]+") do
+		if name ~= "global" and name:match("^[%w%-%._]+$") then list[#list + 1] = name end
+	end
+	table.sort(list)
+	return list
+end
+
+local function monitor_cmd(ifname)
+	return "hostapd_cli -p " .. M.HOSTAPD_CTRL_DIR .. " -i " .. ifname
+		.. " -a " .. M.ACTION_SCRIPT
+end
+
+-- Start a monitor for every BSS that has none. A monitor exits once hostapd
+-- stops answering it (a `wifi reload` replaces the sockets), so this runs on
+-- the same liveness clock as collector_ensure and simply starts it again.
+-- A changed script (an openUF upgrade) replaces every monitor. Returns how
+-- many were started.
+function M.monitors_ensure()
+	local want = M.action_script()
+	local fresh = M._read_file(M.ACTION_SCRIPT) ~= want
+	if fresh then
+		M.monitors_stop()
+		local f = io.open(M.ACTION_SCRIPT, "w")
+		if not f then return 0 end
+		f:write(want)
+		f:close()
+		M._exec("chmod 755 " .. M.ACTION_SCRIPT)
+	end
+	local ps = fresh and "" or (M._popen("ps w 2>/dev/null") or "")
+	local started = 0
+	for _, ifname in ipairs(M.ctrl_ifaces()) do
+		if not ps:find(monitor_cmd(ifname), 1, true) then
+			M._exec(monitor_cmd(ifname) .. " -B >/dev/null 2>&1")
+			started = started + 1
+		end
+	end
+	return started
+end
+
+-- Same bracket trick as collector_stop, for the same reason.
+function M.monitors_stop()
+	M._exec("kill $(pgrep -f '[h]ostapd_cli .*-a " .. M.ACTION_SCRIPT .. "') 2>/dev/null")
 end
 
 -- Drain the notification file into neighbour records.
@@ -302,6 +475,21 @@ function M.harvest(blob)
 	-- (rep-mode non-zero) is a station declining too, so it does not count
 	-- here either.
 	local reporters = {}
+	-- Control-socket reports first: they carry the neighbour's beacon body,
+	-- so for a BSSID both paths reported, this is the record that is kept.
+	for sta, rep, hex in blob:gmatch(
+			"BEACON%-RESP%-RX (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) %d+ (%x+) (%x+)") do
+		local repmode = tonumber(rep, 16)
+		if repmode == 0 then
+			reporters[sta:lower()] = true
+			local r = M.parse_report(hex)
+			if r and r.band and r.bssid ~= "00:00:00:00:00:00" and not seen[r.bssid] then
+				seen[r.bssid] = true
+				r.seen_at = now
+				out[#out + 1] = r
+			end
+		end
+	end
 	for body in blob:gmatch('"beacon%-report":%s*(%b{})') do
 		local address  = body:match('"address":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
 		local bssid    = body:match('"bssid":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
@@ -332,21 +520,38 @@ end
 -- Merge harvested neighbours into one radio's scan_table.
 --
 -- `entries` is the payload-shaped list already built from the passive scan
--- cache; anything the cache knows wins, because it carries an SSID, a security
--- mode and a width that a beacon report simply does not have. Only genuinely
--- new BSSIDs on this radio's band are appended.
+-- cache; anything the cache knows wins, because it is the radio's own
+-- measurement and carries the sibling tag (is_unifi/serialno) that a beacon
+-- report cannot: the tag rides in a vendor element at the END of the beacon,
+-- past where a client's reported frame body is cut. Only genuinely new
+-- BSSIDs on this radio's band are appended.
 --
 -- opts.max_age drops stale records: the controller's rogue-AP ingestion
 -- silently discards any entry whose age is 30 or more, so a record held past
 -- that would be payload weight nobody reads. Reporting each one for a cycle or
 -- two and letting it fall out mirrors what a real scan produces, and the
 -- controller keeps its own history of what it was told.
+--
+-- opts.skip: BSSIDs never to report (lowercase keys) -- this AP's own and its
+-- siblings'. A client reports the AP it sits on, and the APs next to it, like
+-- any other BSS; a UniFi AP never lists itself, and lists an adopted sibling
+-- as a UniFi neighbour that the controller keeps out of the scanner. Listed
+-- here untagged, they were "neighbours", and once the SSID is known, a sibling
+-- carrying the site's SSID is exactly what the controller flags as an
+-- impersonating rogue.
+--
+-- opts.site_ssids: this site's own SSIDs. A reported BSS carrying one that is
+-- not in skip may still be a sibling skip does not know about (usteer down),
+-- so its SSID is withheld rather than raise a false rogue alert. The trade:
+-- an evil twin that only a client ever saw is not flagged.
 function M.merge_into(entries, neighbours, opts)
 	entries = entries or {}
 	opts    = opts or {}
 	local band    = opts.band
 	local now     = opts.now or M._now()
 	local max_age = opts.max_age or 30
+	local skip    = opts.skip or {}
+	local site    = opts.site_ssids or {}
 	local have = {}
 	for _, e in ipairs(entries) do
 		if e.bssid then have[e.bssid] = true end
@@ -354,7 +559,8 @@ function M.merge_into(entries, neighbours, opts)
 	for _, n in ipairs(neighbours or {}) do
 		local age = now - (n.seen_at or now)
 		if age < 0 then age = 0 end
-		if n.band == band and not have[n.bssid] and age < max_age then
+		if n.band == band and not have[n.bssid] and age < max_age
+		   and not skip[n.bssid:lower()] then
 			have[n.bssid] = true
 			entries[#entries + 1] = {
 				mac        = n.bssid,
@@ -369,31 +575,40 @@ function M.merge_into(entries, neighbours, opts)
 				freq       = M.freq_of_channel(n.channel),
 				rssi       = n.signal,
 				signal     = n.signal,
-				-- A beacon report carries no SSID, no security mode and no
-				-- width. Each of those absences is handled differently, and the
-				-- difference matters:
+				-- What the report proved (parse_report), and nothing more.
 				--
-				-- bw is set to 20 because every AP occupies at least its 20 MHz
-				-- primary channel, so it is a floor rather than a guess -- and
-				-- because the Environment tab's unconditional filter indexes
+				-- bw falls back to 20 because every AP occupies at least its
+				-- 20 MHz primary channel, so it is a floor rather than a guess --
+				-- and because the Environment tab's unconditional filter indexes
 				-- T.R[band][bw>0 ? bw : <a per-band default>]: a falsy bw falls
 				-- through to a default this controller build may not define, and
 				-- an undefined index drops the row silently. 20 is confirmed to
 				-- render; nil is not.
-				bw         = 20,
+				bw         = n.bw or 20,
 				age        = age,
-				-- security is left ABSENT, not defaulted. There is no floor to
-				-- fall back on here: writing "open" would state, in the operator's
-				-- rogue-AP view, that a neighbour is unencrypted when nothing
-				-- measured it. Observed live -- four WPA2 neighbours reported by a
-				-- client all rendered as "open" before this was removed. A blank
-				-- cell is the honest answer, and no filter keys on this field.
-				security   = nil,
-				essid      = nil,
+				-- security is left ABSENT when unproven, never defaulted:
+				-- writing "open" would state, in the operator's rogue-AP view,
+				-- that a neighbour is unencrypted when nothing measured it.
+				-- Observed live -- four WPA2 neighbours rendered as "open"
+				-- before the default was removed.
+				security   = n.security,
+				essid      = (n.essid and not site[n.essid]) and n.essid or nil,
 			}
 		end
 	end
 	return entries
+end
+
+-- BSSIDs of the other APs usteer knows (its remote nodes), lowercase keys.
+-- usteer is how openUF APs already find each other for band steering and
+-- Roaming Assistant; a node's bssid is the BSS it announces.
+function M.sibling_bssids()
+	local out = M._popen("ubus call usteer remote_info 2>/dev/null") or ""
+	local set = {}
+	for b in out:gmatch('"bssid":%s*"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"') do
+		set[b:lower()] = true
+	end
+	return set
 end
 
 return M

@@ -603,6 +603,25 @@ local function unescape_iw_ssid(s)
 	return s
 end
 
+-- Channel width in MHz from a BSS's operation elements: the VHT Operation
+-- width field and centre segments, and the HT Operation secondary channel
+-- offset ("above"/"below", anything else = none). How the fields combine is
+-- described in scan_table's flush() below. Shared with rrmscan.lua, which
+-- reads the same two elements out of a client's beacon report.
+function M.channel_width(vht_w, vht_seg1, vht_seg2, ht_sec)
+	if vht_w and vht_w >= 1 then
+		local seg2 = vht_seg2 or 0
+		if vht_w == 2 or (vht_w == 1 and seg2 > 0
+				and math.abs(seg2 - (vht_seg1 or 0)) == 8) then
+			return 160
+		end
+		return 80
+	elseif ht_sec == "above" or ht_sec == "below" then
+		return 40
+	end
+	return 20
+end
+
 function M.scan_table(ifname)
 	if not ifname then return {} end
 	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
@@ -638,19 +657,7 @@ function M.scan_table(ifname)
 		-- field 0 means "20 or 40", which the HT secondary channel offset
 		-- resolves; nothing at all means 20.
 		if not cur.bw then
-			if vht_w and vht_w >= 1 then
-				local seg2 = vht_seg2 or 0
-				if vht_w == 2 or (vht_w == 1 and seg2 > 0
-						and math.abs(seg2 - (vht_seg1 or 0)) == 8) then
-					cur.bw = 160
-				else
-					cur.bw = 80
-				end
-			elseif ht_sec == "above" or ht_sec == "below" then
-				cur.bw = 40
-			else
-				cur.bw = 20
-			end
+			cur.bw = M.channel_width(vht_w, vht_seg1, vht_seg2, ht_sec)
 		end
 		if seen_rsn then cur.security = "wpa2"
 		elseif seen_wpa then cur.security = "wpa"

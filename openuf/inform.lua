@@ -92,6 +92,8 @@ M._firewall  = firewall
 M._usteer    = usteer
 M._switchvlan = switchvlan
 M._rrmscan    = rrmscan
+-- A beacon report's width is decided exactly as the scan cache's is.
+if rrmscan and sysinfo then rrmscan._channel_width = sysinfo.channel_width end
 M._roamassist = roamassist
 M._minrssi    = minrssi
 M._loadbalance = loadbalance
@@ -667,6 +669,8 @@ function M.build_json(st, cfg, ufhw)
 	local radio_table       = {}
 	local radio_table_stats = {}
 	local vap_table         = {}
+	-- 802.11k merge inputs, built on first use; see the scan_table merge.
+	local rrm_skip, rrm_site
 	local scan_radio_table  = {}
 	local derived_country   = nil  -- from the radios' UCI regdomain, below
 
@@ -1054,13 +1058,34 @@ function M.build_json(st, cfg, ufhw)
 					-- so one report fills both radios' lists. Anything the
 					-- passive cache already knows wins, since a beacon report
 					-- carries no SSID, security or width. See rrmscan.lua.
+					-- A client reports this AP and its siblings like any other
+					-- BSS: those are skipped (own BSSIDs from vap_table,
+					-- siblings from usteer), and the site's SSIDs are passed so
+					-- an unrecognised BSS carrying one is not raised as a rogue.
+					-- Built once per payload, only when there is something to
+					-- merge.
 					if M._rrmscan and #M._rrm_neighbours > 0 then
+						if not rrm_skip then
+							rrm_skip, rrm_site = {}, {}
+							local ok_sb, sib = pcall(M._rrmscan.sibling_bssids)
+							if ok_sb and type(sib) == "table" then
+								for b in pairs(sib) do rrm_skip[b] = true end
+							end
+							for _, v in ipairs(vap_table) do
+								if type(v.bssid) == "string" and v.bssid ~= "" then
+									rrm_skip[v.bssid:lower()] = true
+								end
+								if v.essid then rrm_site[v.essid] = true end
+							end
+						end
 						pcall(M._rrmscan.merge_into, scan_table,
 							M._rrm_neighbours, {
 								band       = radio.radio,
 								radio      = radio.radio,
 								radio_name = radio.name,
 								max_age    = RRM_MAX_AGE,
+								skip       = rrm_skip,
+								site_ssids = rrm_site,
 							})
 					end
 					scan_radio_table[#scan_radio_table + 1] = {
@@ -4858,6 +4883,13 @@ function M._rrm_tick(cfg, st)
 		end
 		pcall(rrm.collector_ensure,
 			assoc_on and {on_auth = M._assoctrack.forget_shell("m")} or nil)
+		-- The control-socket monitors serve only the 802.11k enrichment:
+		-- connection tracking reads the ubus lines alone.
+		if rrm_on then
+			if rrm.monitors_ensure then pcall(rrm.monitors_ensure) end
+		elseif rrm.monitors_stop then
+			pcall(rrm.monitors_stop)
+		end
 	end
 
 	local blob

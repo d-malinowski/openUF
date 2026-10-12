@@ -175,6 +175,15 @@ local function build(opts)
 			return vaps
 		end
 	end
+	-- vap_patch: edit the fixture vaps in place (bssid, essid, ...).
+	if opts and opts.vap_patch then
+		local get = inform._ucihelper.get_vap_table
+		inform._ucihelper.get_vap_table = function()
+			local vaps = get()
+			opts.vap_patch(vaps)
+			return vaps
+		end
+	end
 	local st = {
 		authkey    = state.DEFAULT_KEY,
 		adopted    = opts and opts.adopted or false,
@@ -2011,6 +2020,43 @@ return {
 			assert_eq(added.band, "ng", "band set or the row silently vanishes")
 			assert_nil(seen["00:00:5e:00:53:17"],
 				"a 5 GHz sighting is not filed under the 2.4 GHz radio")
+		end
+	},
+	{
+		-- A client reports the AP it sits on and its sibling APs like any
+		-- other BSS. Listed, the AP showed up as its own neighbour, and a
+		-- sibling carrying the site's SSID -- untagged, since the tag is in a
+		-- vendor element past where a report's frame body is cut -- is what
+		-- the controller flags as an impersonating rogue.
+		name = "inform json: beacon reports of this AP and its siblings are skipped",
+		fn = function()
+			local prev_n, prev_sib = inform._rrm_neighbours, inform._rrmscan.sibling_bssids
+			inform._rrm_neighbours = {
+				{bssid = "00:00:5e:00:53:01", channel = 1, band = "ng", signal = -11,
+				 seen_at = os.time(), essid = "SiteNet", security = "wpa2"},
+				{bssid = "00:00:5e:00:53:02", channel = 11, band = "ng", signal = -60,
+				 seen_at = os.time(), essid = "SiteNet", security = "wpa2"},
+				{bssid = "00:00:5e:00:53:03", channel = 11, band = "ng", signal = -70,
+				 seen_at = os.time(), essid = "SiteNet", security = "wpa2"},
+				{bssid = "00:00:5e:00:53:04", channel = 6, band = "ng", signal = -80,
+				 seen_at = os.time(), essid = "Elsewhere", security = "wpa2", bw = 40},
+			}
+			inform._rrmscan.sibling_bssids = function()
+				return {["00:00:5e:00:53:02"] = true}
+			end
+			local ok, d = pcall(build, {with_uci = true, vap_patch = function(vaps)
+				vaps[1].bssid, vaps[1].essid = "00:00:5E:00:53:01", "SiteNet"
+			end})
+			inform._rrm_neighbours, inform._rrmscan.sibling_bssids = prev_n, prev_sib
+			assert_true(ok, "build_json survives: " .. tostring(d))
+			local seen = {}
+			for _, e in ipairs(d.scan_radio_table[1].scan_table) do seen[e.bssid] = e end
+			assert_nil(seen["00:00:5e:00:53:01"], "this AP's own BSSID is skipped")
+			assert_nil(seen["00:00:5e:00:53:02"], "a usteer sibling is skipped")
+			assert_not_nil(seen["00:00:5e:00:53:03"], "an unknown BSS is still listed")
+			assert_nil(seen["00:00:5e:00:53:03"].essid, "but not with the site's SSID")
+			assert_eq(seen["00:00:5e:00:53:04"].essid, "Elsewhere", "a foreign SSID is carried")
+			assert_eq(seen["00:00:5e:00:53:04"].bw, 40, "with its width")
 		end
 	},
 	{
