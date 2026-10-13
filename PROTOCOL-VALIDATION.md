@@ -3689,6 +3689,30 @@ remote-node BSSIDs (`ubus call usteer remote_info`). If usteer is not answering,
 one of this site's SSIDs is sent without `essid`, so it can't raise a false alert. An evil twin that only a client
 ever saw is then not flagged.
 
+**Two copies of each report (2026-10-13).** hostapd's `rrm.c` emits the control-socket line
+first and the ubus notification second. They reach the event file through different
+processes (`hostapd_cli -a` and the `ubus subscribe` loop) and often land in different
+10-second drains. openUF's per-BSSID cache kept whichever came later, so the bodiless ubus
+copy replaced the named record. Live in the WiFi Scanner, every row of one office-AP report
+went out unnamed at 20 MHz on the centre channel 42. A bodiless record now keeps the essid,
+security, width and primary channel that a body proved for the same BSSID and band. It
+still updates the level and time.
+
+**Not every client writes RCPI into the RCPI field (2026-10-13).** One office 2.4 GHz client
+wrote signed dBm. It reported its own AP as `0xbf`, which is −65 dBm read as signed and
+−14.5 dBm read as RCPI, while `iw station get` measured it at −71 dBm. Every neighbour it
+reported came out between −11 and −26 dBm. The same byte goes to both the control socket and
+ubus. openUF now decides per station which way it writes the byte, using the one BSS whose
+true level is known: the station's own AP, which every captured report includes. The
+station's report for that BSSID (`iw dev <if> info`) is compared with hostapd's
+`signal avg` for the station (`iw dev <if> station get`). If the signed reading is within
+12 dB and the RCPI reading is more than 20 dB off, the station is treated as signed. If the
+RCPI reading is within 12 dB, it is treated as standard. Otherwise the sample decides nothing.
+The decision lasts for the daemon's lifetime and applies to that station's ubus reports too.
+An uncalibrated station is read the standard way (the capture `rcpi_to_dbm` was checked on:
+124 → −48 dBm for a client on the Archer). After the fix, the office client's neighbours came out at −67 to
+−84 dBm.
+
 `is_rogue` is much narrower than the tab name suggests: set true only when a neighbouring BSSID
 broadcasts the **same essid as one of the site's own configured networks** (an evil-twin check
 raising `EVT_AP_DetectRogueAP`). Ordinary neighbours correctly have `is_rogue: false` and still

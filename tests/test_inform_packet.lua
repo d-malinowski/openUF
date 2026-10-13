@@ -4908,6 +4908,52 @@ return {
 		end
 	},
 	{
+		name = "inform: a bodiless 802.11k copy keeps what the beacon body proved",
+		fn = function()
+			-- hostapd sends each report on its control socket (with the body)
+			-- and then over ubus (without). Landing in a later drain, the ubus
+			-- copy replaced the named record: live, every row of one office
+			-- report reached the controller unnamed, at 20 MHz on channel 42.
+			local orig = {rrm = inform._rrmscan, time = inform._time,
+				nxt = inform._rrm_next_request, cache = inform._rrm_cache}
+			local clock = 5000
+			inform._time = function() return clock end
+			inform._rrm_collector_next = math.huge
+			inform._rrm_next_request = math.huge
+			inform._rrm_cache = {}
+			local batch
+			inform._rrmscan = {harvest = function() return batch, {} end}
+			local cfg = {config = {rrm_enrichment = true}}
+
+			batch = {{bssid = "00:00:5e:00:53:01", band = "na", channel = 48, bw = 80,
+				essid = "Neighbour", security = "wpa2", signal = -70, seen_at = clock, body = true}}
+			inform._rrm_tick(cfg)
+			clock = clock + 10
+			batch = {{bssid = "00:00:5e:00:53:01", band = "na", channel = 42,
+				signal = -71, seen_at = clock}}
+			inform._rrm_tick(cfg)
+			local n = inform._rrm_neighbours[1]
+			assert_eq(n.essid, "Neighbour", "name kept")
+			assert_eq(n.security, "wpa2", "security kept")
+			assert_eq(n.bw, 80, "width kept")
+			assert_eq(n.channel, 48, "primary kept, not the centre channel")
+			assert_eq(n.signal, -71, "the fresher level is taken")
+			assert_eq(n.seen_at, clock, "and so is the fresher time")
+
+			-- With nothing proven before, a bodiless record stands as it is.
+			inform._rrm_cache = {}
+			batch = {{bssid = "00:00:5e:00:53:01", band = "na", channel = 42,
+				signal = -71, seen_at = clock}}
+			inform._rrm_tick(cfg)
+			assert_nil(inform._rrm_neighbours[1].essid, "no body, no name")
+			assert_eq(inform._rrm_neighbours[1].channel, 42, "fixed-field channel")
+
+			inform._rrmscan, inform._time = orig.rrm, orig.time
+			inform._rrm_next_request, inform._rrm_cache = orig.nxt, orig.cache
+			inform._rrm_collector_next = 0
+		end
+	},
+	{
 		name = "inform: a config push re-arms the RRM collector check immediately",
 		fn = function()
 			-- `wifi reload` takes every hostapd object the collector subscribed

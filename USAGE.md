@@ -958,8 +958,18 @@ drains and truncates on every inform:
 - One `hostapd_cli -i <bss> -a /tmp/openuf-bresp.sh` per BSS (from `hostapd-utils`, already a
   dependency). hostapd's **control socket** sends the whole report as `BEACON-RESP-RX`,
   including the neighbour's own beacon as the client heard it. That is where the SSID,
-  security and channel width come from. A monitor exits when hostapd restarts (a
-  `wifi reload`), and openUF starts a new one within a minute. Each uses about 0.9 MB.
+  security and channel width come from. A monitor exits when its interface is torn down
+  (`wifi down`/`up`, or a config push that rebuilds it), and openUF starts a new one within
+  a minute. A `wifi reload` that changes nothing keeps them. Each uses about 0.9 MB.
+
+hostapd sends every report both ways, and the two copies can reach the spool on different
+informs. A bodiless copy never erases the SSID, security, width or channel the full one
+proved for the same BSSID.
+
+Signal comes from the report's RCPI byte. Some clients write signed dBm there instead
+(seen live: every neighbour at −11 to −26 dBm). openUF works out per client which form it
+uses, by comparing what the client reports for its own AP with hostapd's measurement of
+that client (`iw dev <if> station get <sta>`).
 
 Both are reparented to init, so they outlive the daemon. openUF kills them explicitly on
 service stop, on uninstall, and when `rrm_enrichment` is turned off. If you ever find the

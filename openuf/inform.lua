@@ -4912,6 +4912,17 @@ function M._rrm_tick(cfg, st)
 			-- once, at whichever sighting is freshest.
 			local prev = M._rrm_cache[n.bssid]
 			if not prev or n.seen_at >= prev.seen_at then
+				-- hostapd emits each report twice: on the control socket with
+				-- the neighbour's beacon body, then over ubus without. The two
+				-- reach the event file through different processes and land in
+				-- different drains often enough (live, 2026-10-13: every row of
+				-- one office report went out unnamed, on the 80 MHz centre
+				-- channel 42 at 20 MHz). A bodiless copy keeps what the body
+				-- proved about the same BSS instead of erasing it.
+				if prev and prev.body and not n.body and prev.band == n.band then
+					n.essid, n.security, n.bw = prev.essid, prev.security, prev.bw
+					n.channel, n.body = prev.channel, true
+				end
 				M._rrm_cache[n.bssid] = n
 			end
 		end

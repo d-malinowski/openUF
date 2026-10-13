@@ -92,6 +92,61 @@ function M.rcpi_to_dbm(rcpi)
 	return math.floor(rcpi / 2 - 110)
 end
 
+-- Not every client fills the RCPI field with RCPI. One live (2026-10-13, an
+-- office 2.4 GHz client) wrote its received power as a signed dBm byte: its
+-- own AP came back as 0xbf, which is -65 dBm read signed and -14.5 dBm read as
+-- RCPI, while hostapd measured that client at -71 dBm. Every neighbour it
+-- reported landed between -11 and -26 dBm. Which way a client writes the byte
+-- is learned per station from the one BSS whose true level is known here --
+-- the station's own AP, which every report seen so far includes. Verdicts are
+-- kept for the daemon's life: a station that is not calibrated yet, or never
+-- reports its own AP, is read the standard way.
+M._rcpi_signed = {}
+
+-- true = the byte is signed dBm, false = it is RCPI, nil = this sample cannot
+-- tell. ap_dbm is hostapd's own reading of the station.
+function M.rcpi_verdict(raw, ap_dbm)
+	raw, ap_dbm = tonumber(raw), tonumber(ap_dbm)
+	if not raw or not ap_dbm then return nil end
+	local std = raw / 2 - 110
+	local sgn = raw >= 128 and raw - 256 or nil
+	if sgn and math.abs(sgn - ap_dbm) <= 12 and math.abs(std - ap_dbm) > 20 then
+		return true
+	end
+	if math.abs(std - ap_dbm) <= 12 then return false end
+	return nil
+end
+
+-- A reported level in dBm for this station's way of writing it.
+function M.signal_of(sta, raw)
+	raw = tonumber(raw)
+	if not raw then return nil end
+	if sta and M._rcpi_signed[sta:lower()] then
+		return raw >= 128 and raw - 256 or nil
+	end
+	return M.rcpi_to_dbm(raw)
+end
+
+-- This interface's BSSID and hostapd's averaged signal for one station on it.
+-- Both names come off the event file, so they are checked before reaching a
+-- shell.
+local IFNAME_SAFE = "^[%w_%.%-]+$"
+local MAC_SAFE = "^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$"
+function M.iface_bssid(ifname)
+	if type(ifname) ~= "string" or not ifname:match(IFNAME_SAFE) then return nil end
+	local out = M._popen("iw dev " .. ifname .. " info 2>/dev/null") or ""
+	local mac = out:match("addr (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+	return mac and mac:lower()
+end
+function M.sta_signal(ifname, sta)
+	if type(ifname) ~= "string" or not ifname:match(IFNAME_SAFE)
+	   or type(sta) ~= "string" or not sta:match(MAC_SAFE) then
+		return nil
+	end
+	local out = M._popen("iw dev " .. ifname .. " station get " .. sta .. " 2>/dev/null") or ""
+	return tonumber(out:match("signal avg:%s*(%-?%d+)") or out:match("signal:%s*(%-?%d+)"))
+end
+
 -- Band for a reported channel, in the controller's own radio vocabulary.
 -- Beacon reports name a channel but never a frequency, and a client answering
 -- on one band routinely reports the other, so this is what decides which
@@ -165,6 +220,7 @@ function M.parse_report(hex)
 	local rec = {
 		bssid   = string.format("%02x:%02x:%02x:%02x:%02x:%02x", b:byte(16, 21)),
 		channel = b:byte(2),
+		rcpi    = b:byte(14),
 		signal  = M.rcpi_to_dbm(b:byte(14)),
 	}
 	local body, frag_num
@@ -182,6 +238,9 @@ function M.parse_report(hex)
 	end
 	if (frag_num or 0) > 0 then return nil end
 	if body and #body >= 12 then
+		-- Marks a record whose essid/security/bw/channel came from a body, so
+		-- a bodiless copy of the same sighting cannot pass for a newer truth.
+		rec.body = true
 		local privacy = body:byte(11) % 32 >= 16  -- capability bit 4
 		local rsn, wpa, ht, ht_prim, ht_sec, vht_w, seg1, seg2
 		local j = 13
@@ -477,17 +536,40 @@ function M.harvest(blob)
 	local reporters = {}
 	-- Control-socket reports first: they carry the neighbour's beacon body,
 	-- so for a BSSID both paths reported, this is the record that is kept.
-	for sta, rep, hex in blob:gmatch(
-			"BEACON%-RESP%-RX (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) %d+ (%x+) (%x+)") do
-		local repmode = tonumber(rep, 16)
-		if repmode == 0 then
-			reporters[sta:lower()] = true
+	-- The hook writes "<uptime> <ifname> BEACON-RESP-RX ...": the interface
+	-- is what the station's own BSS is looked up by, for calibration.
+	local ctrl, own_rec, sta_if = {}, {}, {}
+	for line in blob:gmatch("[^\n]+") do
+		local pre, sta, rep, hex = line:match(
+			"^(.-)BEACON%-RESP%-RX (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) %d+ (%x+) (%x+)")
+		if sta and tonumber(rep, 16) == 0 then
+			sta = sta:lower()
+			reporters[sta] = true
 			local r = M.parse_report(hex)
-			if r and r.band and r.bssid ~= "00:00:00:00:00:00" and not seen[r.bssid] then
-				seen[r.bssid] = true
-				r.seen_at = now
-				out[#out + 1] = r
+			if r then
+				ctrl[#ctrl + 1] = {sta = sta, rec = r}
+				local ifname = pre:match("(%S+)%s*$")
+				if ifname and not sta_if[sta] then sta_if[sta] = ifname end
 			end
+		end
+	end
+	for sta, ifname in pairs(sta_if) do
+		local own = M.iface_bssid(ifname)
+		for _, c in ipairs(ctrl) do
+			if c.sta == sta and c.rec.bssid == own then own_rec[sta] = c.rec break end
+		end
+		if own_rec[sta] then
+			local v = M.rcpi_verdict(own_rec[sta].rcpi, M.sta_signal(ifname, sta))
+			if v ~= nil then M._rcpi_signed[sta] = v end
+		end
+	end
+	for _, c in ipairs(ctrl) do
+		local r = c.rec
+		if r.band and r.bssid ~= "00:00:00:00:00:00" and not seen[r.bssid] then
+			seen[r.bssid] = true
+			r.signal = M.signal_of(c.sta, r.rcpi)
+			r.seen_at = now
+			out[#out + 1] = r
 		end
 	end
 	for body in blob:gmatch('"beacon%-report":%s*(%b{})') do
@@ -509,7 +591,7 @@ function M.harvest(blob)
 				bssid   = bssid,
 				channel = channel,
 				band    = band,
-				signal  = M.rcpi_to_dbm(rcpi),
+				signal  = M.signal_of(address, rcpi),
 				seen_at = now,
 			}
 		end

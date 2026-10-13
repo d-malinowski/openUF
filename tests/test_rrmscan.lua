@@ -675,4 +675,65 @@ return {
 				end)
 		end
 	},
+	{
+		name = "rrmscan: rcpi_verdict tells a signed-dBm client from a standard one",
+		fn = function()
+			-- Live 2026-10-13: own AP at 0xbf, hostapd measured -71 dBm.
+			assert_true(rrmscan.rcpi_verdict(0xbf, -71) == true, "signed dBm")
+			-- The capture rcpi_to_dbm was checked on: 124 -> -48.
+			assert_true(rrmscan.rcpi_verdict(124, -50) == false, "standard RCPI")
+			assert_nil(rrmscan.rcpi_verdict(124, -80), "neither fits: no verdict")
+			assert_nil(rrmscan.rcpi_verdict(nil, -70), "no reading")
+			assert_nil(rrmscan.rcpi_verdict(0xbf, nil), "no measurement")
+			-- Below 128 the byte cannot be a negative dBm value.
+			assert_true(rrmscan.rcpi_verdict(100, -60) == false, "100 is RCPI -60")
+		end
+	},
+	{
+		name = "rrmscan: harvest calibrates each client on its own AP's report",
+		fn = function()
+			local function line(sta, last, rcpi)
+				return "100.5 phy0-ap1 BEACON-RESP-RX " .. sta .. " 7 00 "
+					.. report_hex({op = 81, channel = 1, last = last, rcpi = rcpi,
+						body_ies = ie(0, "N" .. last) .. RSN}) .. "\n"
+			end
+			local signed_sta, std_sta = "00:00:5e:00:53:10", "00:00:5e:00:53:11"
+			-- Own AP is ...:02. The signed client reports a neighbour ...:03 at
+			-- 0xa6 (-90) first and its AP at 0xbf (-65); the standard one gives
+			-- 124 (-48) for its AP and 40 (-90) for the neighbour ...:04. The
+			-- neighbour line comes first: calibration must find the AP's.
+			local blob = line(signed_sta, 0x03, 0xa6) .. line(signed_sta, 0x02, 0xbf)
+				.. line(std_sta, 0x02, 124) .. line(std_sta, 0x04, 40)
+			local orig = rrmscan._rcpi_signed
+			rrmscan._rcpi_signed = {}
+			local ok, err = pcall(function()
+				with_popen(function(cmd)
+					if cmd:find(" info", 1, true) then return "Interface phy0-ap1\n\taddr 00:00:5e:00:53:02\n" end
+					if cmd:find(signed_sta, 1, true) then return "\tsignal avg:\t-70 [-71, -77] dBm\n" end
+					if cmd:find(std_sta, 1, true) then return "\tsignal avg:\t-50 [-51, -55] dBm\n" end
+				end, function()
+					local m = by_bssid(rrmscan.harvest(blob))
+					assert_eq(m["00:00:5e:00:53:02"].signal, -65, "own AP, signed reading")
+					assert_eq(m["00:00:5e:00:53:03"].signal, -90, "neighbour, signed reading")
+					assert_eq(m["00:00:5e:00:53:04"].signal, -90, "standard client unchanged")
+					assert_true(m["00:00:5e:00:53:03"].body == true, "a bodied record says so")
+				end)
+				-- The verdict outlives the drain: the same station's bodiless ubus
+				-- copy, arriving later, is read the same way.
+				local ubus = '{ "beacon-report": {"address":"' .. signed_sta
+					.. '","op-class":81,"channel":6,"rcpi":178,"bssid":"00:00:5e:00:53:05","rep-mode":0} }\n'
+				local m = by_bssid(rrmscan.harvest(ubus))
+				assert_eq(m["00:00:5e:00:53:05"].signal, -78, "remembered for the ubus path")
+				assert_nil(m["00:00:5e:00:53:05"].body, "and a ubus record has no body")
+				-- An unknown station is read the standard way.
+				local other = ubus:gsub(signed_sta, "00:00:5e:00:53:12")
+				assert_eq(rrmscan.harvest(other)[1].signal, -21, "uncalibrated: RCPI")
+			end)
+			rrmscan._rcpi_signed = orig
+			if not ok then error(err, 0) end
+			-- Names off the event file never reach a shell unchecked.
+			assert_nil(rrmscan.iface_bssid("phy0;reboot"), "bad ifname refused")
+			assert_nil(rrmscan.sta_signal("phy0-ap1", "x; reboot"), "bad station refused")
+		end
+	},
 }
