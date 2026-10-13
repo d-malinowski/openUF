@@ -104,6 +104,8 @@ if [ "$1" = "--verify" ]; then
 	mkdir -p "$BUILD/verify"
 	cp -r "$STAGE" "$BUILD/verify/openuf"
 	cp -r tests "$BUILD/verify/tests"
+	# The installer tests source install.sh from the project root; ship-identical.
+	cp install.sh "$BUILD/verify/"
 	if ! ( cd "$BUILD/verify" && lua tests/run_tests.lua ); then
 		echo ""
 		echo "  FAIL tests do not pass against the stripped tree -- not packaging."
