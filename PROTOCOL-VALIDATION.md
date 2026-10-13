@@ -281,6 +281,57 @@ for every port, so one AP's Ports view was populated and the other's read 0 B ev
 openUF now does that once at startup when the attribute exists and reads 0
 (`switchvlan.enable_mib_polling`, opt out with `dev.conf.vlan.mib_poll_ms = false`).
 
+### A wired client's usage history grows by the gateway's lifetime counter — controller-side, NOT FIXED
+
+2026-10-13, real UCG Ultra on Network 10.6. A media player cabled into the Living room AP
+showed **968 TB** of 24 h usage. A second wired host on the Office AP was inflated the same
+way, only less. The live client totals (`stat/sta` `wired-tx_bytes`/`wired-rx_bytes`) were
+sane, about 190 GB. Only the per-client report rows (`5minutes`/`hourly`/`daily` `user`)
+were wrong. They started growing on 08-02, the day openUF began reporting real sockets
+and their hosts.
+
+**Mechanism (CFR on the 10.6 `internal-dependencies.jar`; class names are per-build):**
+- The per-client report accumulator is a counter diff. For each `(user, mac)` record it adds
+  `value − last` when that is positive, then stores `last = value`, even when the value went down.
+- The gateway feeds that key every cycle. Its station stats carry the gateway's lifetime per-client
+  byte and packet counters, rx and tx swapped. For this player that was ≈266.94 GB / 203 M packets.
+- An AP feeds the same key for each wired host in its `port_table[].mac_table`. The gate is
+  `hasStationStat()`, and it is decided by **device type**: `uap`, `udm`, `uxg`, `ugw` and `uacc` say
+  true, `usw` says false. The port-host context has no override for APs, so a wired host on a `uap`
+  takes the same path as a wireless station. Its row becomes a report record with no byte fields, so it reads 0.
+- A host is processed when its row carries no wireless-event type, or when it is the only host
+  on its port (`is_only_station_on_port`).
+- Every `0 → lifetime` change therefore adds the gateway's whole lifetime counter.
+
+**Live proof.** I polled the player's current 5-minute row every 2 s and logged the Living room AP's
+informs at the same time (ActiveOpens). Six informs in a row were each followed within
+0–4 s by a jump of exactly +266.94 GB. A fresh 5-minute bucket already held 266.94 GB after
+15 s. The small steps between jumps are the gateway's real deltas.
+
+**Why the other clients look right:**
+- A host on the gateway's own ports has no AP record competing with it.
+- A NAS on the Living room AP looks right only because the gateway has counted almost none of its traffic (LAN-local).
+- On a **USW**, a host alone on a port takes its traffic from the change in the port's own counters (`port_delta`), and the switch writes no report record. Only the gateway feeds the history, so nothing alternates.
+
+**A real U6-IW should do the same.** The gate depends on the device type, not on anything openUF
+sends, so it treats a genuine in-wall AP's port hosts the same way. Firmware can't confirm
+what such an AP actually puts in `mac_table`:
+- BZ2 4.0.15 (plaintext) has no port or MAC table at all.
+- Every in-wall build is encrypted back to 3.9.27 (2018): U2IW, U7IW and UHDIW. Only the kernel `PART` header is in clear.
+
+No public report of the symptom was found.
+
+**Not fixed in openUF, by decision.** No lever on the openUF side is clean:
+- Putting counters in `mac_table` rows: any second source that differs from the gateway's
+  counter still inflates the history on each alternation.
+- A wireless-event type on the row: a host that is alone on its port is processed anyway.
+- A `vlan` on the row that doesn't match the network: the host is skipped, which is the same as not reporting it.
+- Not reporting wired hosts at all: this fixes the history, but loses the port attribution
+  ("player → Living room AP, port 3") that real-socket reporting exists for.
+
+The live totals, the port attribution and the Ports view all stay correct. Only the usage history
+of wired clients behind an openUF AP on a site with a UniFi gateway is wrong.
+
 ---
 
 ## A tagged SSID's trunk deafened every wired client on the AP — FIXED
