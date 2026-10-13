@@ -14,6 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The release notes are the annotated tag's message. checkout can leave
+      # the tag lightweight on a tag push, so fetch the tag object itself.
+      - name: Read release notes from the tag
+        id: notes
+        run: |
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          echo "name=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents:subject)')" >> "$GITHUB_OUTPUT"
+          git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents:body)' > release-notes.md
+
       - name: Install Lua and dependencies
         run: |
           sudo apt-get update -qq
@@ -36,4 +45,6 @@ jobs:
           files: |
             openuf.tar.gz
             openuf.tar.gz.sha256
+          name: ${{ steps.notes.outputs.name }}
+          body_path: release-notes.md
           generate_release_notes: true
