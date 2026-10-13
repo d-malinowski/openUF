@@ -208,6 +208,29 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: sta_table() reads an underflowed u32 retry counter as 0",
+		fn = function()
+			-- mt76 (OpenWrt 25.12) adds count - 1 with no guard for count 0:
+			-- a fresh station's counters read 2^32 - 1, which the controller
+			-- added to its per-band totals as a 2^32 jump.
+			local dump = "Station cc:cc:cc:cc:cc:cc (on wlan1)\n"
+				.. "\ttx packets:\t12\n"
+				.. "\ttx retries:\t4294967295\n"
+				.. "\ttx failed:\t4294967295\n"
+				.. "Station dd:dd:dd:dd:dd:dd (on wlan1)\n"
+				.. "\ttx packets:\t5000\n"
+				.. "\ttx retries:\t2147483647\n"
+				.. "\ttx failed:\t7\n"
+			with_fixtures({}, {["station dump"] = dump}, function()
+				local stas = sysinfo.sta_table("wlan1")
+				assert_eq(stas[1].tx_retries, 0, "-1 as u32 is no retry count")
+				assert_eq(stas[1].tx_failed, 0, "nor a failed count")
+				assert_eq(stas[2].tx_retries, 2147483647, "2^31 - 1 is still a count")
+				assert_eq(stas[2].tx_failed, 7, "small counts pass")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: wifi_driver() reads the netdev's driver once",
 		fn = function()
 			sysinfo._driver_cache = {}

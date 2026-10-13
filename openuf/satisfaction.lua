@@ -191,9 +191,20 @@ end
 
 -- mac80211's "tx failed" means frames dropped after the last retry on most
 -- drivers, but failed ATTEMPTS on mt76 (it tracks tx retries and can exceed
--- tx packets; measured on an AX3000T), where it is no drop count at all.
+-- tx packets; measured on an AX3000T): see M.dropped.
 function M.failed_is_dropped(driver)
 	return not (driver and driver:match("^mt7"))
+end
+
+-- A station's dropped frames from its tx failed/retries counters. mt76's
+-- tx-free path adds count - 1 to retries and that plus 1 for a frame that
+-- finally failed to tx_failed (mt7915/mac.c), so the drops are the
+-- difference. Its WED path counts both from the firmware's own report, where
+-- failed is far below retries: 0 there, never a negative count.
+function M.dropped(failed_is_dropped, failed, retries)
+	if failed_is_dropped then return failed end
+	if not failed then return nil end
+	return math.max(0, failed - (retries or 0))
 end
 
 return M

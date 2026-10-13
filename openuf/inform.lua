@@ -1226,7 +1226,7 @@ function M.build_json(st, cfg, ufhw)
 			sat_tallies_by_radio[vap.radio_name] = sat_tallies_by_radio[vap.radio_name] or {}
 			table.insert(sat_tallies_by_radio[vap.radio_name], tally)
 			-- tx failed counts dropped frames on most drivers but failed
-			-- attempts on mt76 (satisfaction.failed_is_dropped).
+			-- attempts on mt76 (satisfaction.failed_is_dropped/dropped).
 			local failed_is_dropped = sat.failed_is_dropped(
 				M._sysinfo.wifi_driver and M._sysinfo.wifi_driver(ok_if and ifnames[1]))
 			-- Each station's AKM from hostapd, for is_11r below.
@@ -1250,7 +1250,8 @@ function M.build_json(st, cfg, ufhw)
 				vap_rx_packets  = vap_rx_packets  + (sta.rx_packets or 0)
 				vap_tx_packets  = vap_tx_packets  + (sta.tx_packets or 0)
 				vap_tx_retries  = vap_tx_retries  + (sta.tx_retries or 0)
-				vap_tx_dropped  = vap_tx_dropped  + (sta.tx_failed or 0)
+				local sta_dropped = sat.dropped(failed_is_dropped, sta.tx_failed, sta.tx_retries)
+				vap_tx_dropped  = vap_tx_dropped  + (sta_dropped or 0)
 				if sta.signal then
 					signal_sum   = signal_sum + sta.signal
 					signal_count = signal_count + 1
@@ -1297,7 +1298,7 @@ function M.build_json(st, cfg, ufhw)
 				-- retry term over the last completed minute.
 				local win = sat.window(prev and prev.sat_window, {
 					packets = sta.tx_packets, retries = sta.tx_retries,
-					dropped = failed_is_dropped and sta.tx_failed or 0,
+					dropped = sta_dropped or 0,
 				}, now)
 				M._sta_stats_cache[sta.mac] = { time = now, sat_window = win }
 				local mov = win.mov or {}
@@ -1437,7 +1438,8 @@ function M.build_json(st, cfg, ufhw)
 			-- counters, derived from the same per-station data, were populated
 			-- correctly. Attempts are successful + retried transmissions, the
 			-- same definition sta_table uses; dropped is the driver's own
-			-- tx_failed.
+			-- drop count (satisfaction.dropped: tx_failed, less the retries
+			-- that mt76 folds into it).
 			vap.wifi_tx_attempts = vap_tx_packets + vap_tx_retries
 			vap.wifi_tx_dropped  = vap_tx_dropped
 			local rstat = radio_stats_by_name[vap.radio_name]

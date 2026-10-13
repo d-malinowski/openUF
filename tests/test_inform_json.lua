@@ -693,7 +693,7 @@ return {
 			local vap, rs = d.vap_table[1], d.radio_table_stats[1]
 			assert_eq(vap.wifi_tx_attempts, vap.tx_packets + vap.tx_retries,
 				"attempts are successful + retried, as sta_table defines them")
-			assert_eq(vap.wifi_tx_dropped, vap.tx_dropped, "dropped is the driver's tx_failed")
+			assert_eq(vap.wifi_tx_dropped, vap.tx_dropped, "dropped is the driver's drop count")
 			assert_eq(rs.wifi_tx_attempts, vap.wifi_tx_attempts,
 				"radio sums its VAPs' attempts")
 			assert_eq(rs.wifi_tx_dropped, vap.wifi_tx_dropped, "and their drops")
@@ -1027,6 +1027,7 @@ return {
 				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
 				ip = "192.168.1.100", hostname = "testap",
 			}
+			local last_vap
 			-- One inform, ten seconds after the last: c = {signal, avg,
 			-- noise, tx/rx rate, lifetime tx packets/retries/failed, driver}.
 			local function inform_once(c)
@@ -1056,6 +1057,7 @@ return {
 				end
 				t = t + 10
 				local d = cjson.decode(inform.build_json(st, nil, ufhw))
+				last_vap = d.vap_table[1]
 				local sta = d.vap_table[1].sta_table[1]
 				return sta.satisfaction, sta.satisfaction_reason, sta.anomalies
 			end
@@ -1095,6 +1097,17 @@ return {
 			for _ = 1, 6 do step(c, 100, 40, 40) end
 			t = t + 50
 			assert_eq(inform_once(c), 80, "mt76: retries judged, failed attempts not counted as drops")
+			assert_eq(last_vap.tx_dropped, 0, "nor in the VAP's drops")
+			for _ = 1, 6 do step(c, 100, 40, 42) end
+			t = t + 50
+			assert_eq(inform_once(c), 68, "mt76: failed beyond the retries are drops: 80 less 12")
+			assert_eq(last_vap.tx_dropped, 12, "and the VAP reports those 12, not 492")
+			assert_eq(last_vap.wifi_tx_dropped, 12, "as does the pair the controller divides")
+			-- An underflowed counter (count - 1 with count 0) is no 2^32 retries.
+			c.retries, c.failed = 4294967295, 4294967295
+			inform_once(c)
+			assert_eq(last_vap.tx_retries, 0, "no 2^32 jump in the VAP's retries")
+			assert_true(last_vap.wifi_tx_attempts < 2147483648, "nor in its attempts")
 			inform._sysinfo._driver_cache = {}
 
 			-- SNR: the averaged signal over a noise floor taken as no lower than -96.

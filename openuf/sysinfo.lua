@@ -302,6 +302,18 @@ local function _bitrate_generation_nss(line)
 	return nil, nil
 end
 
+-- A u32 station counter read as signed, floored at 0. mt76 as shipped in
+-- OpenWrt 25.12 (2026.03.19~39c960c3, mt7915 tx-free path) adds
+-- FIELD_GET(COUNT) - 1 to tx_retries and tx_failed with no guard for a count
+-- of 0, so a fresh station's counters can read 4294967295; upstream later
+-- made it `count ? count - 1 : 0`. Passed on, one such reading added exactly
+-- 2^32 to the controller's per-band totals (the Office AP showed 47 billion
+-- tx packets and 50 % retries). No real retry count gets near 2^31.
+function M.u32_count(v)
+	if v and v >= 2147483648 then return 0 end
+	return v
+end
+
 -- Returns a table of connected stations from `iw dev <ifname> station dump`.
 -- Each entry: {mac, signal, signal_avg, tx_bitrate, rx_bitrate, tx_mcs,
 --              rx_mcs, tx_generation, tx_nss, rx_generation, rx_nss,
@@ -369,8 +381,8 @@ function M.sta_table(ifname)
 			if rx_bytes  then cur.rx_bytes    = tonumber(rx_bytes)   end
 			if tx_pkts   then cur.tx_packets  = tonumber(tx_pkts)    end
 			if rx_pkts   then cur.rx_packets  = tonumber(rx_pkts)    end
-			if tx_retries then cur.tx_retries = tonumber(tx_retries) end
-			if tx_failed  then cur.tx_failed  = tonumber(tx_failed)  end
+			if tx_retries then cur.tx_retries = M.u32_count(tonumber(tx_retries)) end
+			if tx_failed  then cur.tx_failed  = M.u32_count(tonumber(tx_failed))  end
 			if inactive  then cur.inactive_ms = tonumber(inactive)   end
 			if connected then cur.connected_sec = tonumber(connected) end
 		end

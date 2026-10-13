@@ -2956,6 +2956,27 @@ The `"Inconsistent vap"`/`"Invalid id"` warn paths only fire on an actual lookup
 rate/delta between informs. Static counters produce a zero delta even when the absolute value
 is correct — which is why `iw-mock.sh`'s fake counters must increase monotonically.
 
+**mt76 retry counters can read as 2^32 − 1 (2026-10-13).** The Office AP's (AX3000T, mt76)
+Air Stats showed 47,270,605,212 tx packets on 2.4 GHz, 50 % / 33 % retries and 49.4 % drops.
+`stat.ap` held `ng-tx_retries` = 11 × 2^32 + 2.75 M and `na-tx_retries`/`na-wifi_tx_dropped`
+≈ 2^32. The 5-minute report pinned one jump at 2026-10-13 02:55 UTC: `tx_retries` and
+`wifi_tx_dropped` both +4294967366 (2^32 + 70) in the same bucket. The controller (CFR,
+`devmgr/wcvb`, the client and VAP delta helper) keeps a delta only when it is positive and the
+last value is non-zero. A counter that goes down costs nothing, but one reading near 2^32 adds
+2^32. `stat.ap` is cumulative, so the jump stays.
+Source: mt76 as shipped in OpenWrt 25.12.5 (`kmod-mt7915e` 2026.03.19~39c960c3) adds
+`FIELD_GET(MT_TX_FREE_COUNT, info) - 1` to the u32 `tx_retries`, and that plus the failure bit to
+`tx_failed`, with no guard for a count of 0 (`mt7915/mac.c`, tx-free path). Upstream later made it
+`count ? count - 1 : 0`. A fresh station's counters can then read 4294967295. openUF now reads
+both as signed 32-bit and floors them at 0 (`sysinfo.u32_count`). The same source gives the
+real drop count: `tx_failed − tx_retries` (`satisfaction.dropped`). It feeds the VAP/radio
+`tx_dropped`/`wifi_tx_dropped` and the WiFi Experience drop term. Before, openUF counted every
+failed attempt as a drop (≈ retries) in the VAP totals, though not in satisfaction. The WED path
+reports both counts from firmware, so there the difference floors at 0.
+✅ Live on the Office AP, after the deploy: Home IoT 181 dropped against 6,118 retries (before:
+6,134 against 5,958), 5 GHz 0. ⚠️ The values already accumulated stay in `stat.ap` until the
+device is re-adopted.
+
 ### VAP, device and radio fields (2026-10-10)
 
 Audit F11: firmware keys that openUF did not send, checked against what 10.6.106
@@ -3212,7 +3233,7 @@ openUF's sources: SNR from `iw`'s `signal avg` (the last frame's `signal` withou
 radio's in-use survey noise; rates from `tx/rx bitrate` × 1000; the retry window from
 `tx packets`/`tx retries`/`tx failed` deltas over ≥ 60 s; `tx failed` as drops except on mt76
 (driver name `mt7*` from `/sys/class/net/<if>/device/driver`), where it counts failed attempts
-(table below).
+and the drops are `tx failed − tx retries` (table below; source in "mt76 retry counters" above).
 
 Verified 2026-10-10: ✅ lab (10.4.57) stores client `satisfaction`/`satisfaction_reason`/
 `anomalies`, both VAP charts, `radio_table_stats` satisfaction 85/100 and the device's 90 =

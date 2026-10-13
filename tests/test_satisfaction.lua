@@ -183,4 +183,14 @@ return {
 			assert_false(sat.failed_is_dropped("mt76x2e"), "mt76x2e")
 		end
 	},
+	{
+		name = "satisfaction: dropped() is tx failed, or failed less retries on mt76",
+		fn = function()
+			assert_eq(sat.dropped(true, 5, 40), 5, "ath: failed is the drop count")
+			assert_eq(sat.dropped(false, 42, 40), 2, "mt76 tx-free path: failed = retries + drops")
+			assert_eq(sat.dropped(false, 3, 40), 0, "mt76 WED path: never a negative count")
+			assert_eq(sat.dropped(false, 4, nil), 4, "no retries line: all of failed")
+			assert_eq(sat.dropped(false, nil, 4), nil, "no failed line: unknown")
+		end
+	},
 }
