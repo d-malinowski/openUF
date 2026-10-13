@@ -1163,6 +1163,46 @@ return {
 		end
 	},
 	{
+		-- A UniFi AP reports utilisation over its last ~1 s (umac.ko diffs the
+		-- MIB counters every 10 beacons), not since the radio came up.
+		name = "inform json: channel utilisation is the delta since the previous inform",
+		fn = function()
+			local orig = inform._sysinfo.radio_stats
+			local cur
+			inform._sysinfo.radio_stats = function() return {cur} end
+			local function at(freq, active, busy, rx, tx)
+				cur = {freq = freq, in_use = true, noise = -95, channel_time = active,
+				       channel_time_busy = busy, channel_time_rx = rx, channel_time_tx = tx}
+				local a = build({with_uci = true, with_clients = true}).radio_table[1].athstats
+				return a.cu_total, a.cu_self_rx, a.cu_self_tx, a.cu_interf
+			end
+			inform._cu_cache = {}
+			-- first reading: everything since bring-up (25% lifetime average)
+			local t, rx, tx, i = at(2412, 40000, 10000, 9000, 200)
+			assert_eq(t, 25, "first reading: the counters as they stand")
+			-- next 10 s: 8 s busy, the lifetime average would say 26%
+			t, rx, tx, i = at(2412, 50000, 18000, 9500, 3200)
+			assert_eq(t, 80, "cu_total over the last window")
+			assert_eq(rx, 5, "cu_self_rx over the last window")
+			assert_eq(tx, 30, "cu_self_tx over the last window")
+			assert_eq(i, 45, "cu_interf from the windowed values")
+			-- rounded like the firmware: 6 ms busy of 1000 is 0.6%, reported as 1
+			t = at(2412, 51000, 18006, 9500, 3200)
+			assert_eq(t, 1, "0.6% rounds to 1, as the firmware's +128>>8 does")
+			-- no new active time: repeat the previous figures, don't invent 0%
+			t = at(2412, 51000, 18006, 9500, 3200)
+			assert_eq(t, 1, "a stalled reading repeats the previous result")
+			-- radio restarted: counters went backwards, take them as they stand
+			t = at(2412, 2000, 1000, 100, 100)
+			assert_eq(t, 50, "after a restart: everything since the restart")
+			-- channel change: no delta across two channels
+			t = at(2437, 4000, 1400, 100, 100)
+			assert_eq(t, 35, "after a channel change: the new channel's counters, not a delta (20)")
+			inform._sysinfo.radio_stats = orig
+			inform._cu_cache = {}
+		end
+	},
+	{
 		-- The controller logs "Possible interference" when athstats.ast_txto
 		-- or ast_cst rises faster than 10/s; it diffs the raw counts itself.
 		name = "inform json: athstats carries ath9k's tx and carrier-sense timeout counts",

@@ -173,6 +173,10 @@ M._sta_stats_cache = {}
 -- ...and how long an unseen station stays in it. See the sweep in build_json.
 M.STA_STATS_FORGET_AFTER = 600
 
+-- In-memory only, keyed by radio name: the in-use survey counters at the last
+-- inform and the utilisation computed from them. See _windowed_cu.
+M._cu_cache = {}
+
 -- Injectable: override in tests to control elapsed time deterministically.
 M._time = os.time
 
@@ -623,6 +627,55 @@ local function _in_use_survey(stats)
 	return stats[1]
 end
 
+-- Channel utilisation (cu_total/cu_self_rx/cu_self_tx, percent) over the
+-- time since the previous inform, not since the radio came up.
+--
+-- The survey counters accumulate from bring-up, so busy/active is a lifetime
+-- average: an 11-hour-old 2.4 GHz radio kept reporting 25% whatever the air
+-- was doing now. A UniFi AP reports the last ~1 s. Its driver (umac.ko,
+-- ieee80211_beacon_chanutil_update2) diffs the MIB rx_clear/rx_frame/
+-- tx_frame/cycle counters every 10 beacon intervals and stores each as
+-- round(delta * 100 / cycle_delta). Firmware-confirmed for 4.0.15. The
+-- window here is one inform interval: the nearest sample openUF has.
+--
+-- The first reading, a channel change, or counters that went backwards (the
+-- radio restarted) fall back to the counters as they stand, which is then
+-- everything since that restart. A reading with no new active time (two
+-- builds within the same millisecond, or a driver that stalls the counters)
+-- repeats the previous result rather than inventing 0%.
+local function _windowed_cu(name, s)
+	local now = {
+		freq   = s.freq,
+		active = s.channel_time or 0,
+		busy   = s.channel_time_busy or 0,
+		rx     = s.channel_time_rx or 0,
+		tx     = s.channel_time_tx or 0,
+	}
+	local prev = name and M._cu_cache[name]
+	local d = now
+	if prev and prev.freq == now.freq and now.active >= prev.active
+	   and now.busy >= prev.busy and now.rx >= prev.rx and now.tx >= prev.tx then
+		if now.active == prev.active then
+			now.out = prev.out
+			M._cu_cache[name] = now
+			return prev.out[1], prev.out[2], prev.out[3]
+		end
+		d = {
+			active = now.active - prev.active,
+			busy   = now.busy - prev.busy,
+			rx     = now.rx - prev.rx,
+			tx     = now.tx - prev.tx,
+		}
+	end
+	local function pct(x)
+		if d.active <= 0 then return 0 end
+		return math.min(100, math.floor(x * 100 / d.active + 0.5))
+	end
+	now.out = {pct(d.busy), pct(d.rx), pct(d.tx)}
+	if name then M._cu_cache[name] = now end
+	return now.out[1], now.out[2], now.out[3]
+end
+
 -- Build the inform JSON payload.
 -- st: current state table
 -- cfg: device configuration (from conf.lua)
@@ -905,12 +958,8 @@ function M.build_json(st, cfg, ufhw)
 					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
 				end
 				if in_use then
-					local s     = in_use  -- the channel the radio is actually on
-					local total = s.channel_time or 0
-					local busy  = s.channel_time_busy or 0
-					local cu_total   = total > 0 and math.floor(busy * 100 / total) or 0
-					local cu_self_rx = total > 0 and math.floor((s.channel_time_rx or 0) * 100 / total) or 0
-					local cu_self_tx = total > 0 and math.floor((s.channel_time_tx or 0) * 100 / total) or 0
+					-- in_use: the channel the radio is actually on
+					local cu_total, cu_self_rx, cu_self_tx = _windowed_cu(radio.name, in_use)
 					local entry = {
 						name        = radio.name,
 						channel     = radio.channel,

@@ -2884,6 +2884,33 @@ this radio's own tx/rx.
 > `inform.lua`'s `_in_use_survey()`; the test fixture now mirrors the real ordering, and
 > reverting the selection fails 4 tests.
 
+> **`cu_*` cover the last inform interval, not the radio's lifetime (2026-10-13).** The
+> survey counters accumulate from radio bring-up, so `busy / active` is a lifetime average.
+> Until 2026-10-13 openUF sent exactly that. The Living room 2.4 GHz radio, up 11 h, reported
+> 25% while it was measuring 15–17% over 10 s windows, and the Office 2.4 GHz reported 13.8%
+> against 5–6%. A live spike or lull never showed.
+> **Firmware-confirmed for 4.0.15** (`umac.ko`, MIPS disassembly):
+> - `ieee80211_beacon_chanutil_update2` runs once per VAP per beacon. Every
+>   10 × VAP-count calls (10 beacon intervals, ~1 s), it reads the MIB counters through
+>   `ic_get_mib_cycle_counts_pct` (`ic+28348`: tx_frame, rx_frame, rx_clear, cycle).
+> - It stores `round(Δcounter × 100 / Δcycle)` as three bytes at `ic+22788..22790`
+>   (`(v × 256 / Δcycle × 100 + 128) >> 8`). Those are rx_clear, rx_frame and tx_frame,
+>   in that order.
+> - `ath_ioctl`'s athstats reply copies those bytes into `cu_total`/`cu_self_rx`/`cu_self_tx`,
+>   and `mcad` forwards them.
+> - The `ieee80211_sysctl_chanutil_{total,selfrx,selftx}` sysctls print the same bytes.
+>
+> openUF now keeps the in-use entry's counters per radio (`_windowed_cu`) and reports the
+> delta since the previous inform, rounded the same way. That window is ~10 s, not ~1 s.
+> The fallbacks:
+> - The first reading, a channel change, or any counter going backwards (radio restart)
+>   uses the counters as they stand.
+> - A reading with no new active time repeats the last result.
+>
+> Live 2026-10-13: Living 2.4 GHz 17% on the controller against 15–17% measured on the AP;
+> Office 2.4 GHz 6% against 5–6%. The Living 5 GHz radio (ath10k, ch 36/80) shows 0% because
+> it is 0.4–0.5% busy (2 clients, ~2 KB/s), not because of a reading fault.
+
 `spectrum_table[]` entries carry `channel`, `center_freq`, `width`, `utilization`,
 `interference` (field names recovered from two independent Lombok DTO constant pools).
 `channel`/`center_freq`/`utilization` come mechanically from survey dump; `interference` is
