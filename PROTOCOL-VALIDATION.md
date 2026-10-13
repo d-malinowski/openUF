@@ -3140,7 +3140,7 @@ Nested, **not** a flat top-level `user_table`.
 | `nss` | Read directly by the controller, no derivation |
 | `radio_proto` | Read only by the **disconnect-time** archive path (`TtZhv`) |
 | **`is_11n`, `is_11ac`, `is_11ax`, `is_11be`** | What the **live** display actually uses — see below |
-| `wifi_tx_attempts`, `wifi_tx_retries_percentage` | `attempts = tx_packets + tx_retries` |
+| **`tx_retries`**, `wifi_tx_attempts`, `wifi_tx_dropped`, `wifi_tx_retries_percentage` | Lifetime counters. `attempts = tx_packets` (retries not included); dropped is `satisfaction.dropped`; percentage = retries ÷ (retries + attempts + dropped). The controller replaces the percentage with its own from the deltas: see below |
 | `satisfaction`, `satisfaction_now`, `satisfaction_reason`, `anomalies` | The firmware's own formula — see below |
 | ~~`capacity`, `throughput`, `linkscore`, `multicast`~~ | **Not sent** (since 2026-10-11). UniFi firmware's `fill_stainfo_json` sends none of the four (firmware-confirmed for 3.9.27 to 4.0.15). The 10.x controller reads `capacity`/`throughput`/`linkscore` only in `devmgr.c.KHUkYjHujLgFBD`'s `active_sta_table` builder, which runs only for a mesh **uplink** VAP's entry (it also maps `airmax.link_quality`/`link_capacity` onto them). `multicast` is read per client as a sub-document (`getX`), and a number came back `null`. On the live 10.6 controller none of the four showed up in `stat/sta` or `stat/device`. openUF used to send a tx-rate proxy, a byte-rate delta and two `0` placeholders |
 | `name` | Omitted — controller/admin-assigned, no local source |
@@ -3178,6 +3178,26 @@ while `nss` — read directly, no derivation — works immediately. Both must be
 | none (legacy) | falls back to the band: `a` on `na`, `g` on `ng` | 1 |
 
 Never `b` — real dual-band 11n+ hardware doesn't negotiate down to 802.11b-only rates.
+
+**A client's "TX Retries" is the controller's delta of `tx_retries` (2026-10-13).** Every
+client showed "TX Retries 0.0%". On each inform the controller diffs the wireless client's
+counter keys: `tx_bytes`, `rx_bytes`, `tx_packets`, `rx_packets` (`devmgr.KrlpWXOulbN`) plus
+`wifi_tx_attempts` and `tx_retries` (`devmgr.HCKpgcBFPLu`). It keeps the positive deltas
+(`wcvb`), adds them to the client's stored totals and **overwrites**
+`wifi_tx_retries_percentage` with `wifi.k.bLwwMKkr`: Δretries ÷ (Δretries + Δattempts +
+Δdropped) × 100, rounded to 0.1 (`devmgr.TtZhv`). openUF sent no per-station `tx_retries`, so
+Δretries was always 0. `wifi_tx_dropped` is read from the same delta but is not in the diffed
+key list, so its delta is 0 whatever is sent. openUF sends it anyway as the lifetime count.
+**`wifi_tx_attempts` excludes retries.** Firmware 4.0.15 sends no `wifi_tx_attempts` at all, so
+the controller is the only source. Every rate it computes from the field (client, `stat.ap`
+`tx_retries_percentage_max`, per band) uses retries + attempts + dropped as the denominator.
+The disconnect-time session archive also fills `wifi_tx_attempts` from `wifi_tx_packets`.
+openUF used to send `tx_packets + tx_retries`, which counted the retries twice. It now sends
+`tx_packets`, per station, per VAP and per radio, and the radio's `tx_retries_pct` uses the
+same denominator.
+✅ Live on both APs and the 10.6 controller: one inform after the deploy, 8 of 13 wireless
+clients had non-zero `tx_retries` in `stat/sta`, with percentages from 4.2 to 15.3 (on both
+mt76 and ath9k/ath10k clients). The client panel showed "TX Retries 7.4%" for a 2.4 GHz phone.
 
 **`satisfaction` is a device-computed field.** The controller's `wifi_experience_score` is a
 straight passthrough — `com.ubnt.service.l.e.AcrQJeJCScLn`:

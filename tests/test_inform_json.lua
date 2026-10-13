@@ -691,8 +691,8 @@ return {
 			-- the permanent "TX Retries: High (100%)" on the Devices view.
 			local d = build({with_uci = true, with_clients = true})
 			local vap, rs = d.vap_table[1], d.radio_table_stats[1]
-			assert_eq(vap.wifi_tx_attempts, vap.tx_packets + vap.tx_retries,
-				"attempts are successful + retried, as sta_table defines them")
+			assert_eq(vap.wifi_tx_attempts, vap.tx_packets,
+				"attempts are the frames sent, retries not included, as sta_table defines them")
 			assert_eq(vap.wifi_tx_dropped, vap.tx_dropped, "dropped is the driver's drop count")
 			assert_eq(rs.wifi_tx_attempts, vap.wifi_tx_attempts,
 				"radio sums its VAPs' attempts")
@@ -918,13 +918,19 @@ return {
 			assert_false(sta_table[1].is_11ac, "not VHT")
 			assert_false(sta_table[1].is_11ax, "not HE")
 			assert_false(sta_table[1].is_11be, "not EHT")
-			-- wifi_tx_attempts/wifi_tx_retries_percentage: tx_packets(287) +
-			-- tx_retries(4) = 291 attempts, 4 of them retried.
-			assert_eq(sta_table[1].wifi_tx_attempts, 291, "wifi_tx_attempts = tx_packets + tx_retries")
+			-- The client panel's "TX Retries" is the controller's delta of
+			-- tx_retries over retries + wifi_tx_attempts + dropped (devmgr
+			-- TtZhv): without tx_retries per station it read 0.0 % for
+			-- every client. Attempts are the 287 frames sent; 4 retries.
+			local st = sta_table[1]
+			assert_eq(st.tx_retries, 4, "tx_retries is sent per station")
+			assert_eq(st.wifi_tx_attempts, 287, "wifi_tx_attempts = tx_packets, retries not included")
+			assert_not_nil(st.wifi_tx_dropped, "wifi_tx_dropped is sent per station")
 			-- exact value round-trips through cjson's %.14g float encoding,
 			-- so compare with a tolerance rather than bit-for-bit equality
-			assert_true(math.abs(sta_table[1].wifi_tx_retries_percentage - 4 * 100 / 291) < 1e-10,
-				"wifi_tx_retries_percentage = retries as % of attempts")
+			assert_true(math.abs(st.wifi_tx_retries_percentage
+				- 4 * 100 / (287 + 4 + st.wifi_tx_dropped)) < 1e-10,
+				"wifi_tx_retries_percentage = retries / (retries + attempts + dropped)")
 			-- satisfaction (satisfaction.lua): signal avg -63 dBm is far
 			-- above the noise floor (100), the mean of 144.4 and 72.2
 			-- Mbit/s is 108300 kbps (90), and the retry window has no

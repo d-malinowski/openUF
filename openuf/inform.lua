@@ -1280,18 +1280,22 @@ function M.build_json(st, cfg, ufhw)
 					}
 				end
 				local prev = M._sta_stats_cache[sta.mac]
-				-- wifi_tx_attempts: total transmission attempts (successful +
-				-- retried), i.e. tx_packets + tx_retries -- both already
-				-- parsed from iw. wifi_tx_retries_percentage: retries as a
-				-- fraction of attempts. Confirmed real field names/semantics
-				-- via the decompiled wireless-client model
-				-- (com.ubnt.service.l.e.AQODNNoMmBlFpWXX) and unpoller/unifi's
-				-- REST client struct. Lifetime values; WiFi Experience uses
-				-- its own per-minute window instead.
-				local wifi_tx_attempts = (sta.tx_packets or 0) + (sta.tx_retries or 0)
+				-- The client panel's "TX Retries": the controller diffs this
+				-- station's tx_retries and wifi_tx_attempts (with the byte and
+				-- packet counters) every inform, keeps the positive deltas and
+				-- overwrites wifi_tx_retries_percentage with
+				-- retries / (retries + attempts + dropped) of those deltas
+				-- (devmgr TtZhv, wifi.k bLwwMKkr). Every retry rate it computes
+				-- has that denominator, and the session archive fills
+				-- wifi_tx_attempts from wifi_tx_packets: attempts are the
+				-- frames sent, retries not included. Without tx_retries here
+				-- the delta was 0 and every client read 0.0 %. Lifetime
+				-- values; WiFi Experience uses its own per-minute window.
+				local wifi_tx_attempts = sta.tx_packets or 0
+				local tries = wifi_tx_attempts + (sta.tx_retries or 0) + (sta_dropped or 0)
 				local wifi_tx_retries_pct = 0
-				if wifi_tx_attempts > 0 then
-					wifi_tx_retries_pct = (sta.tx_retries or 0) * 100 / wifi_tx_attempts
+				if tries > 0 then
+					wifi_tx_retries_pct = (sta.tx_retries or 0) * 100 / tries
 				end
 				-- WiFi Experience, the firmware's formula (satisfaction.lua):
 				-- SNR from the averaged signal, the last tx/rx rates, and the
@@ -1398,7 +1402,9 @@ function M.build_json(st, cfg, ufhw)
 					is_11be    = sta.tx_generation == "be",
 					radio_proto = sta.tx_generation or (vap.radio == "na" and "a" or "g"),
 					nss         = sta.tx_nss or 1,
+					tx_retries       = sta.tx_retries,
 					wifi_tx_attempts = wifi_tx_attempts,
+					wifi_tx_dropped  = sta_dropped,
 					wifi_tx_retries_percentage = wifi_tx_retries_pct,
 					-- WiFi Experience (satisfaction.lua). The controller
 					-- computes none of it: it stores what the AP sends.
@@ -1436,11 +1442,12 @@ function M.build_json(st, cfg, ufhw)
 			-- degenerated -- which is what pinned "TX Retries: High (100%)"
 			-- on the Devices view even though the signal-bucketed attempt
 			-- counters, derived from the same per-station data, were populated
-			-- correctly. Attempts are successful + retried transmissions, the
-			-- same definition sta_table uses; dropped is the driver's own
-			-- drop count (satisfaction.dropped: tx_failed, less the retries
-			-- that mt76 folds into it).
-			vap.wifi_tx_attempts = vap_tx_packets + vap_tx_retries
+			-- correctly. Attempts are the frames sent, retries not included,
+			-- the same definition sta_table uses (the controller's rate is
+			-- retries / (retries + attempts + dropped)); dropped is the
+			-- driver's own drop count (satisfaction.dropped: tx_failed, less
+			-- the retries that mt76 folds into it).
+			vap.wifi_tx_attempts = vap_tx_packets
 			vap.wifi_tx_dropped  = vap_tx_dropped
 			local rstat = radio_stats_by_name[vap.radio_name]
 			if rstat then
@@ -1454,14 +1461,15 @@ function M.build_json(st, cfg, ufhw)
 				rstat.rx_packets = (rstat.rx_packets or 0) + vap_rx_packets
 				rstat.tx_bytes   = (rstat.tx_bytes   or 0) + vap_tx_bytes
 				rstat.rx_bytes   = (rstat.rx_bytes   or 0) + vap_rx_bytes
-				-- Retries as a share of total attempts (successful + retried),
-				-- the same definition sta_table's wifi_tx_retries_percentage
-				-- uses. Left absent while nothing has been transmitted, rather
-				-- than reported as 0% or 100% of nothing.
-				local attempts = rstat.tx_packets + rstat.tx_retries
-				if attempts > 0 then
+				-- Retries as a share of every try (sent + retried + dropped),
+				-- the controller's own definition, which sta_table's
+				-- wifi_tx_retries_percentage uses too. Left absent while
+				-- nothing has been transmitted, rather than reported as 0% or
+				-- 100% of nothing.
+				local tries = rstat.tx_packets + rstat.tx_retries + rstat.tx_dropped
+				if tries > 0 then
 					rstat.tx_retries_pct =
-						math.floor(rstat.tx_retries * 100 / attempts + 0.5)
+						math.floor(rstat.tx_retries * 100 / tries + 0.5)
 				end
 			end
 			-- avg_client_signal: mean RSSI (dBm, negative) of currently
