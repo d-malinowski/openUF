@@ -4805,6 +4805,45 @@ return {
 		end
 	},
 	{
+		name = "inform: with no rrm_request_interval set, beacon requests go out hourly",
+		fn = function()
+			-- hostapd logs every report as a long hex line; at the old 600 s
+			-- default they filled three quarters of logread.
+			local orig_rrm, orig_sysinfo, orig_time =
+				inform._rrmscan, inform._sysinfo, inform._time
+			local asked, t = 0, 1000
+			inform._time = function() return t end
+			inform._rrmscan = {
+				collector_ensure = function() end,
+				harvest          = function() return {}, {aa = true} end,
+				hostapd_objects  = function() return {"hostapd.wlan0"} end,
+				capable_stations = function() return {"aa:bb:cc:dd:ee:01"} end,
+				request          = function() asked = asked + 1 end,
+			}
+			inform._sysinfo = setmetatable({
+				radio_caps = function() return {channel = 36} end,
+			}, {__index = orig_sysinfo})
+
+			local cfg = {config = {rrm_enrichment = true}}
+			inform._rrm_asked = {}
+			inform._rrm_next_request = 0
+			inform._rrm_rr = 0
+
+			inform._rrm_tick(cfg)
+			t = 1000 + 600;  inform._rrm_tick(cfg)
+			t = 1000 + 3599; inform._rrm_tick(cfg)
+			local before_hour = asked
+			t = 1000 + 3600; inform._rrm_tick(cfg)
+
+			inform._rrmscan, inform._sysinfo, inform._time = orig_rrm, orig_sysinfo, orig_time
+			inform._rrm_asked = {}
+			inform._rrm_next_request = 0
+
+			assert_eq(before_hour, 1, "one request in the first hour")
+			assert_eq(asked, 2, "the next one an hour later")
+		end
+	},
+	{
 		name = "inform: a station that never answers is benched, and un-benched by a report",
 		fn = function()
 			-- Asking a station that only ever acknowledges costs it an ack

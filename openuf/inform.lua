@@ -133,8 +133,12 @@ M.RRM_BENCH_SECONDS  = 6 * 3600
 -- How often to ask ONE station for a sweep. An active beacon measurement takes
 -- the client off-channel for roughly duration x channels (~1.3 s for a full
 -- operating class at 50 TU), so this is deliberately slow: the point is to
--- keep the Environment tab honest, not to poll.
-M.RRM_REQUEST_INTERVAL = 600
+-- keep the Environment tab honest, not to poll. Hourly, because hostapd writes
+-- every report it receives to syslog as a hex line (~15 per answer, outside
+-- openUF's control): at 600 s they took 72-78% of a 128 KB logread buffer,
+-- live 2026-10-13. The controller keeps a reported neighbour ~24 h (rogueap
+-- rows 22 h old still listed), so an hourly refresh loses no row.
+M.RRM_REQUEST_INTERVAL = 3600
 
 -- How often the background collector is checked for life. That check forks
 -- `pgrep -f`, and ran on every 10-second heartbeat -- but the subscription

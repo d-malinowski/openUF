@@ -3747,6 +3747,15 @@ Verified end to end 2026-09-02 on the Archer C5's 5 GHz radio, whose passive cac
 at −53/−69/−81/−81 dBm on ch 36/44/48 — one of them `00:00:5e:00:53:05`, the *other* AP's
 5 GHz BSS, which this radio cannot hear from another room but the client could.
 
+**Request interval: hourly (2026-10-13).** hostapd logs every beacon report it receives
+(`wpa_msg` at `MSG_INFO`, which `hostapd -s` sends to syslog) as one `BEACON-RESP-RX` line of
+up to ~1 KB of hex, about 15 per answer. openUF can't suppress that without lowering hostapd's
+log level, which also hides `DFS-*` and `AP-STA-CONNECTED`. At the old 600 s default those lines
+held 72% (Archer C5) and 78% (AX3000T) of a 128 KB `logread` buffer, so the AX3000T's log went
+back only ~3 h. The controller doesn't need that rate: openUF sends a reported neighbour for
+only 30 s, and the controller then keeps the row on its own. The live `stat/rogueap` listed rows
+last seen 22 h earlier. The default is now 3600 s.
+
 #### The frame body: hostapd's control socket, not ubus (2026-10-12)
 
 The AirView WiFi Scanner showed 5 GHz rows named by their BSSID, with no Security, at 20 MHz.

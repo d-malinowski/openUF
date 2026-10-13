@@ -939,7 +939,7 @@ to its usual SSID check, so it changes nothing there.
 
 openUF closes that gap the way Ubiquiti's Channel AI describes — *"neighbor reports and
 automated RRM scans"* — rather than by scanning. Every `rrm_request_interval` seconds
-(default 600) it asks **one** 802.11k-capable client for an active beacon measurement: the
+(default 3600) it asks **one** 802.11k-capable client for an active beacon measurement: the
 *client* leaves the channel, sweeps, and reports what it saw, while the AP keeps serving.
 One answer returned 15 BSSes across both bands at once, and a client sitting on 5 GHz
 routinely reports 2.4 GHz too — so a single report enriches both radios. It took that
@@ -948,7 +948,7 @@ empty 5 GHz list from 0 neighbours to 4, one of them an AP the radio cannot hear
 | Setting | Meaning |
 |---|---|
 | `rrm_enrichment` | `true` by default. Set `false` to never send a beacon request. Switching it off also tears down the background collector on the next cycle, and `/etc/init.d/openuf stop` does the same |
-| `rrm_request_interval` | Seconds between requests, across all radios and clients combined — they are asked one at a time, round-robin |
+| `rrm_request_interval` | Seconds between requests, across all radios and clients combined — they are asked one at a time, round-robin. Default 3600. hostapd writes each answer to syslog as ~15 long `BEACON-RESP-RX` lines, so a short interval pushes everything else out of `logread`. The controller keeps a reported neighbour for about a day, so going below an hour buys nothing visible |
 
 Reports are collected two ways, into one spool, `/tmp/openuf-rrm.jsonl`, which openUF
 drains and truncates on every inform:
@@ -1498,6 +1498,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Clients on the same radio can't reach each other (a Cast/Google Home stereo pair or speaker group falls apart, AirPlay or printers vanish) while other clients are fine | The WLAN has Proxy ARP or Multicast Enhancement on, so OpenWrt forces `ap_isolate=1`, and the radio's bridge port lost its hairpin flag in a reconfigure (§ Hairpin). `cat /sys/class/net/<ifname>/brport/hairpin_mode` must be `1` on every BSS whose `/var/run/hostapd-phy*.conf` block has `ap_isolate=1`. openUF restores it within a minute and logs `re-asserted hairpin_mode`. On an older openUF, run `echo 1 >` on that file and on `proxyarp_wifi` |
 | Idle clients score low on WiFi Experience, and every client receives the same ~16 KB/s even when nothing is using it | usteerd's broadcast sync, copied to each client by Multicast Enhancement (§ usteer's AP-to-AP sync). Compare a client's `tx bytes` in `iw dev <ifname> station dump` over 30 s across clients. `nft list table bridge openuf_usteer` must show three drop rules while usteerd runs. On an older openUF, the traffic reaches every client |
 | A wired client behind the AP shows terabytes of usage in its 24 h / hourly / daily history, while its live totals look right | A controller collision, not an openUF counter. The controller writes a wired host that an AP reports in `port_table[].mac_table` into the per-client history with no byte counters. A UniFi gateway writes the same client with its own lifetime counter, so the controller adds that whole counter again on every AP inform. The history is wrong, the live totals and the port attribution are right. Expected: a real U6-IW goes through the same code. The only openUF-side fix would be to stop reporting wired hosts, so it is left as is (PROTOCOL-VALIDATION "A wired client's usage history grows") |
+| `logread` is mostly `BEACON-RESP-RX` hex lines | hostapd logging each 802.11k beacon report openUF asked a client for. Raise `rrm_request_interval` (3600 s by default; older `conf.lua` files set 600), or set `rrm_enrichment = false` |
 | A radio's Ch. Util reads 0 % | Usually true: it is the busy share of the operating channel since the previous inform (~10 s), rounded to whole percent like UniFi firmware, so a quiet 5 GHz cell at 0.4 % shows 0. Check with two `iw dev <ifname> survey dump` readings 10 s apart (`[in use]` entry: Δ`channel busy time` / Δ`channel active time`). Before 2026-10-13 openUF sent the average since the radio came up, which hid every spike |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |

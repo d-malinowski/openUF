@@ -67,8 +67,10 @@ config = {
 
 	-- Seconds between beacon requests, across all radios and clients combined
 	-- (they are asked one at a time, round-robin). Deliberately slow: the point
-	-- is to keep the Environment tab honest, not to poll.
-	rrm_request_interval = 600,
+	-- is to keep the Environment tab honest, not to poll. Each answer also puts
+	-- ~15 long BEACON-RESP-RX lines in hostapd's syslog, so a short interval
+	-- crowds everything else out of logread.
+	rrm_request_interval = 3600,
 
 	-- WiFi Connectivity (controller: Insights -> AirView -> Connectivity): report
 	-- each client connection's Association / Authentication / DHCP / DNS stages,
