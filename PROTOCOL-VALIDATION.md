@@ -3689,6 +3689,19 @@ remote-node BSSIDs (`ubus call usteer remote_info`). If usteer is not answering,
 one of this site's SSIDs is sent without `essid`, so it can't raise a false alert. An evil twin that only a client
 ever saw is then not flagged.
 
+What a real UniFi AP does (firmware-confirmed for 3.9.27 to 4.0.15, BZ2 4.0.15 `/bin/mcad`
+`prepare_scan_array`): it sends the driver's scan list (`libubnt` `get_scanlist` →
+`parse_scan_results`) with no BSSID filter. The only entry it drops is one on the other
+band, decided from the entry's mode string. Siblings therefore reach the controller, tagged
+`is_unifi`/`serialno` from their vendor element. The controller's scan ingest (10.6
+`qikih`) sends a row with `is_unifi` down the UniFi-device path and never stores it as
+a `stat/rogueap` row. A radio does not hear its own beacons, and the other radio's BSSes
+are on the other band, so the AP's own BSSIDs never appear. On a real UniFi site, the WiFi Scanner
+shows no row with the site's own SSIDs unless a third party broadcasts one. openUF matches
+this: passive rows tag siblings `is_unifi` (see the sibling note above), and 802.11k rows
+skip own and sibling BSSIDs. Rows with site SSIDs that were stored before 2026-10-13 00:00 stay
+in the scanner's 1-day window until they age out.
+
 **Two copies of each report (2026-10-13).** hostapd's `rrm.c` emits the control-socket line
 first and the ubus notification second. They reach the event file through different
 processes (`hostapd_cli -a` and the `ubus subscribe` loop) and often land in different
