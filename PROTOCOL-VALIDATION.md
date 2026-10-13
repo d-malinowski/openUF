@@ -3131,7 +3131,7 @@ Nested, **not** a flat top-level `user_table`.
 | Field | Notes |
 |---|---|
 | `active`, `mac`, `ap_mac`, `channel`, `radio` | `active` is always `true` — an entry only exists while `iw station dump` lists the station |
-| `signal`, `rssi`, `noise` | `signal` is `iw`'s dBm. `rssi` is the **SNR** in dB over the radio's in-use survey noise, floored at −96 as the firmware does (`signal = rssi + max(noise, −96)`); `noise` is that floor, absent with no survey reading. See "Station fields" below |
+| `signal`, `rssi`, `noise` | `signal` is `iw`'s dBm. `rssi` is the **SNR** in dB over the radio's in-use survey noise, floored at −96 as the firmware does (`signal = rssi + max(noise, −96)`); `noise` is the survey reading itself, sent unclamped as the firmware does (so below −96 dBm `rssi + noise` is less than `signal`), absent with no survey reading. See "Station fields" below |
 | `state`, `is_11r` | `state` carries only bit 0x10 (dozing), and only where mac80211 tracks power save; `is_11r` only when true. See "Station fields" below |
 | `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets` | **Raw cumulative counters.** The vapInformProcessor computes its own `tx_bytes-d`/`rx_bytes-d`/`bytes-d`/`bytes-r` deltas server-side keyed by `time_delta` — never send a pre-computed rate here. |
 | `tx_rate`, `rx_rate` | **Kbps** (`iw` reports Mbit/s, so ×1000) |
@@ -3294,7 +3294,8 @@ and earlier the one client whose AP report was newest read 0. The lab has no gat
 the AP's value.
 
 Verified 2026-10-10 on both APs against the real 10.6.106 controller: `stat/sta` shows `rssi`
-45/44 for clients at −51/−48 dBm (noise −106 → floored −96 on ath10k, −92 on mt798x), `noise`,
+45/44 for clients at −51/−48 dBm (noise −106 → floored −96 on ath10k, −92 on mt798x), `noise` −106 sent raw (2026-10-13: firmware 4.0.15
+`fill_stainfo_json` stores the radio noise s16 unclamped and applies the −96 floor only to `signal`),
 and `is_11r: true` on the six clients whose hostapd AKM is 00-0f-ac-9 or -4. No 2.4 GHz client
 was on the ath9k radio during the check, so `powersave_enabled: true` has not been seen end to
 end; the reader was checked against live debugfs.
