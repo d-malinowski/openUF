@@ -1160,6 +1160,33 @@ lua -e "dofile('/opt/openuf/ucihelper.lua').wlan_clear()"
 # or simply reset-inform and re-adopt
 ```
 
+### Roaming events
+
+Insights → AirView → Roaming lists each client move between APs: Success or Failed (with the
+disconnect time), and the Fast Roaming, Roaming Assistant and Minimum RSSI tags. A UniFi AP
+reports arrivals and departures as they happen (`association`, `sta_leave`, `sta_roam`
+notifs), and the controller pairs the two within 10 s. openUF does the same whenever it sends
+the connection-stage notifs above, and only then claims `wifi_caps2` `0x2000`, which tells the
+controller to use those reports instead of guessing roams from heartbeats.
+
+| Event | Sent by | When |
+|---|---|---|
+| `association` | the new AP | hostapd reports the client authorized; carries the signal and the auth algorithm (`ft` = Fast Roaming) |
+| `sta_leave` | the old AP | hostapd reports a disassociation; carries why openUF sent it away, if it did (Minimum RSSI kick, Roaming Assistant) |
+| `sta_roam` | the old AP | the client's address arrives from the uplink while hostapd still lists it: it is behind another AP now |
+
+- A departure arriving more than a second before its arrival makes the roam Failed, so these
+  are sent the moment they happen, not with the 10 s heartbeat. The inform daemon looks at the
+  event collector every 250 ms for that.
+- The `sta_roam` signal comes from `bridge monitor fdb` (package `ip-bridge`), started with
+  the event collector. A client roaming by 802.11r tells its old AP nothing, and hostapd keeps
+  it listed for 6–40 s, past the controller's 10 s window. Without `ip-bridge` such roams are
+  still reported by the new AP, but the old AP's late `sta_leave` misses the pairing and the
+  roam is not listed.
+- A move between the bands of one AP is not a roam, as on a UniFi AP.
+- Turn it off with `assoc_tracker = false` (it goes with the connection stages). The capability
+  bit goes too, and the controller falls back to guessing roams from heartbeats.
+
 ### L2 hardening: BPDU and VLAN-tag drop on the SSIDs
 
 Every full push also carries an `ebtables.*` block, the literal ebtables fragments stock

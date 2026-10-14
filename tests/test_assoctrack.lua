@@ -21,6 +21,28 @@ end
 
 local function reset()
 	at._stas, at._queue = {}, {}
+	at._here, at._roamed, at._kicks, at._roam_queue = {}, {}, {}, {}
+end
+
+-- Roam reports: a second BSS on this AP, and the collector's lines for them.
+local IF2  = "phy0-ap0"
+local VAP2 = "openuf_radio0_home_lan"
+local MAP  = {[IF] = VAP, [IF2] = VAP2}
+local function line(t, ev, body) return string.format('%.2f { "%s": {%s} }', t, ev, body) end
+local function assoc(t, ifname, sig)
+	return line(t, "assoc", string.format('"address":"%s","ifname":"%s","signal":%d', STA, ifname, sig))
+end
+local function authorized(t, ifname, alg)
+	return line(t, "sta-authorized", string.format('"address":"%s","ifname":"%s","auth-alg":"%s"', STA, ifname, alg))
+end
+local function disassoc(t, ifname)
+	return line(t, "disassoc", string.format('"address":"%s","ifname":"%s"', STA, ifname))
+end
+-- As the collector's fdb half writes them, from `bridge monitor fdb` on the
+-- Archer C5 (swconfig) and the AX3000T (DSA), 2026-10-14.
+local function fdb(t, port) return string.format("%.2f fdb %s dev %s master br-lan ", t, STA, port) end
+local function roams(lines, map)
+	return at.roam_ingest(at.parse_events(table.concat(lines, "\n")), map or MAP)
 end
 
 -- One connection from the fixture: auth 13.20, assoc 13.25, authorized 13.32.
@@ -354,6 +376,242 @@ return {
 			assert_true(ok, "poll survives: " .. tostring(out))
 			assert_eq(#out, 1, "and decides")
 			assert_true(out[1].event_id:match("^00005e005301%-%d+$") ~= nil, "event_id is mac-millis: " .. out[1].event_id)
+		end
+	},
+	{
+		name = "assoctrack: parse_events reads learned fdb entries, not ageing, switch or own ones",
+		fn = function()
+			local blob = table.concat({
+				"6305912.12 fdb 00:00:5e:00:53:01 dev eth1 master br-lan ",
+				"6305912.12 fdb 00:00:5e:00:53:01 dev eth1 vlan 1 master br-lan ",
+				"222911.60 fdb 00:00:5e:00:53:02 dev wan self ",
+				"6305913.13 fdb Deleted 00:00:5e:00:53:01 dev eth1 master br-lan ",
+				"6305913.20 fdb 00:00:5e:00:53:10 dev br-lan master br-lan permanent",
+				"6305913.30 fdb 00:00:5E:00:53:03 dev phy1-ap0 master br-lan ",
+			}, "\n")
+			local evs = at.parse_events(blob)
+			assert_eq(#evs, 3, "two learned lines for .01 (plain and vlan) and one for .03")
+			assert_eq(evs[1].ev, "fdb", "fdb event")
+			assert_eq(evs[1].port, "eth1", "port")
+			assert_eq(evs[1].t, 6305912.12, "uptime prefix")
+			assert_eq(evs[3].mac, "00:00:5e:00:53:03", "lower-cased")
+			assert_eq(evs[3].port, "phy1-ap0", "a BSS port is kept; roam_ingest judges it")
+		end
+	},
+	{
+		name = "assoctrack: an authorized station is announced once, with auth_rssi and auth_algo",
+		fn = function()
+			reset()
+			local out = roams({assoc(100.10, IF, -61), authorized(100.22, IF, "ft")})
+			assert_eq(#out, 1, "one association")
+			local p = out[1]
+			assert_eq(p.message_type, "STA_ASSOC_TRACKER", "message_type")
+			assert_eq(p.event_type, "association", "event_type")
+			assert_eq(p.mac, STA, "mac")
+			assert_eq(p.vap, VAP, "vap_table name of the BSS")
+			assert_eq(p.auth_rssi, -61, "signal of the association request")
+			assert_eq(p.auth_algo, "ft", "hostapd's auth-alg: ft marks Fast Roaming")
+			assert_eq(#at._roam_queue, 1, "queued for sending")
+			out = roams({authorized(130.0, IF, "ft")})
+			assert_eq(#out, 0, "a re-key is not a second arrival")
+		end
+	},
+	{
+		name = "assoctrack: no association without a signal or a known BSS",
+		fn = function()
+			reset()
+			assert_eq(#roams({authorized(100.22, IF, "sae")}), 0, "authorized with no assoc seen: no auth_rssi")
+			reset()
+			assert_eq(#roams({assoc(100.10, "phy9-ap0", -61), authorized(100.22, "phy9-ap0", "sae")}), 0,
+				"BSS without a vap_table entry")
+		end
+	},
+	{
+		name = "assoctrack: a disassociation is a sta_leave with avg_rssi, last_seen and why",
+		fn = function()
+			reset()
+			roams({assoc(100.10, IF, -61), authorized(100.22, IF, "sae")})
+			at._roam_queue = {}
+			at.observe({{mac = STA, ifname = IF, signal = -72, inactive_ms = 1500}}, 200)
+			local out = roams({disassoc(205.40, IF)})
+			assert_eq(#out, 1, "one leave")
+			local p = out[1]
+			assert_eq(p.event_type, "sta_leave", "event_type")
+			assert_eq(p.vap, VAP, "vap")
+			assert_eq(p.avg_rssi, -72, "the latest heartbeat's signal")
+			assert_eq(p.last_seen, 205, "whole seconds of uptime at the event")
+			assert_eq(p.assoc_status, 0, "nobody sent it away")
+			assert_eq(math.type and math.type(p.last_seen) or "integer", "integer", "an integer for getLong")
+			assert_nil(at._here[STA], "no longer here")
+			assert_eq(#roams({disassoc(206.0, IF)}), 0, "a second disassoc is not a second leave")
+		end
+	},
+	{
+		name = "assoctrack: a failed handshake is no departure",
+		fn = function()
+			reset()
+			assert_eq(#roams({assoc(100.10, IF, -61), disassoc(102.0, IF)}), 0, "never authorized")
+		end
+	},
+	{
+		name = "assoctrack: kicks set assoc_status bits: 16 Minimum RSSI, 8192 Roaming Assistant",
+		fn = function()
+			local o_time = at._time
+			local now = 5000
+			at._time = function() return now end
+			local ok, err = pcall(function()
+				reset()
+				roams({assoc(100.10, IF, -80), authorized(100.22, IF, "sae")})
+				at.note_kick(STA, at.KICK_MIN_RSSI)
+				local p = roams({disassoc(130.0, IF)})[1]
+				assert_eq(p.assoc_status, 16, "Minimum RSSI kick")
+				assert_nil(at._kicks[STA], "the ledger entry is spent")
+
+				reset()
+				roams({assoc(100.10, IF, -80), authorized(100.22, IF, "sae")})
+				at.note_kick(STA, at.KICK_ROAM_ASSIST)
+				now = now + 10
+				at.note_kick(string.upper(STA), at.KICK_MIN_RSSI)
+				p = roams({disassoc(130.0, IF)})[1]
+				assert_eq(p.assoc_status, 8208, "both, OR'd")
+
+				reset()
+				roams({assoc(100.10, IF, -80), authorized(100.22, IF, "sae")})
+				at.note_kick(STA, at.KICK_ROAM_ASSIST)
+				now = now + at.KICK_TTL + 1
+				p = roams({disassoc(130.0, IF)})[1]
+				assert_eq(p.assoc_status, 0, "a kick older than KICK_TTL explains nothing")
+			end)
+			at._time = o_time
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- Seen live 2026-10-14 (Pixel-9): the phone FT-roamed to the other AP
+		-- at 11:18:44; this AP's bridge learned it on its uplink in that
+		-- second, while hostapd here listed it until 11:18:50.
+		name = "assoctrack: the address moving to the uplink while associated is a sta_roam",
+		fn = function()
+			local o_time = at._time
+			at._time = function() return 5000 end
+			local ok, err = pcall(function()
+				reset()
+				roams({assoc(100.10, IF, -61), authorized(100.22, IF, "sae")})
+				at._roam_queue = {}
+				at.observe({{mac = STA, ifname = IF, signal = -74, inactive_ms = 300}}, 300)
+				at.note_kick(STA, at.KICK_ROAM_ASSIST)
+				local out = roams({fdb(304.66, "eth1"), fdb(304.66, "eth1")})
+				assert_eq(#out, 1, "one roam, though the vlan line repeats the move")
+				local p = out[1]
+				assert_eq(p.event_type, "sta_roam", "event_type")
+				assert_eq(p.vap, VAP, "the BSS it left")
+				assert_eq(p.avg_rssi, -74, "avg_rssi")
+				assert_eq(p.last_seen, 299, "last frame heard, from the heartbeat")
+				assert_eq(p.assoc_status, 8192, "Roaming Assistant's BTM request moved it")
+				assert_eq(#roams({disassoc(310.0, IF)}), 0, "hostapd's late drop is not reported again")
+				-- hostapd still lists it until then; the heartbeat must not take it back.
+				reset()
+				roams({assoc(100.10, IF, -61), authorized(100.22, IF, "sae")})
+				roams({fdb(304.66, "eth1")})
+				at.observe({{mac = STA, ifname = IF, signal = -90, inactive_ms = 4000}}, 306)
+				assert_nil(at._here[STA], "roamed: not here again")
+				at.observe({}, 316)
+				assert_nil(at._roamed[STA], "hostapd dropped it: mark gone")
+			end)
+			at._time = o_time
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "assoctrack: fdb moves within this AP, or before the BSS map is known, are not roams",
+		fn = function()
+			reset()
+			roams({assoc(100.10, IF, -61), authorized(100.22, IF, "sae")})
+			assert_eq(#roams({fdb(101.0, IF)}), 0, "learned on its own BSS")
+			assert_eq(#roams({fdb(102.0, IF2)}), 0, "moved to a sibling BSS of this AP")
+			assert_eq(#roams({fdb(103.0, "eth1")}, {}), 0, "no BSS map yet")
+			assert_true(at._here[STA] ~= nil, "still here after all three")
+			reset()
+			assert_eq(#roams({fdb(103.0, "eth1")}), 0, "a station that is not here")
+			reset()
+			roams({assoc(100.10, IF, -61)})
+			assert_eq(#roams({fdb(103.0, "eth1")}), 0, "associated, not authorized")
+		end
+	},
+	{
+		-- A band change on this AP: the association on the new BSS comes
+		-- first, the old BSS lets go after.
+		name = "assoctrack: leaving one BSS of this AP for another is no sta_leave",
+		fn = function()
+			reset()
+			roams({assoc(100.10, IF, -61), authorized(100.22, IF, "sae")})
+			local out = roams({assoc(200.0, IF2, -55), authorized(200.1, IF2, "ft"), disassoc(200.5, IF)})
+			assert_eq(#out, 1, "only the association")
+			assert_eq(out[1].event_type, "association", "association")
+			assert_eq(out[1].vap, VAP2, "on the new BSS")
+		end
+	},
+	{
+		name = "assoctrack: observe picks up stations associated before the collector saw them",
+		fn = function()
+			reset()
+			at.observe({{mac = string.upper(STA), ifname = IF, signal = -66, inactive_ms = 2000}}, 500)
+			local h = at._here[STA]
+			assert_true(h ~= nil, "known")
+			assert_eq(h.seen, 498, "last heard: uptime less inactive time")
+			local out = roams({disassoc(520.0, IF)})
+			assert_eq(#out, 1, "its departure is reported")
+			assert_eq(out[1].avg_rssi, -66, "with the heartbeat's signal")
+			at.observe({{mac = STA, ifname = IF, signal = -66}}, 600)
+			at.observe({}, 610)
+			assert_nil(at._here[STA], "gone from the dump: forgotten")
+		end
+	},
+	{
+		name = "assoctrack: a roamed station is away until hostapd drops it or it is heard here again",
+		fn = function()
+			reset()
+			roams({assoc(100.10, IF, -61), authorized(100.22, IF, "sae")})
+			roams({fdb(104.0, "eth1")})
+			assert_true(at.roamed_away(STA, 110, 6000), "silent since the move: away")
+			assert_true(at.roamed_away(string.upper(STA), 200, 96000), "case-insensitive, still away")
+			at.observe({{mac = STA, ifname = IF, signal = -60, inactive_ms = 96000}}, 200)
+			assert_nil(at._here[STA], "observe does not take it back")
+			assert_false(at.roamed_away(STA, 210, 500), "a frame 2.5 s after the move: it is here")
+			assert_nil(at._roamed[STA], "mark lifted")
+			assert_false(at.roamed_away("00:00:5e:00:53:09", 210, 0), "never roamed")
+			assert_false(at.roamed_away(nil, 210, 0), "no mac")
+		end
+	},
+	{
+		name = "assoctrack: roam queue is capped and requeues in order",
+		fn = function()
+			reset()
+			for i = 1, at.MAX_ROAMS + 3 do
+				at.requeue_roams({})
+				at._roam_queue[#at._roam_queue + 1] = {i = i}
+			end
+			at.requeue_roams({})
+			assert_eq(#at._roam_queue, at.MAX_ROAMS, "capped")
+			local first = at.take_roams(2)
+			assert_eq(first[1].i, 4, "oldest dropped first")
+			at.requeue_roams(first)
+			assert_eq(at._roam_queue[1].i, 4, "back at the front")
+			assert_eq(at._roam_queue[2].i, 5, "in order")
+		end
+	},
+	{
+		name = "assoctrack: teardown forgets the roam state",
+		fn = function()
+			local o = at._exec
+			at._exec = function() return 0 end
+			at._here, at._roamed, at._kicks, at._roam_queue = {x = {}}, {x = 1}, {x = {}}, {{}}
+			at.teardown()
+			at._exec = o
+			assert_nil(next(at._here), "here")
+			assert_nil(next(at._roamed), "roamed")
+			assert_nil(next(at._kicks), "kicks")
+			assert_eq(#at._roam_queue, 0, "queue")
 		end
 	},
 }

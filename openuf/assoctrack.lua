@@ -139,6 +139,7 @@ end
 function M.teardown()
 	M._exec("nft delete table " .. M.NFT_TABLE .. " >/dev/null 2>&1")
 	M._stas, M._queue = {}, {}
+	M._here, M._roamed, M._kicks, M._roam_queue = {}, {}, {}, {}
 end
 
 -- A new attempt starts from a clean slate: anything the sets hold for the
@@ -211,6 +212,9 @@ end
 
 -- Collector lines: "<uptime> { \"<event>\": {...} }". Only the four events
 -- this module consumes are parsed; probes are the bulk of the file.
+-- "<uptime> fdb <bridge monitor line>" lines come from the collector's fdb
+-- half (rrmscan.collector_script, opts.fdb) and become ev = "fdb" with the
+-- bridge port the address was learned on.
 local WANTED = {auth = true, assoc = true, ["sta-authorized"] = true, disassoc = true}
 
 function M.parse_events(blob)
@@ -218,7 +222,17 @@ function M.parse_events(blob)
 	if type(blob) ~= "string" then return out end
 	for line in blob:gmatch("[^\n]+") do
 		local t, ev, body = line:match('^(%d+%.?%d*)%s+{%s*"([%w%-]+)":%s*(%b{})')
-		if t and WANTED[ev] then
+		local ft, rest = line:match("^(%d+%.?%d*)%s+fdb%s+(.*)$")
+		if ft then
+			-- Only a learned entry on a bridge: "Deleted" ages out, "self"
+			-- is the switch's own table repeating the bridge's, "permanent"
+			-- is one of the AP's own addresses.
+			local mac, port = rest:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+dev%s+(%S+)")
+			if mac and rest:find(" master ", 1, true)
+				and not rest:find("permanent", 1, true) then
+				out[#out + 1] = {t = tonumber(ft), ev = "fdb", mac = mac:lower(), port = port}
+			end
+		elseif t and WANTED[ev] then
 			local mac = body:match('"address":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
 			if mac then
 				out[#out + 1] = {
@@ -416,6 +430,236 @@ end
 function M.requeue(list)
 	for i = #list, 1, -1 do table.insert(M._queue, 1, list[i]) end
 	while #M._queue > M.MAX_QUEUE do table.remove(M._queue, 1) end
+end
+
+--[[
+	Roam reports: Insights -> AirView -> Roaming.
+
+	The controller pairs a station's departure from one AP with its arrival
+	at another (devmgr's wifiRoamingDetector, PROTOCOL-VALIDATION.md "Roam
+	reports"), from three more STA_ASSOC_TRACKER event types:
+
+	  association -- the new AP, once the station is authorized: vap, mac,
+	      auth_rssi (dropped without it), auth_algo ("ft" = Fast Roaming).
+	  sta_leave   -- the old AP, on a disassociation: vap, mac, avg_rssi,
+	      last_seen (this AP's uptime), assoc_status (why it was sent away:
+	      16 Minimum RSSI, 8192 Roaming Assistant).
+	  sta_roam    -- the old AP, when the station turned up behind another AP
+	      while still associated here: a roam, whatever the gap.
+
+	The two halves must reach the controller within 10 s of each other, in
+	either order, and a leave more than a second ahead of the association
+	makes it a failed roam with that gap as its disconnect time. So these go
+	out as soon as they happen (inform.lua's _idle), not on the heartbeat.
+
+	How the old AP knows: a station that roams by 802.11r or by simply
+	associating elsewhere says nothing to the AP it leaves. hostapd keeps it
+	listed until its inactivity timer or missing ACKs drop it, 6-40 s later
+	on both boards -- too late. But the new AP's bridge announces the station
+	(hostapd's Layer 2 Update frame), and this AP's bridge then learns its
+	address on the uplink, in the same second: seen live (Pixel-9, FT roam,
+	2026-10-14) while hostapd here still listed it for 6 s more. That move,
+	from `bridge monitor fdb`, is the sta_roam.
+]]--
+
+-- The controller's assoc_status bits (devmgr AssocStatus).
+M.KICK_MIN_RSSI    = 16
+M.KICK_ROAM_ASSIST = 8192
+-- How long a kick explains the station's departure. Roaming Assistant's
+-- BTM request is followed by its own disassociation GRACE (10 s) later.
+M.KICK_TTL  = 60
+M.MAX_ROAMS = 32
+
+-- mac -> {ifname, rssi, seen, fresh}: who is associated here, from hostapd's
+-- events and every heartbeat's station dump (observe). seen = uptime of the
+-- last frame heard from it, as far as known; fresh = associated, not yet
+-- authorized.
+M._here     = {}
+-- mac -> uptime its address moved behind another AP; until it disassociates
+-- here, so that disassociation is not reported again as a leave, and so the
+-- heartbeat stops listing it (roamed_away).
+M._roamed   = {}
+-- mac -> {bits, at = os.time()}: openUF just sent it away, and why.
+M._kicks    = {}
+M._roam_queue = {}
+
+M._time = function() return os.time() end
+
+local function bor(a, b)
+	local r, bit = 0, 1
+	while a > 0 or b > 0 do
+		if a % 2 == 1 or b % 2 == 1 then r = r + bit end
+		a, b, bit = math.floor(a / 2), math.floor(b / 2), bit * 2
+	end
+	return r
+end
+
+-- Called by whoever deauths or steers a station, just before it does.
+function M.note_kick(mac, bits)
+	if type(mac) ~= "string" then return end
+	mac = mac:lower()
+	local now = M._time()
+	local k = M._kicks[mac]
+	if k and now - k.at <= M.KICK_TTL then
+		k.bits, k.at = bor(k.bits, bits), now
+	else
+		M._kicks[mac] = {bits = bits, at = now}
+	end
+end
+
+local function kick_bits(mac)
+	local k = M._kicks[mac]
+	if not k then return 0 end
+	M._kicks[mac] = nil
+	if M._time() - k.at > M.KICK_TTL then return 0 end
+	return k.bits
+end
+
+-- The heartbeat's station dump. stas: {mac, ifname, signal, inactive_ms};
+-- up: /proc/uptime when it was read. Fills in stations associated before the
+-- collector saw them, refreshes signal and last-heard, and forgets stations
+-- that left without an event. One already reported as roamed is not taken
+-- back: hostapd lists it until it times out.
+-- Has this station, which hostapd still lists, left for another AP? True from
+-- its sta_roam until hostapd drops it -- unless it is heard from here after
+-- the move (its return was missed, or the move was not one), which lifts the
+-- mark. up: uptime of the station dump; inactive_ms: the dump's inactive time.
+--
+-- The heartbeat leaves such a station out. Listed, it makes the controller
+-- see the client move back here and then away again once hostapd lets go,
+-- and 10.6's roam fallback writes that second move as a tag-less roam of its
+-- own when no report confirms it within 15 s (seen live: a duplicate 36 s
+-- after the real roam).
+function M.roamed_away(mac, up, inactive_ms)
+	if type(mac) ~= "string" then return false end
+	mac = mac:lower()
+	local r = M._roamed[mac]
+	if not r then return false end
+	if up and up - (tonumber(inactive_ms) or 0) / 1000 > r + 1 then
+		M._roamed[mac] = nil
+		return false
+	end
+	return true
+end
+
+function M.observe(stas, up)
+	local here, listed = {}, {}
+	for _, s in ipairs(stas or {}) do
+		local mac = type(s.mac) == "string" and s.mac:lower()
+		if mac then listed[mac] = true end
+		local r = mac and M.roamed_away(mac, up, s.inactive_ms)
+		if mac and s.ifname and not r then
+			local h = M._here[mac] or {}
+			h.ifname = s.ifname
+			h.rssi   = tonumber(s.signal) or h.rssi
+			if up then h.seen = up - (tonumber(s.inactive_ms) or 0) / 1000 end
+			here[mac] = h
+		end
+	end
+	M._here = here
+	for mac in pairs(M._roamed) do
+		if not listed[mac] then M._roamed[mac] = nil end
+	end
+	local now = M._time()
+	for mac, k in pairs(M._kicks) do
+		if now - k.at > M.KICK_TTL then M._kicks[mac] = nil end
+	end
+end
+
+local function queue_roam(p)
+	M._roam_queue[#M._roam_queue + 1] = p
+	while #M._roam_queue > M.MAX_ROAMS do table.remove(M._roam_queue, 1) end
+end
+
+local function leave_payload(event_type, mac, h, vap, last_seen)
+	return {
+		message_type = "STA_ASSOC_TRACKER",
+		event_type   = event_type,
+		mac          = mac,
+		vap          = vap,
+		avg_rssi     = h.rssi,
+		-- Whole seconds of this AP's uptime: the controller subtracts it from
+		-- the uptime of this AP's last inform.
+		last_seen    = math.floor(last_seen or 0),
+		assoc_status = kick_bits(mac),
+	}
+end
+
+-- Turn hostapd and fdb events into roam reports. vap_by_ifname maps a BSS
+-- netdev to its vap_table name; a station on a BSS without one is not
+-- reported (the controller resolves everything from the vap). Returns the
+-- payloads queued.
+function M.roam_ingest(events, vap_by_ifname)
+	vap_by_ifname = vap_by_ifname or {}
+	local out = {}
+	local function emit(p) out[#out + 1] = p; queue_roam(p) end
+	for _, e in ipairs(events or {}) do
+		local h = M._here[e.mac]
+		if e.ev == "assoc" then
+			M._roamed[e.mac] = nil
+			M._here[e.mac] = {ifname = e.ifname, rssi = e.signal, seen = e.t, fresh = true}
+		elseif e.ev == "sta-authorized" then
+			-- Reported once authorized, so a failed handshake is no arrival and
+			-- auth_algo is known. No signal seen means no auth_rssi, and the
+			-- controller drops an association without one.
+			if h and h.fresh and h.ifname == e.ifname then
+				h.fresh = nil
+				local vap = vap_by_ifname[e.ifname]
+				if vap and h.rssi then
+					emit({
+						message_type = "STA_ASSOC_TRACKER",
+						event_type   = "association",
+						mac          = e.mac,
+						vap          = vap,
+						auth_rssi    = h.rssi,
+						auth_algo    = e.alg,
+					})
+				end
+			end
+		elseif e.ev == "disassoc" then
+			-- A roamed station left _here when its address moved: hostapd's
+			-- late drop of it is not reported again.
+			M._roamed[e.mac] = nil
+			if h and (e.ifname == nil or h.ifname == e.ifname) then
+				M._here[e.mac] = nil
+				local vap = vap_by_ifname[h.ifname]
+				-- Never authorized: a failed attempt, not a departure (the
+				-- connection funnel reports it).
+				if vap and h.rssi and not h.fresh then
+					emit(leave_payload("sta_leave", e.mac, h, vap, e.t))
+				end
+			end
+			-- Otherwise the station is already on another BSS of this AP (it
+			-- associated there first): a band change, not a departure.
+		elseif e.ev == "fdb" then
+			-- Learned on a port that is none of this AP's BSSes while hostapd
+			-- still has it: it is behind another AP now. Judged only once the
+			-- BSS map is known, or a move to a sibling BSS would look foreign.
+			local vap = h and not h.fresh and vap_by_ifname[h.ifname]
+			if vap and e.port ~= h.ifname and not vap_by_ifname[e.port] then
+				M._here[e.mac] = nil
+				M._roamed[e.mac] = e.t
+				if h.rssi then
+					emit(leave_payload("sta_roam", e.mac, h, vap, h.seen or e.t))
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- Up to n queued roam reports, oldest first, removed from the queue.
+function M.take_roams(n)
+	local out = {}
+	while #out < n and #M._roam_queue > 0 do
+		out[#out + 1] = table.remove(M._roam_queue, 1)
+	end
+	return out
+end
+
+function M.requeue_roams(list)
+	for i = #list, 1, -1 do table.insert(M._roam_queue, 1, list[i]) end
+	while #M._roam_queue > M.MAX_ROAMS do table.remove(M._roam_queue, 1) end
 end
 
 return M

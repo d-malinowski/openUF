@@ -5370,6 +5370,131 @@ return {
 		end
 	},
 	{
+		-- A roam report spoils with delay; a funnel event does not. Roams go
+		-- first, and a failed roam POST stops the funnel too (the controller
+		-- is not answering).
+		name = "inform: roam reports are sent before funnel notifs",
+		fn = function()
+			local at = inform._assoctrack
+			local o_post, o_build = inform.http_post, inform.build_packet
+			local o_queue, o_roams, o_ident = at._queue, at._roam_queue, inform._notif_identity
+			local sent, fail_on = {}, nil
+			inform.build_packet = function(json) return json end
+			inform.http_post = function(_, pkt)
+				local p = cjson.decode(pkt).notif_payload
+				if p.n == fail_on then return nil, "timeout" end
+				sent[#sent + 1] = p.n
+				return "noop"
+			end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20"}
+			local ok, err = pcall(function()
+				at._queue = {{n = "f1"}}
+				at._roam_queue = {{n = "r1"}, {n = "r2"}}
+				assert_eq(inform._send_notifs({adopted = true, inform_url = "u"}), 3, "all three")
+				assert_eq(table.concat(sent, ","), "r1,r2,f1", "roams first")
+				sent, fail_on = {}, "r2"
+				at._queue = {{n = "f1"}}
+				at._roam_queue = {{n = "r1"}, {n = "r2"}}
+				assert_eq(inform._send_notifs({adopted = true, inform_url = "u"}), 1, "stopped at the failure")
+				assert_eq(#at._roam_queue, 1, "the failed roam kept")
+				assert_eq(at._roam_queue[1].n, "r2", "the failed roam kept")
+				assert_eq(#at._queue, 1, "the funnel event not tried")
+			end)
+			inform.http_post, inform.build_packet = o_post, o_build
+			at._queue, at._roam_queue, inform._notif_identity = o_queue, o_roams, o_ident
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: _idle looks at the collector every ROAM_POLL_S while roam reports are on",
+		fn = function()
+			local t = 0
+			local selects = {}
+			local sock = {
+				gettime = function() return t end,
+				select = function(r, _, timeout)
+					selects[#selects + 1] = timeout
+					t = t + timeout
+					return {}
+				end,
+			}
+			local o_poll, polls = inform._roam_poll, 0
+			inform._roam_poll = function() polls = polls + 1 end
+			inform._guest_server, inform._stun_c = nil, nil
+			inform._roam_fast = true
+			local ok, err = pcall(inform._idle, sock, 1)
+			inform._roam_fast = false
+			inform._roam_poll = o_poll
+			if not ok then error(err, 0) end
+			assert_eq(#selects, 4, "1 s in 0.25 s steps")
+			assert_eq(selects[1], inform.ROAM_POLL_S, "step")
+			assert_eq(polls, 4, "a look after each")
+			assert_eq(t, 1, "and still returns at the deadline")
+		end
+	},
+	{
+		-- Between heartbeats _idle drains the collector's file itself: the
+		-- roam report goes out at once, the funnel's notif waits for the
+		-- heartbeat, and the drained lines are kept for the beacon-report
+		-- harvest the heartbeat still runs.
+		name = "inform: _roam_poll sends roam reports at once and keeps the lines for the harvest",
+		fn = function()
+			local at = inform._assoctrack
+			local STA = "00:00:5e:00:53:01"
+			local file = os.tmpname()
+			local lines = table.concat({
+				'100.10 { "assoc": {"address":"' .. STA .. '","ifname":"phy1-ap0","signal":-61} }',
+				'100.22 { "sta-authorized": {"address":"' .. STA .. '","ifname":"phy1-ap0","auth-alg":"ft"} }',
+				'100.30 { "beacon-report": {"address":"' .. STA .. '"} }',
+			}, "\n") .. "\n"
+			local f = io.open(file, "w"); f:write(lines); f:close()
+			local o = {rrm = inform._rrmscan, post = inform.http_post, build = inform.build_packet,
+				ident = inform._notif_identity, map = inform._vap_by_ifname}
+			local posts = {}
+			inform._rrmscan = {EVENT_FILE = file, drain = function()
+				local h = io.open(file, "r"); local b = h:read("*a"); h:close()
+				h = io.open(file, "w"); h:close()
+				return b
+			end}
+			inform.build_packet = function(json) return json end
+			inform.http_post = function(_, pkt) posts[#posts + 1] = cjson.decode(pkt).notif_payload; return "noop" end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20"}
+			inform._vap_by_ifname = {["phy1-ap0"] = "openuf_radio1_home"}
+			inform._roam_st = {adopted = true, inform_url = "u"}
+			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
+			inform._pre_blob = nil
+			local ok, err = pcall(function()
+				inform._roam_poll()
+				assert_eq(#posts, 1, "one POST")
+				assert_eq(posts[1].event_type, "association", "the roam report")
+				assert_eq(posts[1].auth_algo, "ft", "auth_algo")
+				assert_true(at._stas[STA] ~= nil, "the funnel's attempt is open, for the heartbeat")
+				assert_eq(inform._pre_blob, lines, "lines kept for the harvest")
+				inform._roam_poll()
+				assert_eq(#posts, 1, "an empty file costs nothing more")
+			end)
+			-- The heartbeat folds those lines into what harvest sees.
+			local harvested
+			inform._rrmscan = {drain = function() return "200.0 tail\n" end,
+				harvest = function(b) harvested = b; return {}, {} end,
+				collector_ensure = function() end}
+			local o_time = inform._time
+			inform._time = function() return 1 end
+			inform._rrm_collector_next = 10
+			local ok2, err2 = pcall(inform._rrm_tick, {config = {rrm_enrichment = true}}, {notif_assoc_stat = true})
+			inform._time = o_time
+			inform._rrm_collector_next = 0
+			os.remove(file)
+			inform._rrmscan, inform.http_post, inform.build_packet = o.rrm, o.post, o.build
+			inform._notif_identity, inform._vap_by_ifname = o.ident, o.map
+			inform._roam_st, inform._roam_fast, inform._pre_blob = nil, false, nil
+			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
+			if not ok then error(err, 0) end
+			if not ok2 then error(err2, 0) end
+			assert_eq(harvested, lines .. "200.0 tail\n", "pre-drained lines first, then the heartbeat's own")
+		end
+	},
+	{
 		name = "inform: nothing is sent before adoption",
 		fn = function()
 			local at = inform._assoctrack

@@ -1124,8 +1124,9 @@ together):
     `wpa_auth_failures`, `radius_auth_status` (`success`/`failure`), `ip_failures`
     (DHCP_TIMEOUT), `traffic_failures`, `dns_resp_seen` (`yes`/`no`/`N/A`) and
     `dns_timeouts`.
-  - `eirJvdtm` (roam detection) consumes `association`, `sta_roam` and `sta_leave`. openUF
-    does not send those, because roaming already works from `sta_table`.
+  - `eirJvdtm` (roam detection) consumes `association`, `sta_roam` and `sta_leave`. See
+    [Roam reports](#roam-reports-association--sta_leave--sta_roam) below: openUF sends them
+    since 2026-10-14.
 
 **Lab, 10.4.57, 2026-10-09.** All three were sent from the AP container with openUF's own
 `build_packet`/`http_post`:
@@ -1175,6 +1176,120 @@ visible to hostapd, so the DHCP/DNS evidence comes from nft (see USAGE.md).
   nft 1.1.6 on 6.12.94 and accepted the full table in a dry run (`nft -c`).
 - A bare `nft -f` of a table body appends a second copy of every rule.
   `table X` / `delete table X` / `table X { … }` in one file is idempotent.
+
+### Roam reports (`association` / `sta_leave` / `sta_roam`)
+
+**Symptom.** Insights → AirView → Roaming on the real UCG Ultra (2026-10-14) listed 69 events,
+every one "Roaming / Success", with no failed roam and no Fast Roaming, Roaming Assistant or
+Minimum RSSI tag. The activity was real; the detail was never sent.
+
+**Decompile** (CFR, 10.4.57 and 10.6.106 `internal-dependencies.jar`; same logic, class names
+differ). `WIFI_ROAMING` documents in `unifi_stat.wifi_connectivity_event` come from
+`wifi/connectivity/c/AcrQJeJCScLn` (bean `wifiRoamingService`) by two paths:
+
+1. **sta_table path.** A client's `ap_mac` changing between two heartbeats. It runs only when
+   either AP lacks `supportsRoamTopologyStats()` = `hasWifiCapability2(8192)` (`wifi_caps2`
+   `0x2000`). It always writes `successful=true`. Its tags come only from the cache path 2
+   fills when an association carries no RSSI, so they were always null for openUF. **All 69
+   events came from here.**
+2. **Tracker path** (`devmgr/w/a/eirJvdtm`, bean `wifiRoamingDetector`). It runs on
+   `STA_ASSOC_TRACKER` notifs, keeps the last event per (site, client) in a Caffeine cache for
+   **10 s**, and pairs a departure from one AP with an arrival at another, in either order:
+   - `sta_leave` (handler `QnvUxbsXyAJZ`/`gyWdIcvdh`): reads `vap`, `mac`, `avg_rssi`
+     (`getInt`, required), `assoc_status` and `last_seen`. It also tells `staManager` the
+     client left: when the client is still filed under this AP and BSSID, it is disconnected
+     there at `receive_time - (last_inform_uptime - last_seen)`.
+   - `sta_roam`: the same fields; processed **only if the sender claims `0x2000`**.
+   - `association`: `vap`, `mac`, `auth_rssi` (dropped without it), `auth_algo`.
+   - `fast_roaming` = `auth_algo == "ft"`. `assoc_status` bits (enum `VVyiC`): `16`
+     KICKED_DUE_TO_MIN_RSSI, `8192` MOVED_DUE_TO_ROAMING_ASSISTANT.
+   - `successful` = the departure was `sta_roam`, OR arrival minus departure ≤ 1000 ms. Both
+     times are the controller's **receive time in whole seconds**; a departure that arrives
+     after the arrival is a negative gap, so a success. Otherwise a failed roam with
+     `disconnect_duration` = the gap.
+   - Both ends must resolve `vap` against the sender's `vap_table` and share a `wlanconf_id`,
+     and the two APs must differ.
+   - Without `0x2000` the funnel handler (`lhuvxd`) also feeds every funnel `success` into
+     the tracker as an arrival.
+
+`0x2000` has exactly these three callers in 10.6.106 (sta_table path, `sta_roam` gate,
+funnel feed). Claiming it without sending the reports would make roams vanish; sending the
+reports without it would record every roam twice. openUF does both or neither
+(`assoc_tracker`).
+
+**Reference firmware.** BZ2 4.0.15 (plaintext) has only the old success/failure tracker; the
+three event types are newer than any readable build. It does show how a UniFi AP knows a
+station left: its hostapd broadcasts an `iapp_key`-wrapped RRB frame on each association, and
+the old AP drops the station (see [802.11r key holders](#80211r-key-holders-iapp_key)).
+OpenWrt has no such message.
+
+**How openUF's old AP knows (hardware, 2026-10-14).** A station that roams by FT or simply
+associates elsewhere says nothing to the AP it leaves. hostapd keeps it listed until its
+inactivity timer or missing ACKs drop it, **6–40 s later** on both boards (Pixel-9 several
+times, a Mac in normal use), which is outside the 10 s window. But the old AP's bridge
+learns the station's address on its uplink when the new AP's hostapd announces it:
+
+| Time | Event |
+|---|---|
+| 11:18:44 | Office (AX3000T) `AP-STA-CONNECTED … auth_alg=ft`; its fdb learns the STA on `phy0-ap0` at .660 |
+| 11:18:44 | Living room (Archer C5) `bridge monitor fdb`: STA `dev eth1 master br-lan`, **while hostapd there still lists it** |
+| 11:18:50 | Living room hostapd: "disconnected due to excessive missing ACKs" |
+
+`bridge monitor fdb` piped through a shell `read` loop delivers each line within 10 ms on
+both boards (a static test entry added and removed). The Archer C5's own timestamps are
+garbage (`-16843009 usec`), so the collector stamps lines with `/proc/uptime`. DSA repeats
+each entry as `self`, and a VLAN-aware bridge repeats it with `vlan 1`.
+
+**openUF** (`assoctrack.lua`, 2026-10-14):
+- `association` once hostapd reports `sta-authorized`, with the `assoc` notification's
+  `signal` as `auth_rssi` and `auth-alg` as `auth_algo`. A failed handshake is no arrival.
+- `sta_leave` on hostapd's `disassoc`, with the heartbeat's signal as `avg_rssi`, the event's
+  uptime as `last_seen`, and `assoc_status` from a 60 s ledger that Minimum RSSI (16) and
+  Roaming Assistant (8192, at the BTM request and at the disassociation) write before they
+  act. Not sent for a station that moved to another BSS of the same AP.
+- `sta_roam` when the station's address is learned on a port that is not one of this AP's
+  BSSes while hostapd still lists it; hostapd's later drop is not reported again.
+- The inform loop wakes every 250 ms to read the collector's file and sends a roam report at
+  once; the heartbeat's 10 s would put a departure up to 10 s ahead of its arrival. The poll
+  itself costs 3 CPU ticks per 30 s on the Archer C5.
+
+**Lab, 10.6.106, both AP containers claiming `0x2060`**, lines appended to each daemon's
+collector file (so through the real fast path):
+
+| Sent | Stored |
+|---|---|
+| old AP: fdb move to `eth0`; new AP: `assoc` + `sta-authorized` `ft` | Success, `fast_roaming: true` |
+| old AP: `disassoc`; new AP 3.2 s later: `assoc` + `sta-authorized` `sae` | Failed, `disconnect_duration: 3000` |
+
+An earlier lab run with hand-made payloads and no `0x2000` showed the tags: `assoc_status
+8192` → `triggered_by_roaming_assistant: true`, `16` → `triggered_by_minimal_rssi: true`.
+
+**Live, real UCG Ultra, 2026-10-14**, both APs reporting `wifi_caps2` `0x2060`:
+- Pixel-9 banned 20 s on both Office radios at 11:39:47, reconnected (SAE) to the living room
+  at 11:39:51: listed as **Failed Roaming, Office AP → Living room AP**.
+- The same phone's band change within Office (FT, 11:39:15): no roam listed, as on a UniFi AP.
+- The silent departure: a BTM request from Office (accepted, status 0) moved the Pixel to the
+  living room at 11:46:57 (SAE). Office's hostapd kept listing it until its inactivity drop at
+  11:47:13, outside the 10 s window, so only Office's fdb-triggered `sta_roam` can have paired:
+  listed as **Roaming, Office AP → Living room AP, Success, 11:46:57**.
+- Unprompted, 12:18:49: the Pixel FT-roamed from the living room to Office; the living room
+  dropped it 13 s later. Stored `SUCCESS_ROAMING`, `fast_roaming: true`.
+- Unprompted, 12:21:39: openUF's Roaming Assistant on Office steered the Pixel to the living
+  room. Stored `fast_roaming: true`, `triggered_by_roaming_assistant: true`.
+- ⚠️ Not yet seen live: the Minimum RSSI tag (unit tests plus the lab's hand-made payloads).
+
+**10.6's roam fallback (not in 10.4.57).** One live record had no tags and a millisecond
+timestamp: 11:47:33, a second copy of the 11:46:57 roam. 10.6.106 adds
+`wifi/connectivity/c/rGUtaVWZlySeOK` ("Roam incident fallback"): every client move it infers
+from heartbeats is held for 15 s (the tracker's 10 s + 5) keyed on (site, client, new AP), and
+one the tracker did not confirm in that time is re-emitted as `rFCHnXVpfjjP`, which writes a
+sta_table-path roam **with no `0x2000` check**. Here the Office AP's heartbeat still listed the
+Pixel until hostapd dropped it at 11:47:13, so the controller saw it move back to Office and
+away again, and nothing confirmed the second move. openUF now leaves a station out of its
+heartbeat from its `sta_roam` until hostapd drops it, unless the station is heard from on this
+AP after the move (`assoctrack.roamed_away`). Unit-tested; the live roams after the fix
+(12:25:34, FT) produced no copy, but the old AP dropped the station within 5 s there, so the
+long-listing case has not recurred on hardware yet.
 
 ---
 
@@ -2778,7 +2893,9 @@ Gated, and not to be claimed:
 - **No callers in the controller**, so a bit does nothing: `supportMinRateCtrl` (`wifi_caps`
   `0x200`), `supportMultiAclList` (`0x400`), `supportRadiusMacAuth` (`0x1000`),
   `supportHideChWidth` (`0x10000`), `supportZeroHandoff` (`0x2`), `supportLockAp`
-  (`0x1000000`), `supportsRoamTopologyStats` (`wifi_caps2` `0x2000`).
+  (`0x1000000`). `supportsRoamTopologyStats` (`wifi_caps2` `0x2000`) was listed here by
+  mistake. It has three callers and is claimed while roam reports are sent, see
+  [Roam reports](#roam-reports-association--sta_leave--sta_roam).
 
 **The per-port VLAN validator** (`com.ubnt.ace.api.e.VVyiC`, reachable only once
 `hasQCASwitch()` is true):

@@ -1339,8 +1339,36 @@ return {
 				assert_eq(#kicked, 1, "30 s below: exactly one station kicked")
 				assert_eq(kicked[1].mac, "11:22:33:44:55:66", "the -75 dBm station (below -70 threshold) is kicked")
 				assert_eq(kicked[1].ifname, "wlan0", "kicked on the resolved live ifname")
+				local k = inform._assoctrack._kicks["11:22:33:44:55:66"]
+				assert_true(k ~= nil and k.bits == 16, "its departure will carry assoc_status 16 (Minimum RSSI)")
+				assert_nil(inform._assoctrack._kicks["aa:bb:cc:dd:ee:ff"], "not the station left alone")
 			end)
 			inform._time = orig_time
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- A station reported as roamed away (sta_roam) is left out of the
+		-- heartbeat while hostapd still lists it: listed, the controller sees
+		-- it move back and away again, and 10.6 writes that as a second,
+		-- tag-less roam (seen live, 2026-10-14).
+		name = "inform json: a station that roamed away is not reported while hostapd still lists it",
+		fn = function()
+			local at = inform._assoctrack
+			local o_roamed = at._roamed
+			local ok, err = pcall(function()
+				-- Marked later than any frame the fixture reports: not heard since.
+				at._roamed = {["11:22:33:44:55:66"] = 1e12}
+				local d = build({with_clients = true, with_uci = true})
+				local macs = {}
+				for _, v in ipairs(d.vap_table) do
+					for _, sta in ipairs(v.sta_table or {}) do macs[sta.mac] = true end
+				end
+				assert_nil(macs["11:22:33:44:55:66"], "the roamed station is left out")
+				assert_true(macs["aa:bb:cc:dd:ee:ff"], "the other one is reported")
+				assert_true(at._roamed["11:22:33:44:55:66"] ~= nil, "still marked: hostapd still lists it")
+			end)
+			at._roamed = o_roamed
 			if not ok then error(err, 0) end
 		end
 	},
@@ -2173,6 +2201,22 @@ return {
 			-- PROTOCOL-VALIDATION.md for the ones this device does not implement).
 			local d = build()
 			assert_eq(d.wifi_caps2, 0x60, "wifi_caps2 is exactly 0x40|0x20")
+		end
+	},
+	{
+		-- supportsRoamTopologyStats() is hasWifiCapability2(8192) (10.6.106).
+		-- With it the controller takes roams only from this AP's roam reports,
+		-- so it is claimed exactly while those are sent: when the controller
+		-- asked for connection notifs and conf.lua has not vetoed them.
+		name = "inform json: wifi_caps2 adds 0x2000 only while roam reports are sent",
+		fn = function()
+			assert_eq(build().wifi_caps2, 0x60, "not asked: no claim")
+			assert_eq(build({st = {notif_assoc_stat = true}}).wifi_caps2, 0x2060, "asked: claimed")
+			inject_sysinfo()
+			local st = {authkey = state.DEFAULT_KEY, inform_url = "http://10.0.0.1:8080/inform",
+				mac = "aa:bb:cc:dd:ee:ff", notif_assoc_stat = true}
+			local d = cjson.decode(inform.build_json(st, {config = {assoc_tracker = false}}, ufhw))
+			assert_eq(d.wifi_caps2, 0x60, "assoc_tracker = false: no claim")
 		end
 	},
 	{

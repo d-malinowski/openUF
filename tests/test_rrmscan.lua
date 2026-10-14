@@ -590,6 +590,62 @@ return {
 		end
 	},
 	{
+		-- Roam reports (assoctrack.lua): the old AP learns that a station
+		-- left from its bridge, which moves the address to the uplink in the
+		-- same second. The fdb half runs beside the subscriber, in the
+		-- background, and writes lines assoctrack.parse_events reads.
+		name = "rrmscan: opts.fdb adds a bridge monitor to the collector, stamped like the rest",
+		fn = function()
+			local plain = rrmscan.collector_script({on_auth = "true"})
+			assert_false(plain:find("bridge", 1, true) ~= nil, "no fdb half unless asked")
+			local s = rrmscan.collector_script({on_auth = "true", fdb = true})
+			local b = s:find("bridge monitor fdb", 1, true)
+			local u = s:find('ubus subscribe "$@"', 1, true)
+			assert_true(b ~= nil and u ~= nil and b < u, "the monitor is started before the subscriber")
+			assert_true(s:find("done &\n", b, true) ~= nil, "in the background: the subscriber keeps the foreground")
+			assert_true(s:find("Deleted*|*' self'*) continue", 1, true) ~= nil,
+				"ageing and the switch's own entries are dropped in the shell")
+			assert_true(s:find("printf '%s fdb %s\\n'", 1, true) ~= nil, "uptime, then 'fdb', then the line")
+			assert_true(s:find("on_auth", 1, true) == nil and s:find("true ;;", 1, true) ~= nil,
+				"the auth hook is still there")
+		end
+	},
+	{
+		-- A wifi reload kills the subscriber, never the monitor: each restart
+		-- would otherwise leave one more `bridge monitor` behind.
+		name = "rrmscan: the fdb half is killed before every start and on stop",
+		fn = function()
+			local orig_script = rrmscan.COLLECTOR_SCRIPT
+			rrmscan.COLLECTOR_SCRIPT = os.tmpname()
+			local ok, err = pcall(function()
+				with_popen(function(cmd)
+					if cmd:find("pgrep", 1, true) then return "" end
+					if cmd:find("ubus list", 1, true) then return "hostapd.phy0-ap0\n" end
+					return ""
+				end, function()
+					with_exec(function(cmds)
+						assert_true(rrmscan.collector_ensure({fdb = true}), "started")
+						local kill_at, start_at
+						for i, c in ipairs(cmds) do
+							if c:find("[b]ridge monitor fdb", 1, true) and c:find("kill", 1, true) then kill_at = kill_at or i end
+							if c:find("sh " .. rrmscan.COLLECTOR_SCRIPT, 1, true) then start_at = i end
+						end
+						assert_true(kill_at ~= nil and start_at ~= nil and kill_at < start_at,
+							"a leftover monitor is killed before the new collector starts")
+					end)
+				end)
+			end)
+			os.remove(rrmscan.COLLECTOR_SCRIPT)
+			rrmscan.COLLECTOR_SCRIPT = orig_script
+			if not ok then error(err, 0) end
+			with_exec(function(cmds)
+				rrmscan.collector_stop()
+				assert_true(table.concat(cmds, "\n"):find("kill $(pgrep -f '[b]ridge monitor fdb')", 1, true) ~= nil,
+					"collector_stop kills it too")
+			end)
+		end
+	},
+	{
 		name = "rrmscan: harvest takes a blob drained once for several consumers",
 		fn = function()
 			local blob = read_fixture("ubus_beacon_report.txt")

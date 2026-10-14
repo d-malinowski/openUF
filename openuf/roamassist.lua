@@ -171,9 +171,14 @@ end
 
 -- One pass. observations: one per associated station on a vap with Roaming
 -- Assistant on: {ifname, ssid, mac, signal, connected_sec, threshold}.
--- opts.diff_db overrides DEFAULT_DIFF_DB. Returns the number of actions.
+-- opts.diff_db overrides DEFAULT_DIFF_DB. opts.on_steer(mac), when given, is
+-- called just before each BTM request and disassociation (assoctrack's kick
+-- ledger: the departure that follows is reported as Roaming Assistant's).
+-- Returns the number of actions.
 function M.tick(observations, now, opts)
 	local diff_db = tonumber(opts and opts.diff_db) or M.DEFAULT_DIFF_DB
+	local on_steer = opts and opts.on_steer
+	local function steered(mac) if on_steer then pcall(on_steer, mac) end end
 	local actions = 0
 	local nodes = nil  -- fetched lazily: most heartbeats need no ubus at all
 
@@ -192,6 +197,7 @@ function M.tick(observations, now, opts)
 			-- same BSS after GRACE: disassociate with the short ban.
 			if cs.pending.ifname == o.ifname and now - cs.pending.at >= M.GRACE then
 				if safe(o.ifname, o.mac) then
+					steered(o.mac)
 					disassociate(o.ifname, o.mac)
 					M._log(string.format("%s still on %s after BSS transition "
 						.. "request; disassociated (ban %d s)", o.mac, o.ifname,
@@ -227,6 +233,7 @@ function M.tick(observations, now, opts)
 				local cand = info and type(info.nodes) == "table"
 					and M.find_candidate(o, info.nodes, nodes, diff_db)
 				if cand and safe(o.ifname, o.mac, cand.nr) then
+					steered(o.mac)
 					btm_request(o.ifname, o.mac, cand.nr)
 					M._log(string.format("%s at %d dBm on %s (threshold %d); "
 						.. "BSS transition request to %s (%s, %d dBm)",

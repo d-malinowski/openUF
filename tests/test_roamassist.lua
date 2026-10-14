@@ -91,6 +91,32 @@ return {
 		end
 	},
 	{
+		-- assoctrack's kick ledger: the departure that follows a BTM request
+		-- or the disassociation is reported as Roaming Assistant's (8192), so
+		-- the hook has to have run before the command that causes it.
+		name = "roamassist: on_steer hears of the BTM request and the disassociation first",
+		fn = function()
+			with_ra(sticky(), function(cmds)
+				local seen = {}
+				local opts = {on_steer = function(mac) seen[#seen + 1] = mac .. "@" .. #cmds end}
+				local o = obs()
+				ra.tick({o}, 1000, opts)
+				ra.tick({o}, 1000 + ra.BELOW_HOLD, opts)
+				assert_eq(#seen, 1, "the BTM request")
+				assert_eq(seen[1], MAC .. "@0", "before its command")
+				ra.tick({o}, 1000 + ra.BELOW_HOLD + ra.GRACE, opts)
+				assert_eq(#seen, 2, "then the disassociation")
+				assert_eq(seen[2], MAC .. "@1", "before its command too")
+				assert_true(has(cmds, "del_client"), "which did happen")
+			end)
+			with_ra(sticky(), function()
+				ra.tick({obs()}, 1000, {on_steer = function() error("boom") end})
+				assert_eq(ra.tick({obs()}, 1000 + ra.BELOW_HOLD,
+					{on_steer = function() error("boom") end}), 1, "a failing hook stops nothing")
+			end)
+		end
+	},
+	{
 		name = "roamassist: a far client with no better AP is never touched",
 		fn = function()
 			local clients = {[FAR] = {

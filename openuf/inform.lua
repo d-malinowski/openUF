@@ -161,6 +161,17 @@ M._assoc_installed   = false
 -- Notif informs are one POST each. A burst of reconnects (an AP restart roams
 -- everybody back) is drained over a few cycles instead of in one.
 M.NOTIFS_PER_CYCLE   = 8
+-- Roam reports (assoctrack.lua) cannot wait for the heartbeat: the controller
+-- pairs a departure with an arrival only within 10 s, and calls the roam
+-- failed when the departure arrived more than a second ahead. While
+-- connection tracking is on, _idle wakes this often to read the collector's
+-- file and sends any roam report at once. _roam_fast and _roam_st are set by
+-- each _tick; _pre_blob holds what _idle drained, for the heartbeat's
+-- beacon-report harvest.
+M.ROAM_POLL_S        = 0.25
+M._roam_fast         = false
+M._roam_st           = nil
+M._pre_blob          = nil
 
 -- Matches rrmscan.merge_into's own cutoff, which exists because the
 -- controller's rogue-AP ingestion silently drops any entry with age >= 30.
@@ -1182,6 +1193,9 @@ function M.build_json(st, cfg, ufhw)
 		local minrssi_obs = {}
 		-- Load balance: every station on a radio that has it on.
 		local lb_obs = {}
+		-- Every station, for the roam reports' view of who is here
+		-- (assoctrack.observe).
+		local here_obs = {}
 		-- WiFi Speed Limit: what each netdev lists and its WLAN's limits,
 		-- for _shaper_resync after this inform is built.
 		local shape_obs = {complete = true, by_ifname = {}, where = {}, conn = {}}
@@ -1244,13 +1258,21 @@ function M.build_json(st, cfg, ufhw)
 					local so = {down = vap.ratelimit_down, up = vap.ratelimit_up, macs = {}}
 					shape_obs.by_ifname[ifname] = so
 					for _, sta in ipairs(rv2) do
-						stas[#stas + 1] = sta
-						sta_ifname[#stas] = bss
-						if type(sta.mac) == "string" then
-							local m = sta.mac:lower()
-							so.macs[#so.macs + 1] = m
-							shape_obs.where[m] = ifname
-							shape_obs.conn[m] = tonumber(sta.connected_sec)
+						here_obs[#here_obs + 1] = {mac = sta.mac, ifname = bss,
+							signal = sta.signal_avg or sta.signal, inactive_ms = sta.inactive_ms}
+						-- Behind another AP since its sta_roam; hostapd just
+						-- has not noticed yet (assoctrack.roamed_away).
+						local gone = M._assoctrack
+							and M._assoctrack.roamed_away(sta.mac, uptime, sta.inactive_ms)
+						if not gone then
+							stas[#stas + 1] = sta
+							sta_ifname[#stas] = bss
+							if type(sta.mac) == "string" then
+								local m = sta.mac:lower()
+								so.macs[#so.macs + 1] = m
+								shape_obs.where[m] = ifname
+								shape_obs.conn[m] = tonumber(sta.connected_sec)
+							end
 						end
 					end
 				else
@@ -1570,6 +1592,11 @@ function M.build_json(st, cfg, ufhw)
 		local ok_mr, mr_kicks = pcall(M._minrssi.tick, minrssi_obs, now)
 		local kicked = {}
 		for _, k in ipairs(ok_mr and mr_kicks or {}) do
+			-- Before the kick: its disassociation is reported the moment
+			-- hostapd announces it, carrying why (assoctrack roam reports).
+			if M._assoctrack then
+				pcall(M._assoctrack.note_kick, k.mac, M._assoctrack.KICK_MIN_RSSI)
+			end
 			pcall(ufuci.kick_station, k.ifname, k.mac)
 			kicked[k.mac] = true
 		end
@@ -1583,8 +1610,12 @@ function M.build_json(st, cfg, ufhw)
 		end
 		if M._roamassist and #roam_obs > 0 then
 			pcall(M._roamassist.tick, roam_obs, now,
-				{diff_db = cfg and cfg.config and cfg.config.roam_assist_diff_db})
+				{diff_db = cfg and cfg.config and cfg.config.roam_assist_diff_db,
+				 on_steer = M._assoctrack and function(mac)
+					M._assoctrack.note_kick(mac, M._assoctrack.KICK_ROAM_ASSIST)
+				 end})
 		end
+		if M._assoctrack then pcall(M._assoctrack.observe, here_obs, uptime) end
 		-- Each radio's WiFi Experience, beside its channel utilisation in
 		-- athstats: the controller builds radio_table_stats' satisfaction
 		-- from athstats.satisfaction (default -1, devmgr), and the firmware
@@ -1960,10 +1991,18 @@ function M.build_json(st, cfg, ufhw)
 		-- (wireless.<n>.btm_disassoc.*), which openuf/roamassist.lua
 		-- implements. Decompiled from controller 10.6.101.
 		--
+		-- Bit 0x2000 (8192): Device.supportsRoamTopologyStats(). With it on
+		-- both APs the controller stops deriving roams from sta_table moves
+		-- (always "Success", no tags) and takes them from this AP's roam
+		-- reports alone (assoctrack.lua: association / sta_leave / sta_roam
+		-- notifs, which carry Fast Roaming, failures and the Roaming
+		-- Assistant and Minimum RSSI tags). Claimed only while those are
+		-- sent: without the reports the bit would make roams vanish.
+		--
 		-- No other bit is claimed: wifi_caps2 also gates real-hardware-only
 		-- features (Mesh MLO parent/child and others, see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
-		wifi_caps2       = 0x60,
+		wifi_caps2       = 0x60 + (M._assoc_enabled(st, cfg) and 0x2000 or 0),
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		-- Device-level Experience: the VAP scores weighted by their client
 		-- counts (calc_ap_satisfaction, see satisfaction.lua). The controller
@@ -4445,35 +4484,40 @@ end
 function M._idle(socket, wait)
 	local deadline = socket.gettime() + wait
 	local server_ok = true
+	-- Roam reports: wake every ROAM_POLL_S to look at the collector.
+	local fast = M._roam_fast
 	while true do
 		local left = deadline - socket.gettime()
 		if left <= 0 then return end
+		local step = fast and math.min(left, M.ROAM_POLL_S) or left
 		local server = server_ok and M._guest_server or nil
 		local stun_sock = M._stun_c and M._stun_c.sock
 		if not server and not stun_sock then
-			socket.select(nil, nil, left)
-			return
+			socket.select(nil, nil, step)
+			if not fast then return end
+		else
+			local list = {}
+			if server then list[#list + 1] = server end
+			if stun_sock then list[#list + 1] = stun_sock end
+			local r = socket.select(list, nil, step)
+			local server_r, stun_r = false, false
+			for _, s in ipairs(r or {}) do
+				if s == stun_sock then stun_r = true
+				elseif s == server then server_r = true end
+			end
+			if stun_r and M._stun_wake() then return end
+			if server_r then
+				local ctx = M._guest_ctx or {}
+				local ok, served = pcall(M._guestportal.serve_one, server, {
+					url = ctx.url, ap = ctx.ap,
+					ssid_for = function(mac) return M._guest_ssid_for(ctx.vaps, mac) end,
+					arp = M._read_arp, now = M._time,
+				})
+				-- Readable but nothing to accept: do not spin on it.
+				if not (ok and served) then server_ok = false end
+			end
 		end
-		local list = {}
-		if server then list[#list + 1] = server end
-		if stun_sock then list[#list + 1] = stun_sock end
-		local r = socket.select(list, nil, left)
-		local server_r, stun_r = false, false
-		for _, s in ipairs(r or {}) do
-			if s == stun_sock then stun_r = true
-			elseif s == server then server_r = true end
-		end
-		if stun_r and M._stun_wake() then return end
-		if server_r then
-			local ctx = M._guest_ctx or {}
-			local ok, served = pcall(M._guestportal.serve_one, server, {
-				url = ctx.url, ap = ctx.ap,
-				ssid_for = function(mac) return M._guest_ssid_for(ctx.vaps, mac) end,
-				arp = M._read_arp, now = M._time,
-			})
-			-- Readable but nothing to accept: do not spin on it.
-			if not (ok and served) then server_ok = false end
-		end
+		if fast then pcall(M._roam_poll) end
 	end
 end
 
@@ -4885,7 +4929,9 @@ end
 -- mid-connection, which is nearly every heartbeat.
 function M._assoc_poll(blob)
 	local at = M._assoctrack
-	at.ingest(at.parse_events(blob))
+	local evs = at.parse_events(blob)
+	at.ingest(evs)
+	at.roam_ingest(evs, M._vap_by_ifname)
 	if next(at._stas) == nil then return end
 	local up = tonumber(((M._read_file("/proc/uptime") or ""):match("^(%S+)")))
 	if not up then return end
@@ -4903,6 +4949,8 @@ function M._rrm_tick(cfg, st)
 	if not rrm then return false end
 	local rrm_on   = cfg and cfg.config and cfg.config.rrm_enrichment
 	local assoc_on = M._assoc_enabled(st, cfg)
+	M._roam_fast, M._roam_st = assoc_on and rrm.drain ~= nil, st
+	if not assoc_on then M._pre_blob = nil end
 	if not rrm_on and not assoc_on then
 		-- Enrichment is off, but a collector from an earlier run with it ON may
 		-- still be alive: it is a detached `ubus subscribe` child reparented to
@@ -4945,7 +4993,7 @@ function M._rrm_tick(cfg, st)
 			M._assoc_installed = false
 		end
 		pcall(rrm.collector_ensure,
-			assoc_on and {on_auth = M._assoctrack.forget_shell("m")} or nil)
+			assoc_on and {on_auth = M._assoctrack.forget_shell("m"), fdb = true} or nil)
 		-- The control-socket monitors serve only the 802.11k enrichment:
 		-- connection tracking reads the ubus lines alone.
 		if rrm_on then
@@ -4963,6 +5011,11 @@ function M._rrm_tick(cfg, st)
 	if assoc_on then
 		local ok_a, err_a = pcall(M._assoc_poll, blob)
 		if not ok_a then io.stderr:write("inform: assoctrack: " .. tostring(err_a) .. "\n") end
+	end
+	-- Lines _idle drained since the last heartbeat were ingested there; the
+	-- beacon reports among them are still the harvest's.
+	if M._pre_blob then
+		blob, M._pre_blob = M._pre_blob .. (blob or ""), nil
 	end
 	if not rrm_on then return true end
 
@@ -5342,10 +5395,7 @@ end
 -- before any stats or config handling -- so the reply is deliberately not
 -- fed to handle_response, which would read the missing interval as "back to
 -- the default cadence". A failed POST puts the rest back for next cycle.
-function M._send_notifs(st)
-	local at = M._assoctrack
-	if not at or not (st and st.adopted) or not M._notif_identity then return 0 end
-	local batch = at.take(M.NOTIFS_PER_CYCLE)
+local function post_notifs(st, batch, requeue)
 	for i, p in ipairs(batch) do
 		local body = {}
 		for k, v in pairs(M._notif_identity) do body[k] = v end
@@ -5358,11 +5408,43 @@ function M._send_notifs(st)
 		if not resp then
 			local rest = {}
 			for j = i, #batch do rest[#rest + 1] = batch[j] end
-			at.requeue(rest)
-			return i - 1
+			requeue(rest)
+			return i - 1, false
 		end
 	end
-	return #batch
+	return #batch, true
+end
+
+-- Roam reports first: they are the ones a delay spoils.
+function M._send_notifs(st)
+	local at = M._assoctrack
+	if not at or not (st and st.adopted) or not M._notif_identity then return 0 end
+	local n_r, ok = post_notifs(st, at.take_roams(at.MAX_ROAMS), at.requeue_roams)
+	if not ok then return n_r end
+	return n_r + post_notifs(st, at.take(M.NOTIFS_PER_CYCLE), at.requeue)
+end
+
+-- _idle's look at the collector between heartbeats: anything new is ingested
+-- now and a roam report it produced is sent now. The size check keeps a
+-- quiet file from costing more than an open.
+function M._roam_poll()
+	local rrm, at, st = M._rrmscan, M._assoctrack, M._roam_st
+	if not (rrm and at and rrm.drain) then return end
+	local f = io.open(rrm.EVENT_FILE, "r")
+	if not f then return end
+	local size = f:seek("end")
+	f:close()
+	if not size or size == 0 then return end
+	local blob = rrm.drain()
+	if not blob or blob == "" then return end
+	M._pre_blob = (M._pre_blob or "") .. blob
+	local evs = at.parse_events(blob)
+	at.ingest(evs)
+	at.roam_ingest(evs, M._vap_by_ifname)
+	-- Only the roam reports: the funnel's keep the heartbeat's cadence.
+	if #at._roam_queue > 0 and st and st.adopted and M._notif_identity then
+		post_notifs(st, at.take_roams(at.MAX_ROAMS), at.requeue_roams)
+	end
 end
 
 function M._tick(st, cfg, ufhw, ctx)

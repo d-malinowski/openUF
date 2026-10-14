@@ -342,7 +342,7 @@ case "$ACTION" in
 	try_optional lldpd         "LLDP topology / neighbour discovery"
 		try_optional hostapd-utils "Minimum RSSI, client kick, block-deauth"
 		try_optional usteer        "Band Steering"
-		try_optional ip-bridge     "wired clients behind the AP (bridge fdb)"
+		try_optional ip-bridge     "wired clients behind the AP, roam reports (bridge fdb)"
 		try_optional nftables      "client Block/Unblock + Multicast/Broadcast Blocker"
 		# ...and the Blocker half additionally needs the bridge family's `meta`
 		# expression, which lives in nft_meta_bridge and is NOT pulled in by

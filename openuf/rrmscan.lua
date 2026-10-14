@@ -80,6 +80,9 @@ M.EVENT_FILE = "/tmp/openuf-rrm.jsonl"
 -- across two requests captured zero notifications while a subscribe over the
 -- same window captured 22 beacon-reports.
 local SUBSCRIBE_MATCH = "ubus subscribe hostapd"
+-- The collector's fdb half (collector_script, opts.fdb). Bracketed for the
+-- reason collector_stop gives.
+local FDB_KILL = "kill $(pgrep -f '[b]ridge monitor fdb') 2>/dev/null"
 
 -- 802.11 RCPI is a 0.5-dBm-step scale anchored at -110 dBm (IEEE 802.11-2020
 -- 9.4.2.38), so dBm = rcpi/2 - 110. Sanity-checked against reality on the
@@ -369,9 +372,21 @@ function M.collector_script(opts)
 	local lines = {
 		"#!/bin/sh",
 		"# openUF hostapd event collector -- written by rrmscan.lua, do not edit.",
-		'ubus subscribe "$@" | while IFS= read -r l; do',
-		"	read -r u _ < /proc/uptime",
 	}
+	if opts.fdb then
+		-- Bridge address moves, for assoctrack's roam reports: a station
+		-- that left for another AP is learned on the uplink here in the same
+		-- second. Only learned entries; ageing ("Deleted") and the switch's
+		-- own table ("self") are dropped before they reach the file. Each
+		-- line arrives within 10 ms through this pipe (both boards).
+		lines[#lines + 1] = "bridge monitor fdb 2>/dev/null | while IFS= read -r l; do"
+		lines[#lines + 1] = "	case \"$l\" in Deleted*|*' self'*) continue ;; esac"
+		lines[#lines + 1] = "	read -r u _ < /proc/uptime"
+		lines[#lines + 1] = "	printf '%s fdb %s\\n' \"$u\" \"$l\""
+		lines[#lines + 1] = "done &"
+	end
+	lines[#lines + 1] = 'ubus subscribe "$@" | while IFS= read -r l; do'
+	lines[#lines + 1] = "	read -r u _ < /proc/uptime"
 	if opts.on_auth then
 		lines[#lines + 1] = "	case \"$l\" in"
 		lines[#lines + 1] = "	*'{ \"auth\": {\"address\":\"'*)"
@@ -405,6 +420,10 @@ function M.collector_ensure(opts)
 	end
 	local objs = M.hostapd_objects()
 	if #objs == 0 then return false end
+	-- The script's fdb half outlives a `ubus subscribe` that a wifi reload
+	-- killed (it is its own pipeline): without this every reload would add
+	-- one more.
+	M._exec(FDB_KILL)
 	local f = io.open(M.COLLECTOR_SCRIPT, "w")
 	if not f then return false end
 	f:write(want)
@@ -424,6 +443,7 @@ end
 function M.collector_stop()
 	M._exec("kill $(pgrep -f '[" .. SUBSCRIBE_MATCH:sub(1, 1) .. "]"
 		.. SUBSCRIBE_MATCH:sub(2) .. "') 2>/dev/null")
+	M._exec(FDB_KILL)
 	M.monitors_stop()
 	M._exec("rm -f " .. M.EVENT_FILE .. " " .. M.COLLECTOR_SCRIPT .. " "
 		.. M.ACTION_SCRIPT .. " 2>/dev/null")
