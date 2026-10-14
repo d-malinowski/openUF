@@ -68,7 +68,7 @@ moment before the controller container comes up healthy.
 Sections 2–4 describe the UI path. **None of it needs a browser** — the entire
 setup, adoption and config-push flow is the controller's own REST API, which is
 far faster and is what you want when a `down -v` reset is part of the loop.
-Verified end to end against 10.4.57 on 2026-09-10.
+Verified end to end against 10.4.57 on 2026-09-10 and 10.6.106 on 2026-10-14.
 
 ```sh
 J=/tmp/uc.jar                      # cookie jar
@@ -100,9 +100,11 @@ curl -sk -b $J -X PUT $B/api/s/default/set/setting/mgmt/$MG \
   -H 'Content-Type: application/json' \
   -d '{"key":"mgmt","x_ssh_enabled":true,"x_ssh_auth_password_enabled":true,"x_ssh_username":"root","x_ssh_password":"openuf"}'
 
-# 5. Point the AP at the controller and start it (section 4, scripted)
+# 5. Point the AP at the controller and start it (section 4, scripted).
+#    By IP: a freshly adopted AP that informs to the hostname is refused with
+#    "invalid inform_ip controller" (HTTP 400) on 10.6.106.
 docker exec openuf-validation-ap sh -c \
-  'sed -i "s|http://unifi:8080/inform|http://controller:8080/inform|" /opt/openuf/conf.lua'
+  "sed -i 's|http://unifi:8080/inform|http://$CIP:8080/inform|' /opt/openuf/conf.lua"
 docker exec -d openuf-validation-ap sh -c 'cd /opt/openuf && exec lua announce.lua > /tmp/announce.log 2>&1'
 docker exec -d openuf-validation-ap sh -c 'cd /opt/openuf && exec lua inform.lua   > /tmp/inform.log   2>&1'
 
@@ -289,7 +291,22 @@ docker compose -f tools/validation/docker-compose.yml up -d ap2
 ```
 
 `ap2` is behind the `replacement` compose profile, so the default
-single-AP workflow is unchanged.
+single-AP workflow is unchanged. Its mock stations are `de:ad:be:ef:02:0X`
+(`ap`'s are `de:ad:be:ef:00:0X`), so the two APs never report the same
+client and the controller logs no fake roams between them.
+
+### Two APs for notif and roaming tests
+
+Start and adopt `ap2` exactly like `ap` (step 5 with `openuf-validation-ap2`,
+then step 6), and give the site a WLAN so both APs carry a `vap_table`.
+Hand-made `STA_ASSOC_TRACKER` notifs can then be posted from either
+container with openUF's own `build_packet`/`http_post`. Build the payload's
+identity the way `inform.lua`'s entry point does: `dofile("conf.lua")`, then
+`dev.conf` with `.config` and `.uap` merged in, plus the `ufmodel` as `ufhw`.
+A bare `conf.lua` reports a different firmware version (6.6.55 instead of
+6.8.2.15592), and the controller takes each such notif for a firmware change
+(`device_upgraded=true`, visible with `debug.device=debug` in
+`/config/data/system.properties`).
 
 > **MAC caveat:** Docker hands the container a *fresh* eth0 MAC on every
 > `docker stop`/`start` (observed live, 2026-07-13), so a restarted AP

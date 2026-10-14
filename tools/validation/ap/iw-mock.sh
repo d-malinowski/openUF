@@ -89,6 +89,11 @@ Station $mac (on $ifname)
 EOF
 		}
 
+		# The ap2 container gets its own station MACs. With the same three on
+		# both APs the controller saw every mock client move between them on
+		# each heartbeat, and filled AirView -> Roaming with fake roams.
+		if [ "$(hostname)" = "openuf-ap2" ]; then sta=de:ad:be:ef:02; else sta=de:ad:be:ef:00; fi
+
 		# rx_step/tx_step (bytes added per poll) deliberately differ per
 		# station -- besides the base offsets, this also makes each
 		# station's *throughput* (inform.lua's delta-sampled rate, not the
@@ -98,16 +103,16 @@ EOF
 		# throughput would coincidentally come out identical across
 		# stations, which is misleading to eyeball-verify against.
 		if [ "$2" = "wlan0" ]; then
-			emit_station wlan0 de:ad:be:ef:00:01 -58 -59 \
+			emit_station wlan0 $sta:01 -58 -59 \
 				123456 654321 890 432 7 \
 				"144.4 MBit/s MCS 15 short GI" "72.2 MBit/s MCS 7 short GI" 100 \
 				262144 524288
-			emit_station wlan0 de:ad:be:ef:00:02 -70 -71 \
+			emit_station wlan0 $sta:02 -70 -71 \
 				55000 210000 340 150 3 \
 				"54.0 MBit/s" "54.0 MBit/s" 40 \
 				16384 32768
 		else
-			emit_station wlan1 de:ad:be:ef:00:03 -50 -51 \
+			emit_station wlan1 $sta:03 -50 -51 \
 				980000 2100000 5200 3100 12 \
 				"866.7 MBit/s VHT-MCS 9 VHT-NSS 2 80MHz short GI" "780.0 MBit/s VHT-MCS 8 VHT-NSS 2 80MHz short GI" 300 \
 				786432 1572864

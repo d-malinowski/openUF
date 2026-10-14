@@ -25,15 +25,19 @@ services:
     restart: unless-stopped
 
   controller:
-    # Pinned to 10.4.57 -- the version this project's docs claim to be tested
-    # against (see README.md), rather than `latest`, to match that baseline.
+    # Pinned to 10.6.106, the version on the real UCG Ultra the project is
+    # tested against, rather than `latest`. It was 10.4.57 until 2026-10-14:
+    # its roam detector never resolved a notif's `vap` against the device's
+    # vap_table ("Roaming detection: VAP [...] not found" on every
+    # association), so roam events could not be validated there. 10.6.106
+    # resolves them as the real gateway does.
     # Note: both versions return HTTP 404 to the client on well-formed inform
     # POSTs regardless -- that is NOT a rejection (see PROTOCOL-VALIDATION.md
     # "General protocol finding"). The 127.0.0.1:9080/ucore connection-refused
     # errors in this image's logs are an unrelated background licensing/manifest
     # fetch, present on 10.4.57 too -- not the cause of the 404, a dead end
     # ruled out during Stage 1 validation.
-    image: lscr.io/linuxserver/unifi-network-application:10.4.57
+    image: lscr.io/linuxserver/unifi-network-application:10.6.106
     container_name: openuf-validation-controller
     environment:
       - PUID=1000
