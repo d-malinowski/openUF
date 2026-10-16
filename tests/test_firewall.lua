@@ -46,43 +46,55 @@ end
 
 return {
 	{
-		name = "firewall: reconcile with an empty list still (re)creates the table/set/chain",
+		name = "firewall: reconcile replaces the table, set and chain in one nft transaction",
 		fn = function()
-			with_capture(function(cmds)
-				firewall.reconcile({})
-				assert_true(#cmds >= 5, "at least delete+table+set+chain+2 rules")
-				assert_contains(cmds[1], "nft delete table bridge openuf", "clears any prior table first")
-				assert_contains(cmds[2], "nft add table bridge openuf", "recreates the table")
-				assert_contains(cmds[3], "nft add set bridge openuf blocked_macs", "recreates the set")
-				local joined = table.concat(cmds, "\n")
-				assert_contains(joined, "type filter hook forward priority 0", "chain hooked into bridge forward")
-				assert_contains(joined, "ether saddr @blocked_macs drop", "drops traffic from a blocked MAC")
-				assert_contains(joined, "ether daddr @blocked_macs drop", "drops traffic to a blocked MAC")
-			end)
+			local exec, r = fake_nft()
+			local orig = firewall._exec
+			firewall._exec = exec
+			firewall.reconcile({})
+			firewall._exec = orig
+			assert_eq(r.runs, 1, "one nft run, not one per command")
+			assert_eq(table.concat(r.cmds, "\n"), table.concat({
+				"nft add table bridge openuf",
+				"nft delete table bridge openuf",
+				"nft add table bridge openuf",
+				"nft add set bridge openuf blocked_macs { type ether_addr; }",
+				"nft add chain bridge openuf block { type filter hook forward priority 0; }",
+				"nft add rule bridge openuf block ether saddr @blocked_macs drop",
+				"nft add rule bridge openuf block ether daddr @blocked_macs drop",
+			}, "\n"), "the old table goes in the same transaction that builds the new one")
 		end
 	},
 	{
 		name = "firewall: reconcile adds an element per blocked MAC",
 		fn = function()
-			with_capture(function(cmds)
-				firewall.reconcile({"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"})
-				local joined = table.concat(cmds, "\n")
-				assert_contains(joined, "nft add element bridge openuf blocked_macs '{ aa:bb:cc:dd:ee:01 }'",
-					"first MAC added as a set element")
-				assert_contains(joined, "nft add element bridge openuf blocked_macs '{ aa:bb:cc:dd:ee:02 }'",
-					"second MAC added as a set element")
-			end)
+			local exec, r = fake_nft()
+			local orig = firewall._exec
+			firewall._exec = exec
+			firewall.reconcile({"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"})
+			firewall._exec = orig
+			local joined = table.concat(r.cmds, "\n")
+			assert_contains(joined, "nft add element bridge openuf blocked_macs { aa:bb:cc:dd:ee:01 }",
+				"first MAC added as a set element")
+			assert_contains(joined, "nft add element bridge openuf blocked_macs { aa:bb:cc:dd:ee:02 }",
+				"second MAC added as a set element")
+			assert_eq(r.runs, 1, "still one nft run")
 		end
 	},
 	{
-		name = "firewall: reconcile rebuilds from scratch rather than diffing (idempotent across repeat calls)",
+		name = "firewall: a rejected statement leaves the rest in place",
 		fn = function()
-			with_capture(function(cmds)
-				firewall.reconcile({"aa:bb:cc:dd:ee:01"})
-				local first_count = #cmds
-				firewall.reconcile({"aa:bb:cc:dd:ee:01"})
-				assert_eq(#cmds, first_count * 2, "second call issues the exact same command sequence again")
-			end)
+			-- The batch is all or nothing; util.nft_apply re-runs it one
+			-- statement at a time so one bad rule costs only itself.
+			local exec, r = fake_nft(function(l) return l:find("daddr", 1, true) end)
+			local orig = firewall._exec
+			firewall._exec = exec
+			firewall.reconcile({"aa:bb:cc:dd:ee:01"})
+			firewall._exec = orig
+			local joined = table.concat(r.cmds, "\n")
+			assert_contains(joined, "ether saddr @blocked_macs drop", "the other rule is installed")
+			assert_contains(joined, "blocked_macs { aa:bb:cc:dd:ee:01 }", "and the element")
+			assert_true(joined:find("daddr", 1, true) == nil, "only the rejected one is missing")
 		end
 	},
 	{
@@ -120,8 +132,15 @@ return {
 			-- plain HTTP under the well-known default key, so a forged
 			-- block-sta is within reach of anyone on the path.
 			local orig_exec, orig_stderr = firewall._exec, io.stderr
-			local cmds, logged = {}, {}
-			firewall._exec = function(c) cmds[#cmds + 1] = c; return true end
+			local logged = {}
+			local exec, r = fake_nft()
+			local cmds = r.other
+			firewall._exec = function(c)
+				exec(c)
+				for _, l in ipairs(r.cmds) do cmds[#cmds + 1] = l end
+				r.cmds = {}
+				return 0
+			end
 			io.stderr = {write = function(_, ...)
 				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
 			end}

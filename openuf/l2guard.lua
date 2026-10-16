@@ -50,11 +50,6 @@ local util = package.loaded["openuf.util"]
 
 M._exec = os.execute
 
--- os.execute on the device's Lua 5.1 returns the raw exit status (0 =
--- success, non-zero = failure, both truthy); newer Lua returns true/nil.
-local exec_ok = util.exec_ok
-M._exec_ok = exec_ok
-
 M.NFT_TABLE = "bridge openuf_l2guard"
 M.BGA       = "01:80:c2:00:00:00"
 
@@ -122,8 +117,11 @@ local valid_ifname = util.valid_ifname
 -- number of rules installed (0 when there was nothing to enforce or nothing
 -- to enforce it on; the table is deleted either way).
 function M.reconcile(spec, ifnames)
-	M._exec("nft delete table " .. M.NFT_TABLE .. " 2>/dev/null")
-	if type(spec) ~= "table" or not (spec.bpdu or spec.tagdrop) then return 0 end
+	local T = M.NFT_TABLE
+	if type(spec) ~= "table" or not (spec.bpdu or spec.tagdrop) then
+		util.nft_apply(T, nil, M._exec)
+		return 0
+	end
 	local names = {}
 	for _, n in ipairs(ifnames or {}) do
 		if valid_ifname(n) then
@@ -133,30 +131,35 @@ function M.reconcile(spec, ifnames)
 		end
 	end
 	if #names == 0 then
+		util.nft_apply(T, nil, M._exec)
 		io.stderr:write("l2guard: no AP interfaces to protect yet -- rules deferred\n")
 		return 0
 	end
 	local set = "{ " .. table.concat(names, ", ") .. " }"
-	M._exec("nft add table " .. M.NFT_TABLE)
-	-- -300 is where ebtables' nat/broute PREROUTING sat; before bridging.
-	M._exec("nft add chain " .. M.NFT_TABLE
-		.. " pre '{ type filter hook prerouting priority -300; policy accept; }'")
-	M._exec("nft add chain " .. M.NFT_TABLE
-		.. " post '{ type filter hook postrouting priority 0; policy accept; }'")
-	local rules = {}
+	local stmts = {
+		-- -300 is where ebtables' nat/broute PREROUTING sat; before bridging.
+		"add chain " .. T .. " pre { type filter hook prerouting priority -300; policy accept; }",
+		"add chain " .. T .. " post { type filter hook postrouting priority 0; policy accept; }",
+	}
+	local what = {}   -- statement index -> the rule's name, for the warning
+	local function rule(chain, r, name)
+		stmts[#stmts + 1] = "add rule " .. T .. " " .. chain .. " " .. r
+		what[#stmts] = name
+	end
 	if spec.bpdu then
-		rules[#rules + 1] = {"pre",  "iifname " .. set .. " ether daddr " .. M.BGA .. " drop", "BPDU drop (in)"}
-		rules[#rules + 1] = {"post", "oifname " .. set .. " ether daddr " .. M.BGA .. " drop", "BPDU drop (out)"}
+		rule("pre",  "iifname " .. set .. " ether daddr " .. M.BGA .. " drop", "BPDU drop (in)")
+		rule("post", "oifname " .. set .. " ether daddr " .. M.BGA .. " drop", "BPDU drop (out)")
 	end
 	if spec.tagdrop then
-		rules[#rules + 1] = {"pre",  "iifname " .. set .. " ether type vlan drop", "VLAN-tag drop"}
+		rule("pre",  "iifname " .. set .. " ether type vlan drop", "VLAN-tag drop")
 	end
+	local _, failed = util.nft_apply(T, stmts, M._exec)
 	local n = 0
-	for _, r in ipairs(rules) do
-		if exec_ok(M._exec("nft add rule " .. M.NFT_TABLE .. " " .. r[1] .. " '" .. r[2] .. "'")) then
+	for i = 1, #stmts do
+		if what[i] and not failed[i] then
 			n = n + 1
-		else
-			io.stderr:write("openuf: l2guard: nft rejected the " .. r[3] .. " rule. iifname/oifname in the "
+		elseif what[i] then
+			io.stderr:write("openuf: l2guard: nft rejected the " .. what[i] .. " rule. iifname/oifname in the "
 				.. "bridge family need kmod-nft-bridge (apk add kmod-nft-bridge); without it the "
 				.. "controller's ebtables rules are NOT enforced.\n")
 		end

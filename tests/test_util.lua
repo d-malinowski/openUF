@@ -101,6 +101,65 @@ return {
 		end
 	},
 	{
+		name = "util: nft_apply replaces a table in one transaction",
+		fn = function()
+			local exec, r = fake_nft()
+			local ok, failed = util.nft_apply("bridge t", {"add chain bridge t c", "add rule bridge t c drop"}, exec)
+			assert_true(ok, "accepted")
+			assert_nil(next(failed), "nothing rejected")
+			assert_eq(r.runs, 1, "one nft run")
+			assert_eq(table.concat(r.cmds, "\n"), table.concat({
+				-- The add makes the delete succeed when there is no table yet.
+				"nft add table bridge t", "nft delete table bridge t",
+				"nft add table bridge t", "nft add chain bridge t c", "nft add rule bridge t c drop",
+			}, "\n"), "the old table goes in the commit that builds the new one")
+		end
+	},
+	{
+		name = "util: nft_apply with no statements only deletes, every table in one run",
+		fn = function()
+			local exec, r = fake_nft()
+			assert_true(util.nft_apply({"bridge a", "ip b"}, nil, exec), "deleted")
+			assert_eq(r.runs, 1, "one nft run")
+			assert_eq(table.concat(r.cmds, "\n"), "nft add table bridge a\nnft delete table bridge a\n"
+				.. "nft add table ip b\nnft delete table ip b", "both tables, nothing recreated")
+		end
+	},
+	{
+		name = "util: nft_apply names a rejected statement and keeps the rest",
+		fn = function()
+			-- An image without kmod-nft-bridge rejects one rule; the batch is
+			-- all or nothing, so it is re-run a statement at a time.
+			local exec, r = fake_nft(function(l) return l:find("meta", 1, true) end)
+			local stmts = {"add set bridge t s { type ether_addr; }", "add rule bridge t c meta pkttype host drop",
+				"add rule bridge t c drop"}
+			local ok, failed = util.nft_apply("bridge t", stmts, exec)
+			assert_false(ok, "not all of it went in")
+			assert_true(failed[2], "the meta rule is named")
+			assert_nil(failed[1], "the set is not")
+			assert_nil(failed[3], "nor the other rule")
+			local joined = table.concat(r.cmds, "\n")
+			assert_contains(joined, "nft add set bridge t s", "the set is installed")
+			assert_contains(joined, "nft add rule bridge t c drop", "and the other rule")
+			assert_true(joined:find("meta", 1, true) == nil, "the rejected one is not")
+			assert_eq(r.runs, 6, "the batch, a clear, a create, then one run per statement")
+		end
+	},
+	{
+		name = "util: nft_run leaves no script behind and reads 5.1's exit status",
+		fn = function()
+			local path
+			local ok = util.nft_run("add table bridge t\n", function(cmd)
+				path = cmd:match("^nft %-f (%S+)")
+				return 1
+			end)
+			assert_false(ok, "exit status 1 is a failure, though truthy")
+			assert_not_nil(path, "ran nft -f on a file")
+			assert_nil(io.open(path), "the file is removed")
+			assert_true(util.nft_run("x\n", function() return 0 end), "exit status 0 is success")
+		end
+	},
+	{
 		name = "util: every module shares the one loaded copy",
 		fn = function()
 			-- Loading a module must not dofile util.lua again: one copy per

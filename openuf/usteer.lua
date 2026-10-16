@@ -145,10 +145,6 @@ M.NFT_TABLE = "bridge openuf_usteer"
 
 M._exec = os.execute
 
--- os.execute on the device's Lua 5.1 returns the raw exit status (0 =
--- success, non-zero = failure, both truthy); newer Lua returns true/nil.
-local exec_ok = util.exec_ok
-
 local valid_ifname = util.valid_ifname
 
 -- Whether openUF runs usteerd, i.e. whether the filter has anything to do.
@@ -162,29 +158,32 @@ end
 -- Rebuild the table to drop usteer's sync on exactly these VAP netdevs; an
 -- empty or nil list removes it. Returns the number of rules installed.
 function M.reconcile_filter(ifnames)
-	M._exec("nft delete table " .. M.NFT_TABLE .. " 2>/dev/null")
+	local T = M.NFT_TABLE
 	local names = {}
 	for _, n in ipairs(ifnames or {}) do
 		if valid_ifname(n) then names[#names + 1] = '"' .. n .. '"' end
 	end
-	if #names == 0 then return 0 end
+	if #names == 0 then
+		util.nft_apply(T, nil, M._exec)
+		return 0
+	end
 	local set = "{ " .. table.concat(names, ", ") .. " }"
-	M._exec("nft add table " .. M.NFT_TABLE)
-	M._exec("nft add chain " .. M.NFT_TABLE
-		.. " post '{ type filter hook postrouting priority 0; policy accept; }'")
-	local rules = {
-		"oifname " .. set .. " ip daddr 255.255.255.255 udp dport 16720 drop",
-		"oifname " .. set .. " ip daddr 255.255.255.255 ip protocol udp ip frag-off & 0x1fff != 0 drop",
+	local post = "add rule " .. T .. " post oifname " .. set
+	local stmts = {
+		"add chain " .. T .. " post { type filter hook postrouting priority 0; policy accept; }",
+		post .. " ip daddr 255.255.255.255 udp dport 16720 drop",
+		post .. " ip daddr 255.255.255.255 ip protocol udp ip frag-off & 0x1fff != 0 drop",
 		-- usteer's own group: every fragment carries it, nothing else uses it.
-		"oifname " .. set .. " ip6 daddr ff02::4150 drop",
+		post .. " ip6 daddr ff02::4150 drop",
 	}
+	local _, failed = util.nft_apply(T, stmts, M._exec)
 	local n = 0
-	for _, r in ipairs(rules) do
-		if exec_ok(M._exec("nft add rule " .. M.NFT_TABLE .. " post '" .. r .. "'")) then
-			n = n + 1
-		else
+	for i = 2, #stmts do
+		if failed[i] then
 			io.stderr:write("openuf: usteer: nft rejected a sync filter rule (needs "
 				.. "kmod-nft-bridge); usteer's broadcasts still reach every client.\n")
+		else
+			n = n + 1
 		end
 	end
 	return n

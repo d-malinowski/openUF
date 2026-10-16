@@ -93,6 +93,32 @@ function assert_bytes_eq(got, expected, label)
 	end
 end
 
+-- A stand-in nft for a module's os.execute seam (util.nft_run writes a script
+-- and runs `nft -f <file>`). Returns exec and r: r.cmds lists every statement
+-- nft accepted as "nft <statement>" (a rejected script, being one
+-- transaction, adds none of its statements), r.runs counts nft invocations,
+-- r.other lists every command that was not an nft script. fail(stmt) -> true
+-- makes nft reject a script holding that statement.
+function fake_nft(fail)
+	local r = {cmds = {}, runs = 0, other = {}}
+	local function exec(cmd)
+		local path = cmd:match("^nft %-f (%S+)")
+		if not path then
+			r.other[#r.other + 1] = cmd
+			return 0
+		end
+		r.runs = r.runs + 1
+		local lines = {}
+		for line in io.lines(path) do
+			if fail and fail(line) then return 1 end
+			lines[#lines + 1] = "nft " .. line
+		end
+		for _, l in ipairs(lines) do r.cmds[#r.cmds + 1] = l end
+		return 0
+	end
+	return exec, r
+end
+
 -- Run a list of {name, fn} test entries. Returns the file's own pass/fail
 -- counts so the per-file summary can make a silently-vanished file visible.
 local seen_names = {}

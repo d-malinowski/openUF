@@ -13,7 +13,8 @@ instances (`announce`, `inform`) from `/opt/openuf/`.
 - `switchvlan.lua` (swconfig + DSA per-port VLAN), `sysinfo.lua` (iw/proc/bridge reads),
   `state.lua` (`/etc/openuf/state.json`, explicit `M.FIELDS` list), `crypto.lua`, `inflate.lua`
 - `util.lua`: shared helpers (file/command reads, `exec_ok`, `is_mac`, `valid_ifname`, the
-  bit shim, sysfs `master_of`/`driver_of`). Load it through `package.loaded["openuf.util"]`
+  bit shim, sysfs `master_of`/`driver_of`, `nft_apply`: rebuild an nft table in one
+  `nft -f` transaction, falling back per statement to name a rejected rule). Load it through `package.loaded["openuf.util"]`
   or by path as the modules do, never with a bare `require "util"`. Point a module's
   `M._read_file`-style seams at it rather than copying a helper.
 - `modelmap/` = board hardware profile, `ufmodel/` = presented UniFi identity

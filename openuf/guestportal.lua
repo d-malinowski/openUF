@@ -43,9 +43,9 @@
 
 	Mechanism as in firewall.lua/l2guard.lua: own tables, rebuilt from
 	scratch on every reconcile, kernel state that dies with a reboot and is
-	rebuilt at startup from state.json. The authorized set alone is
-	refreshed in place (set_authorized), so an authorize-guest does not open
-	a gap in the rest.
+	rebuilt at startup from state.json, each rebuild one nft transaction
+	(util.nft_apply). The authorized set alone is refreshed in place
+	(set_authorized), so an authorize-guest does not open a gap in the rest.
 ]]--
 
 local M = {}
@@ -53,8 +53,6 @@ local util = package.loaded["openuf.util"]
 	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 M._exec = os.execute
-
-local exec_ok = util.exec_ok
 
 M.BRIDGE_TABLE = "bridge openuf_guest"
 M.NAT_TABLE    = "ip openuf_guest"
@@ -220,28 +218,26 @@ function M.bridge_mac(ifname)
 	return mac and mac:lower() or nil
 end
 
-local function nft(args)
-	return exec_ok(M._exec("nft " .. args))
+-- The statement that puts macs (a list) into the authorized set, or nil when
+-- none is valid.
+local function authorized_stmt(macs)
+	local list = {}
+	for _, mac in ipairs(macs or {}) do
+		if is_mac(mac) then list[#list + 1] = mac:lower() end
+	end
+	if #list == 0 then return nil end
+	return "add element " .. M.BRIDGE_TABLE .. " authorized { " .. table.concat(list, ", ") .. " }"
 end
 
--- Refill the authorized set from macs (a list). Elements go in chunks, so a
--- full ledger does not make one huge command line.
+local SELFRUN_RULE = "add rule %s selfrun meta pkttype other accept"
+
+-- Refill the authorized set from macs (a list), flush and refill in one
+-- transaction: an authorized guest is never dropped in between. False when
+-- the table is not there.
 function M.set_authorized(macs)
-	if not nft("flush set " .. M.BRIDGE_TABLE .. " authorized 2>/dev/null") then return false end
-	local chunk = {}
-	local function flush()
-		if #chunk == 0 then return end
-		nft("add element " .. M.BRIDGE_TABLE .. " authorized '{ " .. table.concat(chunk, ", ") .. " }'")
-		chunk = {}
-	end
-	for _, mac in ipairs(macs or {}) do
-		if is_mac(mac) then
-			chunk[#chunk + 1] = mac:lower()
-			if #chunk >= 64 then flush() end
-		end
-	end
-	flush()
-	return true
+	local add = authorized_stmt(macs)
+	return util.nft_run("flush set " .. M.BRIDGE_TABLE .. " authorized\n"
+		.. (add and add .. "\n" or ""), M._exec, true)
 end
 
 -- selfrun_guest_mode=pass while the controller is unreachable (the firmware's
@@ -250,11 +246,8 @@ end
 -- still not into the restricted subnets), since nobody can log in to the
 -- portal meanwhile. An empty chain otherwise. Refreshed in place.
 function M.set_selfrun(pass)
-	if not nft("flush chain " .. M.BRIDGE_TABLE .. " selfrun 2>/dev/null") then return false end
-	if pass then
-		return nft("add rule " .. M.BRIDGE_TABLE .. " selfrun 'meta pkttype other accept'")
-	end
-	return true
+	return util.nft_run("flush chain " .. M.BRIDGE_TABLE .. " selfrun\n"
+		.. (pass and SELFRUN_RULE:format(M.BRIDGE_TABLE) .. "\n" or ""), M._exec, true)
 end
 
 -- Rebuild both tables for spec on these VAPs ({ifname=, bridge_mac=}), with
@@ -262,9 +255,11 @@ end
 -- rules installed (0, tables gone, when there is nothing to enforce or
 -- nothing to enforce it on).
 function M.reconcile(spec, vaps, macs, selfrun)
-	M._exec("nft delete table " .. M.BRIDGE_TABLE .. " 2>/dev/null")
-	M._exec("nft delete table " .. M.NAT_TABLE .. " 2>/dev/null")
-	if type(spec) ~= "table" or not spec.enabled then return 0 end
+	local tables = {M.BRIDGE_TABLE, M.NAT_TABLE}
+	if type(spec) ~= "table" or not spec.enabled then
+		util.nft_apply(tables, nil, M._exec)
+		return 0
+	end
 	local names, redirect = {}, {}
 	for _, v in ipairs(vaps or {}) do
 		if valid_ifname(v.ifname) then
@@ -276,19 +271,12 @@ function M.reconcile(spec, vaps, macs, selfrun)
 		end
 	end
 	if #names == 0 then
+		util.nft_apply(tables, nil, M._exec)
 		io.stderr:write("guestportal: no guest interfaces up yet -- rules deferred\n")
 		return 0
 	end
 	local T = M.BRIDGE_TABLE
 	local set = "{ " .. table.concat(names, ", ") .. " }"
-	nft("add table " .. T)
-	nft("add set " .. T .. " authorized '{ type ether_addr; }'")
-	nft("add chain " .. T .. " pre '{ type filter hook prerouting priority -300; policy accept; }'")
-	nft("add chain " .. T .. " post '{ type filter hook postrouting priority 0; policy accept; }'")
-	nft("add chain " .. T .. " guestin")
-	nft("add chain " .. T .. " guestout")
-	nft("add chain " .. T .. " redirect_http")
-	nft("add chain " .. T .. " selfrun")
 
 	local rules = {
 		{"pre",  "iifname " .. set .. " jump guestin"},
@@ -331,31 +319,46 @@ function M.reconcile(spec, vaps, macs, selfrun)
 		add("guestout", "ip daddr " .. net .. " drop")
 	end
 
-	local n, failed = 0, 0
+	local stmts = {
+		"add set " .. T .. " authorized { type ether_addr; }",
+		"add chain " .. T .. " pre { type filter hook prerouting priority -300; policy accept; }",
+		"add chain " .. T .. " post { type filter hook postrouting priority 0; policy accept; }",
+		"add chain " .. T .. " guestin",
+		"add chain " .. T .. " guestout",
+		"add chain " .. T .. " redirect_http",
+		"add chain " .. T .. " selfrun",
+	}
+	local first = #stmts + 1
 	for _, r in ipairs(rules) do
-		if nft("add rule " .. T .. " " .. r[1] .. " '" .. r[2] .. "'") then
-			n = n + 1
-		else
+		stmts[#stmts + 1] = "add rule " .. T .. " " .. r[1] .. " " .. r[2]
+	end
+	local last = #stmts
+	stmts[#stmts + 1] = authorized_stmt(macs)
+	if selfrun then stmts[#stmts + 1] = SELFRUN_RULE:format(T) end
+	-- The marked frames reach the bridge's own stack; send them to M.PORT.
+	stmts[#stmts + 1] = "add chain " .. M.NAT_TABLE .. " pre { type nat hook prerouting priority -101; }"
+	stmts[#stmts + 1] = "add rule " .. M.NAT_TABLE .. " pre meta mark and 0xc0000000 == " .. M.MARK_HTTP
+		.. " meta l4proto tcp redirect to :" .. M.PORT
+	local _, bad = util.nft_apply(tables, stmts, M._exec)
+
+	local n, failed = 0, 0
+	for i = first, last do
+		if bad[i] then
 			failed = failed + 1
-			io.stderr:write("openuf: guestportal: nft rejected " .. ("%q"):format(r[2]) .. "\n")
+			io.stderr:write("openuf: guestportal: nft rejected " .. ("%q"):format(rules[i - first + 1][2]) .. "\n")
+		else
+			n = n + 1
 		end
 	end
 	if failed > 0 then
 		io.stderr:write("openuf: guestportal: " .. failed .. " rule(s) not installed; iifname/oifname in "
 			.. "the bridge family need kmod-nft-bridge. The guest portal is NOT fully enforced.\n")
 	end
-	M.set_authorized(macs)
-	M.set_selfrun(selfrun)
-
-	-- The marked frames reach the bridge's own stack; send them to M.PORT.
-	nft("add table " .. M.NAT_TABLE)
-	nft("add chain " .. M.NAT_TABLE .. " pre '{ type nat hook prerouting priority -101; }'")
-	if nft("add rule " .. M.NAT_TABLE .. " pre 'meta mark and 0xc0000000 == " .. M.MARK_HTTP
-			.. " meta l4proto tcp redirect to :" .. M.PORT .. "'") then
-		n = n + 1
-	else
+	if bad[#stmts] then
 		io.stderr:write("openuf: guestportal: nft rejected the NAT redirect (kmod-nft-nat?). "
 			.. "Guests stay blocked but are not shown the portal.\n")
+	else
+		n = n + 1
 	end
 	if #redirect < #names then
 		io.stderr:write("openuf: guestportal: " .. (#names - #redirect) .. " guest interface(s) not "

@@ -20,9 +20,10 @@
 	two static rules matching against it (source and destination) -- adding/
 	removing a MAC is then a single `nft add|delete element` against the set,
 	never touching the rules themselves. M.reconcile rebuilds the whole table
-	from scratch (delete + recreate) rather than diffing, mirroring
-	netconfig.lua's flush-then-reapply pattern -- simpler and self-healing if
-	the table was ever left in an unexpected state.
+	from scratch (delete + recreate, in one nft transaction: util.nft_apply)
+	rather than diffing -- simpler and self-healing if the table was ever
+	left in an unexpected state, and a blocked client never slips through
+	between the delete and the rebuild.
 ]]--
 
 local M = {}
@@ -45,19 +46,19 @@ local is_mac = util.is_mac
 -- harmless table+set+chain in place) and safe to call repeatedly (each call
 -- fully replaces the previous state rather than accumulating).
 function M.reconcile(blocked_macs)
-	M._exec("nft delete table " .. NFT_TABLE .. " 2>/dev/null")
-	M._exec("nft add table " .. NFT_TABLE)
-	M._exec("nft add set " .. NFT_TABLE .. " blocked_macs '{ type ether_addr; }'")
+	local T = NFT_TABLE
+	local stmts = {"add set " .. T .. " blocked_macs { type ether_addr; }"}
 	for _, mac in ipairs(blocked_macs or {}) do
 		if is_mac(mac) then
-			M._exec("nft add element " .. NFT_TABLE .. " blocked_macs '{ " .. mac .. " }' 2>/dev/null")
+			stmts[#stmts + 1] = "add element " .. T .. " blocked_macs { " .. mac .. " }"
 		else
 			io.stderr:write(("firewall: ignoring malformed blocked MAC %q\n"):format(tostring(mac)))
 		end
 	end
-	M._exec("nft add chain " .. NFT_TABLE .. " block '{ type filter hook forward priority 0; }'")
-	M._exec("nft add rule " .. NFT_TABLE .. " block ether saddr @blocked_macs drop")
-	M._exec("nft add rule " .. NFT_TABLE .. " block ether daddr @blocked_macs drop")
+	stmts[#stmts + 1] = "add chain " .. T .. " block { type filter hook forward priority 0; }"
+	stmts[#stmts + 1] = "add rule " .. T .. " block ether saddr @blocked_macs drop"
+	stmts[#stmts + 1] = "add rule " .. T .. " block ether daddr @blocked_macs drop"
+	util.nft_apply(T, stmts, M._exec)
 	return true
 end
 

@@ -46,17 +46,15 @@ local HOSTAPD_PHY1 = table.concat({
 	"proxy_arp=0",
 }, "\n") .. "\n"
 
+-- The nft statements that took effect (see fake_nft), and the fake itself.
 local function with_capture(fn, fail_pattern)
-	local cmds, orig = {}, l2guard._exec
-	l2guard._exec = function(cmd)
-		cmds[#cmds + 1] = cmd
-		if fail_pattern and cmd:find(fail_pattern, 1, true) then return 1 end
-		return 0
-	end
-	local ok, err = pcall(fn, cmds)
+	local orig = l2guard._exec
+	local exec, r = fake_nft(fail_pattern and function(l) return l:find(fail_pattern, 1, true) end)
+	l2guard._exec = exec
+	local ok, err = pcall(fn, r.cmds)
 	l2guard._exec = orig
 	if not ok then error(err, 0) end
-	return cmds
+	return r.cmds, r
 end
 
 local function with_stderr(fn)
@@ -112,19 +110,20 @@ return {
 		name = "l2guard: reconcile rebuilds the table with BPDU in/out and tag-drop rules on exactly the VAP names",
 		fn = function()
 			local n
-			local cmds = with_capture(function()
+			local cmds, r = with_capture(function()
 				n = l2guard.reconcile({bpdu = true, tagdrop = true}, {"phy0-ap0", "phy1-ap0", "phy1-ap1"})
 			end)
 			assert_eq(n, 3, "three rules")
-			assert_contains(cmds[1], "nft delete table bridge openuf_l2guard", "clears first")
-			assert_contains(cmds[2], "nft add table bridge openuf_l2guard", "recreates")
+			assert_eq(r.runs, 1, "one nft run")
+			assert_eq(cmds[2], "nft delete table bridge openuf_l2guard", "clears first")
+			assert_eq(cmds[3], "nft add table bridge openuf_l2guard", "recreates, in the same transaction")
 			local joined = table.concat(cmds, "\n")
-			assert_contains(joined, "pre '{ type filter hook prerouting priority -300; policy accept; }'", "prerouting chain")
-			assert_contains(joined, "post '{ type filter hook postrouting priority 0; policy accept; }'", "postrouting chain")
+			assert_contains(joined, "pre { type filter hook prerouting priority -300; policy accept; }", "prerouting chain")
+			assert_contains(joined, "post { type filter hook postrouting priority 0; policy accept; }", "postrouting chain")
 			local set = '{ "phy0-ap0", "phy1-ap0", "phy1-ap1" }'
-			assert_contains(joined, "pre 'iifname " .. set .. " ether daddr 01:80:c2:00:00:00 drop'", "BPDU in")
-			assert_contains(joined, "post 'oifname " .. set .. " ether daddr 01:80:c2:00:00:00 drop'", "BPDU out")
-			assert_contains(joined, "pre 'iifname " .. set .. " ether type vlan drop'", "tag drop")
+			assert_contains(joined, "pre iifname " .. set .. " ether daddr 01:80:c2:00:00:00 drop", "BPDU in")
+			assert_contains(joined, "post oifname " .. set .. " ether daddr 01:80:c2:00:00:00 drop", "BPDU out")
+			assert_contains(joined, "pre iifname " .. set .. " ether type vlan drop", "tag drop")
 			assert_true(joined:find("br%-lan") == nil, "never a wired interface")
 		end
 	},
@@ -134,17 +133,17 @@ return {
 			local cmds = with_capture(function()
 				assert_eq(l2guard.reconcile({bpdu = false, tagdrop = false}, {"phy0-ap0"}), 0, "off")
 			end)
-			assert_eq(#cmds, 1, "delete only")
-			assert_contains(cmds[1], "nft delete table", "deleted")
+			assert_eq(table.concat(cmds, "\n"), "nft add table bridge openuf_l2guard\n"
+				.. "nft delete table bridge openuf_l2guard", "delete only")
 			local out = with_stderr(function()
 				cmds = with_capture(function()
 					assert_eq(l2guard.reconcile({bpdu = true, tagdrop = true}, {}), 0, "no VAPs yet")
 				end)
 			end)
-			assert_eq(#cmds, 1, "delete only")
+			assert_eq(#cmds, 2, "delete only")
 			assert_contains(out, "no AP interfaces to protect yet", "deferred, and said so")
 			cmds = with_capture(function() assert_eq(l2guard.reconcile(nil, {"x"}), 0, "nil spec") end)
-			assert_eq(#cmds, 1, "delete only")
+			assert_eq(#cmds, 2, "delete only")
 		end
 	},
 	{

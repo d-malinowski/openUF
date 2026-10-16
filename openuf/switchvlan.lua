@@ -949,7 +949,7 @@ end
 -- not reinstalled fails silently -- as an empty mac_table, which is precisely
 -- the bug it exists to fix.
 --
--- Returns true when a tap is now installed.
+-- Returns true when the whole tap is now installed.
 function M.reconcile_mac_taps(cursor)
 	local c = cursor or get_uci().cursor()
 	local sockets = M.tapped_sockets(c)
@@ -987,44 +987,36 @@ function M.reconcile_mac_taps(cursor)
 		end
 	end
 
-	M._exec("nft delete table " .. NFT_LEARN_TABLE .. " 2>/dev/null")
-	if #sockets == 0 then return false end
+	if #sockets == 0 then
+		util.nft_apply(NFT_LEARN_TABLE, nil, M._exec)
+		return false
+	end
 
 	-- Socket names reach here from the modelmap by way of UCI. They are
-	-- `lan2`/`wan`-shaped and always have been, but they are interpolated into
-	-- a shell command, so sanitise rather than trust -- the same discipline
+	-- `lan2`/`wan`-shaped and always have been, but they are spliced into an
+	-- nft script, so sanitise rather than trust -- the same discipline
 	-- brport_section applies for libuci's sake.
 	local quoted = {}
 	for _, ifname in ipairs(sockets) do
 		quoted[#quoted + 1] = '"' .. ifname:gsub("[^%w._-]", "_") .. '"'
 	end
 
-	local socket_set = "iifname { " .. table.concat(quoted, ", ") .. " }"
-
-	M._exec("nft add table " .. NFT_LEARN_TABLE)
-	M._exec("nft add set " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_SET
-		.. " '{ type ifname . ether_addr; flags dynamic,timeout; timeout "
-		.. NFT_LEARN_TTL .. "; }'")
-	M._exec("nft add set " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_IPSET
-		.. " '{ type ifname . ether_addr . ipv4_addr; flags dynamic,timeout;"
-		.. " timeout " .. NFT_LEARN_TTL .. "; }'")
-	-- priority -300 (dstnat) puts this ahead of anything else openUF hooks in
-	-- the bridge family; policy accept and rules with no verdict mean it
-	-- observes and never decides.
-	M._exec("nft add chain " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
-		.. " '{ type filter hook prerouting priority -300; policy accept; }'")
-	M._exec("nft add rule " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
-		.. " '" .. socket_set
-		.. " update @" .. NFT_LEARN_SET .. " { iifname . ether saddr }'")
-	M._exec("nft add rule " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
-		.. " '" .. socket_set .. " arp saddr ip != 0.0.0.0"
-		.. " update @" .. NFT_LEARN_IPSET
-		.. " { iifname . ether saddr . arp saddr ip }'")
-	M._exec("nft add rule " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
-		.. " '" .. socket_set .. " ip saddr != 0.0.0.0"
-		.. " update @" .. NFT_LEARN_IPSET
-		.. " { iifname . ether saddr . ip saddr }'")
-	return true
+	local T, C = NFT_LEARN_TABLE, NFT_LEARN_CHAIN
+	local rule = "add rule " .. T .. " " .. C .. " iifname { " .. table.concat(quoted, ", ") .. " }"
+	local ok = util.nft_apply(T, {
+		"add set " .. T .. " " .. NFT_LEARN_SET
+			.. " { type ifname . ether_addr; flags dynamic,timeout; timeout " .. NFT_LEARN_TTL .. "; }",
+		"add set " .. T .. " " .. NFT_LEARN_IPSET
+			.. " { type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout " .. NFT_LEARN_TTL .. "; }",
+		-- priority -300 (dstnat) puts this ahead of anything else openUF hooks
+		-- in the bridge family; policy accept and rules with no verdict mean
+		-- it observes and never decides.
+		"add chain " .. T .. " " .. C .. " { type filter hook prerouting priority -300; policy accept; }",
+		rule .. " update @" .. NFT_LEARN_SET .. " { iifname . ether saddr }",
+		rule .. " arp saddr ip != 0.0.0.0 update @" .. NFT_LEARN_IPSET .. " { iifname . ether saddr . arp saddr ip }",
+		rule .. " ip saddr != 0.0.0.0 update @" .. NFT_LEARN_IPSET .. " { iifname . ether saddr . ip saddr }",
+	}, M._exec)
+	return ok
 end
 
 -- Undo dsa_apply: put br-lan's original port list back and drop openUF's

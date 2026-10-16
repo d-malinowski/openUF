@@ -141,10 +141,22 @@ local function joined(u, section)
 	return table.concat(ports_of(u, section), ",")
 end
 
+-- Every command run, in order, with an nft script expanded into its
+-- statements (see fake_nft).
 local function with_capture(fn)
 	local cmds = {}
 	local orig = switchvlan._exec
-	switchvlan._exec = function(c) cmds[#cmds + 1] = c return true end
+	local exec, r = fake_nft()
+	switchvlan._exec = function(c)
+		local seen = #r.cmds
+		local rc = exec(c)
+		if c:find("^nft %-f ") then
+			for i = seen + 1, #r.cmds do cmds[#cmds + 1] = r.cmds[i] end
+		else
+			cmds[#cmds + 1] = c
+		end
+		return rc
+	end
 	local ok, err = pcall(fn, cmds)
 	switchvlan._exec = orig
 	switchvlan._uci = nil
@@ -807,26 +819,26 @@ return {
 				for _, c in ipairs(cmds) do
 					if c:find("^nft ") then nft[#nft + 1] = c end
 				end
-				assert_eq(#nft, 8, "delete, table, two sets, chain, three rules")
-				assert_eq(nft[1], "nft delete table bridge openuf_learn 2>/dev/null",
+				assert_eq(#nft, 9, "delete, table, two sets, chain, three rules")
+				assert_eq(nft[2], "nft delete table bridge openuf_learn",
 					"rebuilt from scratch, like firewall.reconcile")
-				assert_eq(nft[2], "nft add table bridge openuf_learn", "the table")
-				assert_eq(nft[3], "nft add set bridge openuf_learn portmacs "
-					.. "'{ type ifname . ether_addr; flags dynamic,timeout; timeout 5m; }'",
+				assert_eq(nft[3], "nft add table bridge openuf_learn", "the table")
+				assert_eq(nft[4], "nft add set bridge openuf_learn portmacs "
+					.. "{ type ifname . ether_addr; flags dynamic,timeout; timeout 5m; }",
 					"who is behind the socket")
-				assert_eq(nft[4], "nft add set bridge openuf_learn portips "
-					.. "'{ type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 5m; }'",
+				assert_eq(nft[5], "nft add set bridge openuf_learn portips "
+					.. "{ type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 5m; }",
 					"and which address they hold -- what the network label needs")
-				assert_eq(nft[5], "nft add chain bridge openuf_learn learn "
-					.. "'{ type filter hook prerouting priority -300; policy accept; }'",
+				assert_eq(nft[6], "nft add chain bridge openuf_learn learn "
+					.. "{ type filter hook prerouting priority -300; policy accept; }",
 					"observing, never deciding")
-				assert_eq(nft[6], "nft add rule bridge openuf_learn learn "
-					.. "'iifname { \"lan3\" } update @portmacs "
-					.. "{ iifname . ether saddr }'",
-					"and only the socket that actually lost its learning")
 				assert_eq(nft[7], "nft add rule bridge openuf_learn learn "
-					.. "'iifname { \"lan3\" } arp saddr ip != 0.0.0.0 "
-					.. "update @portips { iifname . ether saddr . arp saddr ip }'",
+					.. "iifname { \"lan3\" } update @portmacs "
+					.. "{ iifname . ether saddr }",
+					"and only the socket that actually lost its learning")
+				assert_eq(nft[8], "nft add rule bridge openuf_learn learn "
+					.. "iifname { \"lan3\" } arp saddr ip != 0.0.0.0 "
+					.. "update @portips { iifname . ether saddr . arp saddr ip }",
 					"addresses from ARP, excluding the 0.0.0.0 of a probe")
 			end)
 		end
@@ -845,8 +857,8 @@ return {
 					if c:find("^nft add rule") then last = c end
 				end
 				assert_eq(last, "nft add rule bridge openuf_learn learn "
-					.. "'iifname { \"lan3\" } ip saddr != 0.0.0.0 "
-					.. "update @portips { iifname . ether saddr . ip saddr }'",
+					.. "iifname { \"lan3\" } ip saddr != 0.0.0.0 "
+					.. "update @portips { iifname . ether saddr . ip saddr }",
 					"the IPv4 source rule, excluding a DHCP DISCOVER's 0.0.0.0")
 			end)
 		end
@@ -889,8 +901,8 @@ return {
 				for _, c in ipairs(cmds) do
 					if c:find("^nft ") then nft[#nft + 1] = c end
 				end
-				assert_eq(#nft, 1, "only the teardown")
-				assert_eq(nft[1], "nft delete table bridge openuf_learn 2>/dev/null",
+				assert_eq(table.concat(nft, "\n"), "nft add table bridge openuf_learn\n"
+					.. "nft delete table bridge openuf_learn",
 					"the table goes and nothing replaces it")
 			end)
 		end
@@ -973,10 +985,26 @@ return {
 				switchvlan._uci = u.mock
 				switchvlan.reconcile_mac_taps(u.cursor)
 				assert_true(#cmds > 0, "a stale tap is replaced")
-				assert_eq(cmds[1], "nft delete table bridge openuf_learn 2>/dev/null",
+				assert_eq(cmds[2], "nft delete table bridge openuf_learn",
 					"starting with the teardown")
 			end)
 			switchvlan._popen = orig
+		end
+	},
+	{
+		name = "switchvlan/dsa: a tap nft rejects is not reported as installed",
+		fn = function()
+			local u = dsa_board()
+			u.cursor:set("network", "openuf_brport10_lan3", "device")
+			u.cursor:set("network", "openuf_brport10_lan3", "name", "lan3")
+			u.cursor:set("network", "openuf_brport10_lan3", "learning", "0")
+			local orig, orig_err = switchvlan._exec, io.stderr
+			switchvlan._exec = fake_nft(function(l) return l:find("update @portips", 1, true) end)
+			io.stderr = {write = function() end}
+			switchvlan._uci = u.mock
+			local ok = switchvlan.reconcile_mac_taps(u.cursor)
+			switchvlan._exec, io.stderr, switchvlan._uci = orig, orig_err, nil
+			assert_false(ok, "an address rule is missing: the tap is not whole")
 		end
 	},
 	{
@@ -987,9 +1015,8 @@ return {
 				switchvlan._uci = u.mock
 				assert_true(switchvlan.reconcile_mac_taps(u.cursor) == false,
 					"no sockets, no tap")
-				assert_eq(#cmds, 1, "one command")
-				assert_eq(cmds[1], "nft delete table bridge openuf_learn 2>/dev/null",
-					"and it is the teardown")
+				assert_eq(table.concat(cmds, "\n"), "nft add table bridge openuf_learn\n"
+					.. "nft delete table bridge openuf_learn", "only the teardown")
 			end)
 		end
 	},
