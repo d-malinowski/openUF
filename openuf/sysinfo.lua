@@ -1045,9 +1045,40 @@ function M.ext_offset(freq, width, center)
 	return freq < center and 1 or -1
 end
 
+-- What `iw dev <ifname> info` says about one interface. Inside a pass every
+-- radio's answer comes off one `iw dev`, which lists each interface under a
+-- `phy#N` header with the same lines `info` prints minus `wiphy N`; that line
+-- is put back, so callers read either text alike. An interface the dump does
+-- not list is asked for on its own.
+local function iw_dev_info(ifname)
+	local by_ifname = M._pass and pass_memo("iw_dev", function()
+		local map, phy, lines = {}, nil, nil
+		for line in (M._run_cmd("iw dev") or ""):gmatch("[^\n]+") do
+			local p = line:match("^phy#(%d+)")
+			if p then
+				phy, lines = p, nil
+			elseif line:match("^\t%S") then
+				-- A new interface entry; an unnamed one (a P2P device) is
+				-- skipped whole rather than read as part of the last.
+				local name = line:match("^\tInterface (%S+)")
+				lines = nil
+				if name and phy then
+					lines = {"Interface " .. name, "\twiphy " .. phy}
+					map[name] = lines
+				end
+			elseif lines then
+				lines[#lines + 1] = line:sub(2)
+			end
+		end
+		for name, l in pairs(map) do map[name] = table.concat(l, "\n") .. "\n" end
+		return map
+	end)
+	return by_ifname and by_ifname[ifname] or M._run_cmd("iw dev " .. ifname .. " info")
+end
+
 function M.radio_caps(ifname)
 	if not ifname then return {} end
-	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
+	local dev_info = iw_dev_info(ifname)
 	local phy = dev_info:match("wiphy%s+(%d+)")
 	if not phy then return {} end
 	local phy_info, static = M._phy_info(phy)

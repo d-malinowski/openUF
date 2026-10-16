@@ -1,0 +1,35 @@
+phy#1
+	Interface phy1-ap1
+		ifindex 58
+		wdev 0x100000026
+		addr 00:00:5e:00:53:03
+		ssid openuf-iot
+		type AP
+		channel 1 (2412 MHz), width: 20 MHz, center1: 2412 MHz
+		txpower 17.00 dBm
+		multicast TXQ:
+			qsz-byt	qsz-pkt	flows	drops	marks	overlmt	hashcol	tx-bytes	tx-packets
+			0	0	27188	0	0	0	67	6821923		28383
+	Interface phy1-ap0
+		ifindex 57
+		wdev 0x100000025
+		addr 00:00:5e:00:53:02
+		ssid openuf-lan
+		type AP
+		channel 1 (2412 MHz), width: 20 MHz, center1: 2412 MHz
+		txpower 17.00 dBm
+		multicast TXQ:
+			qsz-byt	qsz-pkt	flows	drops	marks	overlmt	hashcol	tx-bytes	tx-packets
+			0	0	7192	0	0	0	0	2037100		7192
+phy#0
+	Interface phy0-ap0
+		ifindex 56
+		wdev 0xb
+		addr 00:00:5e:00:53:01
+		ssid openuf-lan
+		type AP
+		channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz
+		txpower 23.00 dBm
+		multicast TXQ:
+			qsz-byt	qsz-pkt	flows	drops	marks	overlmt	hashcol	tx-bytes	tx-packets
+			0	0	10866	0	0	0	0	3050130		10866

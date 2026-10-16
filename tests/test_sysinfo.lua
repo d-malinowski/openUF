@@ -1629,6 +1629,94 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: inside a pass every radio's caps come off one `iw dev`, unchanged",
+		fn = function()
+			-- radio_caps forked `iw dev <if> info` once per radio per
+			-- heartbeat; `iw dev` lists them all. Captured on both boards
+			-- (ath79: one 5 GHz and two 2.4 GHz VAPs; filogic: the reverse).
+			local function flat(t)
+				local keys = {}
+				for k in pairs(t) do keys[#keys + 1] = k end
+				table.sort(keys)
+				for i, k in ipairs(keys) do keys[i] = k .. "=" .. tostring(t[k]) end
+				return table.concat(keys, " ")
+			end
+			for _, board in ipairs({"ath79", "filogic"}) do
+				local info, order = {}, {}
+				-- No "\0" in a pattern: 5.1 rejects it. Only the headers carry "#".
+				local text = fixture("iw_dev_info_" .. board .. ".txt")
+				for name, body in text:gmatch("## (%S+)\n([^#]*)") do
+					info[name] = body:gsub("\n$", "")
+					order[#order + 1] = name
+				end
+				assert_eq(#order, 3, board .. ": three interfaces in the capture")
+				local dump = fixture("iw_dev_" .. board .. ".txt")
+				with_fixtures({}, {}, function()
+					local runs = {}
+					sysinfo._run_cmd = function(cmd)
+						runs[#runs + 1] = cmd
+						if cmd == "iw dev" then return dump end
+						local i = cmd:match("^iw dev (%S+) info$")
+						if i then return info[i] or "" end
+						local p = cmd:match("^iw phy phy(%d+) info$")
+						if p then return fixture(p == "0" and "iw_phy_info_5g.txt" or "iw_phy_info_2g.txt") end
+						return ""
+					end
+					local want = {}
+					for _, i in ipairs(order) do want[i] = flat(sysinfo.radio_caps(i)) end
+					runs = {}
+					sysinfo.begin_pass()
+					for _, i in ipairs(order) do
+						assert_eq(flat(sysinfo.radio_caps(i)), want[i],
+							board .. " " .. i .. ": the same caps as its own `info`")
+					end
+					sysinfo.end_pass()
+					local n_dump, n_info = 0, 0
+					for _, c in ipairs(runs) do
+						if c == "iw dev" then n_dump = n_dump + 1 end
+						if c:match(" info$") and c:match("^iw dev") then n_info = n_info + 1 end
+					end
+					assert_eq(n_dump, 1, board .. ": one `iw dev` for the pass")
+					assert_eq(n_info, 0, board .. ": and no per-interface `info`")
+				end)
+			end
+		end
+	},
+	{
+		name = "sysinfo: the `iw dev` dump skips unnamed entries and falls back for unlisted interfaces",
+		fn = function()
+			with_fixtures({}, {}, function()
+				local runs = {}
+				sysinfo._run_cmd = function(cmd)
+					runs[#runs + 1] = cmd
+					if cmd == "iw dev" then
+						-- A P2P device lists after the VAP with its own
+						-- channel; read as part of wlan0 it would have given
+						-- a down VAP that channel.
+						return "phy#0\n\tInterface wlan0\n\t\tifindex 3\n\t\ttype AP\n"
+							.. "\tUnnamed/non-netdev interface\n\t\twdev 0x2\n\t\ttype P2P-device\n"
+							.. "\t\tchannel 11 (2462 MHz), width: 20 MHz, center1: 2462 MHz\n"
+					end
+					if cmd == "iw dev wlan9 info" then
+						return "Interface wlan9\n\twiphy 0\n\tchannel 6 (2437 MHz)\n"
+					end
+					if cmd == "iw phy phy0 info" then return fixture("iw_phy_info_2g.txt") end
+					return ""
+				end
+				sysinfo.begin_pass()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_eq(caps.nss, 2, "wlan0 resolved to phy0 off the dump")
+				assert_nil(caps.channel, "and the P2P device's channel is not wlan0's")
+				assert_eq(sysinfo.radio_caps("wlan9").channel, 6,
+					"an interface the dump lacks is asked for on its own")
+				sysinfo.end_pass()
+				local dumps = 0
+				for _, c in ipairs(runs) do if c == "iw dev" then dumps = dumps + 1 end end
+				assert_eq(dumps, 1, "the dump still runs once")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: radio_caps() reports the live TX power as whole dBm",
 		fn = function()
 			-- Same rationale as the live channel: with the controller's
