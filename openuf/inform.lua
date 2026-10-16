@@ -1309,12 +1309,15 @@ function M.build_json(st, cfg, ufhw)
 				M._sysinfo.wifi_driver and M._sysinfo.wifi_driver(ok_if and ifnames[1]))
 			-- Each station's AKM from hostapd, for is_11r below.
 			local akms = {}
-			if #stas > 0 and M._sysinfo.sta_akms then
-				local bsses, seen_bss = {}, {}
-				for _, b in pairs(sta_ifname) do
-					if not seen_bss[b] then seen_bss[b] = true; bsses[#bsses + 1] = b end
+			if #stas > 0 and M._sysinfo.sta_akms_cached then
+				local list = {}
+				for i, sta in ipairs(stas) do
+					if type(sta.mac) == "string" then
+						list[#list + 1] = {mac = sta.mac, bss = sta_ifname[i],
+							conn = tonumber(sta.connected_sec)}
+					end
 				end
-				local ok_akm, rv_akm = pcall(M._sysinfo.sta_akms, bsses)
+				local ok_akm, rv_akm = pcall(M._sysinfo.sta_akms_cached, list)
 				if ok_akm and type(rv_akm) == "table" then akms = rv_akm end
 			end
 			local noise = noise_by_radio[vap.radio_name]

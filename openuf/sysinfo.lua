@@ -455,13 +455,16 @@ end
 
 -- Each station's AKM suite on the given hostapd BSSes, as hostapd prints it
 -- ("00-0f-ac-9"), keyed by lower-case MAC. One hostapd_cli run for all of them.
+-- The second result is the set of stations hostapd listed at all, so a
+-- station it listed without an AKM (an open network) can be told from one
+-- it never answered for.
 function M.sta_akms(bsses)
-	local out = {}
+	local out, listed = {}, {}
 	local names = {}
 	for _, b in ipairs(bsses or {}) do
 		if b:match("^[%w%-%._]+$") then names[#names + 1] = b end
 	end
-	if #names == 0 then return out end
+	if #names == 0 then return out, listed end
 	local text = M._run_cmd("for b in " .. table.concat(names, " ")
 		.. "; do hostapd_cli -i $b all_sta; done")
 	local cur
@@ -469,9 +472,66 @@ function M.sta_akms(bsses)
 		local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
 		if mac then
 			cur = mac:lower()
+			listed[cur] = true
 		elseif cur then
 			local akm = line:match("^AKMSuiteSelector=(%S+)")
 			if akm then out[cur] = akm:lower() end
+		end
+	end
+	return out, listed
+end
+
+-- A station's AKM is fixed for the life of its association, so it is asked
+-- of hostapd once per association, not every heartbeat. An association is
+-- the station's BSS plus its start (uptime minus iw's connected time); a
+-- start that moved by more than the slack is a new association, which
+-- covers a reconnect between two heartbeats that iw's counter alone could
+-- hide. A station unseen for AKM_IDLE seconds is forgotten.
+M.AKM_IDLE = 300
+M.AKM_START_SLACK = 5
+M._akm_cache = {}   -- [mac] = {bss = ifname, start = s, akm = akm|false, seen = s}
+
+-- stas: {{mac = , bss = , conn = connected seconds}, ...}. Returns sta_akms'
+-- map for those stations, running hostapd_cli only on BSSes that hold a
+-- station with no current answer.
+function M.sta_akms_cached(stas)
+	local now_up = M.uptime()
+	local bsses, want = {}, {}
+	if now_up <= 0 then -- no clock to date associations by: ask every time
+		for _, s in ipairs(stas) do
+			if not want[s.bss] then want[s.bss] = true; bsses[#bsses + 1] = s.bss end
+		end
+		return (M.sta_akms(bsses))
+	end
+	local cache = M._akm_cache
+	for mac, e in pairs(cache) do
+		if e.seen + M.AKM_IDLE < now_up then cache[mac] = nil end
+	end
+	local out = {}
+	for _, s in ipairs(stas) do
+		local mac = s.mac:lower()
+		local e = cache[mac]
+		if e and s.conn and e.bss == s.bss
+			and math.abs(now_up - s.conn - e.start) <= M.AKM_START_SLACK then
+			e.seen = now_up
+			out[mac] = e.akm or nil
+		elseif not want[s.bss] then
+			want[s.bss] = true; bsses[#bsses + 1] = s.bss
+		end
+	end
+	if #bsses == 0 then return out end
+	local akms, listed = M.sta_akms(bsses)
+	listed = listed or {}
+	for _, s in ipairs(stas) do
+		if want[s.bss] then
+			local mac = s.mac:lower()
+			out[mac] = akms[mac]
+			-- Only an answer hostapd gave is kept: a station it did not list
+			-- (it failed, or the station came after iw's read) is asked again.
+			if listed[mac] and s.conn then
+				cache[mac] = {bss = s.bss, start = now_up - s.conn,
+					akm = akms[mac] or false, seen = now_up}
+			end
 		end
 	end
 	return out

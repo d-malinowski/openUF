@@ -26,6 +26,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	sysinfo.end_pass()
 	sysinfo._uplink_cache = {}
 	sysinfo._peer_cache = {}
+	sysinfo._akm_cache = {}
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -44,6 +45,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	sysinfo._phy_info_cache = {}
 	sysinfo._uplink_cache = {}
 	sysinfo._peer_cache = {}
+	sysinfo._akm_cache = {}
 	sysinfo.end_pass()
 	if not ok then error(err, 2) end
 end
@@ -330,11 +332,13 @@ return {
 				.. "00:00:5e:00:53:33\nflags=[AUTH][ASSOC][AUTHORIZED]\n"}, function()
 				local orig = sysinfo._run_cmd
 				sysinfo._run_cmd = function(cmd) seen = cmd; return orig(cmd) end
-				local a = sysinfo.sta_akms({"phy0-ap0", "phy0-ap1", "bad;name"})
+				local a, listed = sysinfo.sta_akms({"phy0-ap0", "phy0-ap1", "bad;name"})
 				sysinfo._run_cmd = orig
 				assert_eq(a["00:00:5e:00:53:31"], "00-0f-ac-9", "FT-SAE station")
 				assert_eq(a["00:00:5e:00:53:32"], "00-0f-ac-2", "PSK station")
 				assert_eq(a["00:00:5e:00:53:33"], nil, "open station: no AKM line")
+				assert_true(listed["00:00:5e:00:53:33"], "but listed")
+				assert_eq(listed["00:00:5e:00:53:34"], nil, "a station hostapd did not print is not")
 			end)
 			assert_true(seen:find("for b in phy0-ap0 phy0-ap1;", 1, true) ~= nil, "one run over both BSSes")
 			assert_true(seen:find("bad;name", 1, true) == nil, "a name unsafe for the shell is dropped")
@@ -342,7 +346,7 @@ return {
 				local n = 0
 				local orig = sysinfo._run_cmd
 				sysinfo._run_cmd = function(cmd) n = n + 1; return orig(cmd) end
-				assert_eq(next(sysinfo.sta_akms({})), nil, "no BSS: empty")
+				assert_eq(next((sysinfo.sta_akms({}))), nil, "no BSS: empty")
 				sysinfo._run_cmd = orig
 				assert_eq(n, 0, "no BSS: nothing run")
 			end)
@@ -353,6 +357,107 @@ return {
 				assert_eq(sysinfo.akm_is_ft(akm), false, akm .. " is not FT")
 			end
 			assert_eq(sysinfo.akm_is_ft(nil), false, "no AKM: not FT")
+		end
+	},
+	{
+		name = "sysinfo: sta_akms_cached() asks hostapd once per association",
+		fn = function()
+			local files = {["/proc/uptime"] = "1000.00 0\n"}
+			local A, B, C = "00:00:5e:00:53:31", "00:00:5e:00:53:32", "00:00:5e:00:53:33"
+			local reply = {
+				["phy0-ap0"] = A .. "\nAKMSuiteSelector=00-0f-ac-9\n" .. B .. "\nAKMSuiteSelector=00-0f-ac-2\n",
+				["phy0-ap1"] = C .. "\nflags=[AUTH][ASSOC][AUTHORIZED]\n",
+			}
+			local runs, asked = 0, {}
+			with_fixtures(files, {}, function()
+				sysinfo._run_cmd = function(cmd)
+					runs = runs + 1
+					local out = {}
+					for b in cmd:match("for b in (.-);"):gmatch("%S+") do
+						asked[#asked + 1] = b
+						out[#out + 1] = reply[b] or ""
+					end
+					return table.concat(out)
+				end
+				local stas = {{mac = A, bss = "phy0-ap0", conn = 100}, {mac = B, bss = "phy0-ap0", conn = 50},
+					{mac = C, bss = "phy0-ap1", conn = 10}}
+				local a = sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 1, "first heartbeat: one hostapd_cli run")
+				assert_eq(#asked, 2, "over both BSSes")
+				assert_eq(a[A], "00-0f-ac-9", "FT-SAE station")
+				assert_eq(a[B], "00-0f-ac-2", "PSK station")
+				assert_eq(a[C], nil, "open station: no AKM")
+
+				-- Fifteen seconds on: the same associations, one second of jitter.
+				files["/proc/uptime"] = "1015.00 0\n"
+				stas[1].conn, stas[2].conn, stas[3].conn = 116, 65, 25
+				a = sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 1, "steady stations: nothing run")
+				assert_eq(a[A], "00-0f-ac-9", "FT-SAE from the cache")
+				assert_eq(a[B], "00-0f-ac-2", "PSK from the cache")
+				assert_eq(a[C], nil, "open station cached as having none")
+
+				-- B reconnected with a new AKM between heartbeats: its connected
+				-- time is still past the last one, but its start moved.
+				files["/proc/uptime"] = "1030.00 0\n"
+				stas[1].conn, stas[2].conn, stas[3].conn = 131, 12, 40
+				reply["phy0-ap0"] = A .. "\nAKMSuiteSelector=00-0f-ac-9\n" .. B .. "\nAKMSuiteSelector=00-0f-ac-8\n"
+				asked = {}
+				a = sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 2, "a new association is asked again")
+				assert_eq(#asked, 1, "on its BSS only")
+				assert_eq(asked[1], "phy0-ap0", "phy0-ap0")
+				assert_eq(a[B], "00-0f-ac-8", "with its new AKM")
+				assert_eq(a[C], nil, "the other BSS still answers from the cache")
+
+				-- A moved to the other BSS with the same connected time.
+				stas[1].bss = "phy0-ap1"
+				reply["phy0-ap1"] = C .. "\n" .. A .. "\nAKMSuiteSelector=00-0f-ac-4\n"
+				a = sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 3, "a station on another BSS is asked again")
+				assert_eq(a[A], "00-0f-ac-4", "with the AKM it holds there")
+
+				-- hostapd did not list a station (it failed, or the station came
+				-- after iw's read): nothing is kept for it.
+				local D = "00:00:5e:00:53:34"
+				stas[4] = {mac = D, bss = "phy0-ap1", conn = 1}
+				sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 4, "a new station is asked for")
+				sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 5, "and asked again while hostapd does not list it")
+				stas[4] = nil
+
+				-- A station unseen for AKM_IDLE is forgotten; a cache hit
+				-- counts as seen.
+				assert_true(sysinfo._akm_cache[D] == nil, "an unlisted station was never cached")
+				files["/proc/uptime"] = "1250.00 0\n"
+				sysinfo.sta_akms_cached({{mac = B, bss = "phy0-ap0", conn = 232}})
+				assert_eq(runs, 5, "B answered from the cache")
+				files["/proc/uptime"] = "1330.00 0\n"
+				sysinfo.sta_akms_cached({})
+				assert_true(sysinfo._akm_cache[A] ~= nil, "A kept for AKM_IDLE")
+				files["/proc/uptime"] = "1331.00 0\n"
+				sysinfo.sta_akms_cached({})
+				assert_eq(sysinfo._akm_cache[A], nil, "and dropped after it")
+				assert_true(sysinfo._akm_cache[B] ~= nil, "B, seen at 1250, kept")
+				files["/proc/uptime"] = "1551.00 0\n"
+				sysinfo.sta_akms_cached({})
+				assert_eq(next(sysinfo._akm_cache), nil, "all gone")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: sta_akms_cached() without a clock asks every time",
+		fn = function()
+			local runs = 0
+			with_fixtures({}, {}, function()
+				sysinfo._run_cmd = function() runs = runs + 1 return "00:00:5e:00:53:31\nAKMSuiteSelector=00-0f-ac-9\n" end
+				local stas = {{mac = "00:00:5e:00:53:31", bss = "phy0-ap0", conn = 100}}
+				assert_eq(sysinfo.sta_akms_cached(stas)["00:00:5e:00:53:31"], "00-0f-ac-9", "answered")
+				sysinfo.sta_akms_cached(stas)
+				assert_eq(runs, 2, "asked again")
+				assert_eq(next(sysinfo._akm_cache), nil, "nothing kept")
+			end)
 		end
 	},
 	{

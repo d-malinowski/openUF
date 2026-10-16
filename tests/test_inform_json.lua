@@ -36,6 +36,7 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 	inform._sysinfo._uplink_cache   = {}
 	inform._sysinfo._ps_phy_cache   = {}
 	inform._sysinfo._peer_cache     = {}
+	inform._sysinfo._akm_cache      = {}
 	inform._sysinfo.end_pass()
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
@@ -940,6 +941,26 @@ return {
 			assert_eq(sta_table[1].satisfaction_now, 90, "satisfaction_now matches satisfaction")
 			assert_eq(sta_table[1].satisfaction_reason, 2, "reason: phy_rate")
 			assert_eq(sta_table[1].anomalies, 0, "no anomalies")
+		end
+	},
+	{
+		name = "inform json: a steady station's AKM is asked of hostapd once, not every heartbeat",
+		fn = function()
+			inform._sta_stats_cache = {}
+			local d, st = build({with_uci = true, with_clients = true})
+			local runs = 0
+			local base = inform._sysinfo._run_cmd
+			inform._sysinfo._run_cmd = function(cmd)
+				if cmd:find("hostapd_cli", 1, true) then runs = runs + 1 end
+				return base(cmd)
+			end
+			inform._sysinfo.end_pass()
+			local d2 = cjson.decode(inform.build_json(st, nil, ufhw))
+			inform._sysinfo._run_cmd = base
+			assert_eq(runs, 0, "second heartbeat: no hostapd_cli")
+			local t1, t2 = d.vap_table[1].sta_table, d2.vap_table[1].sta_table
+			assert_eq(t2[1].is_11r, true, "FT-SAE still reported from the cache")
+			assert_eq(t2[2].is_11r, t1[2].is_11r, "PSK unchanged")
 		end
 	},
 	{
