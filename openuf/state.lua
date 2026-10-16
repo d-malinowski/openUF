@@ -203,6 +203,12 @@ end
 -- write interrupted at the wrong moment cost the adoption outright.
 -- A side effect worth knowing: the bootstrap account now needs write
 -- permission on the DIRECTORY, not on the previous file.
+--
+-- M.last_written keeps the exact bytes, so inform's change detection can tell
+-- this process's own write from syswrapper's: without it every save was read
+-- back on the next heartbeat as an out-of-process change, and the full reload
+-- rebuilt the firewall's nft table each time.
+M.last_written = nil
 function M.save(st)
 	local tmp = M._state_file .. ".tmp"
 	local f = io.open(tmp, "w")
@@ -214,13 +220,15 @@ function M.save(st)
 			error("state.save: cannot write to " .. tmp)
 		end
 	end
-	f:write(cjson.encode(st))
+	local body = cjson.encode(st)
+	f:write(body)
 	f:close()
 	local ok, err = os.rename(tmp, M._state_file)
 	if not ok then
 		os.remove(tmp)
 		error("state.save: cannot replace " .. M._state_file .. ": " .. tostring(err))
 	end
+	M.last_written = body
 end
 
 -- Reset state to defaults and persist immediately.

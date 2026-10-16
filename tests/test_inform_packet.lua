@@ -3890,6 +3890,37 @@ return {
 		end
 	},
 	{
+		name = "inform: _reload_if_changed ignores this process's own state.save, not an external write",
+		fn = function()
+			-- Real file, real token: the token is the file's contents.
+			local path = inform._state._state_file
+			inform._state.save(sample_state({adopted = true, cfgversion = "v1"}))
+			local token = inform._state_mtime(path)
+			local reconciles = 0
+			local orig_fw = inform._firewall
+			inform._firewall = {reconcile = function() reconciles = reconciles + 1 end,
+				deauth = function() end, deny_sync = function() return false end}
+			local ok, err = pcall(function()
+				-- A save from inside the daemon (a setparam, a guest cmd ...).
+				local st = sample_state({adopted = true, cfgversion = "v2"})
+				inform._state.save(st)
+				token = inform._reload_if_changed(st, {config = {}}, token)
+				assert_eq(reconciles, 0, "own save is not reloaded")
+				assert_eq(token, inform._state_mtime(path), "token follows the own write")
+				assert_eq(st.mac, "aa:bb:cc:dd:ee:ff", "st untouched")
+				-- syswrapper writing the file from another process.
+				local f = assert(io.open(path, "w"))
+				f:write('{"adopted":false,"cfgversion":"v3"}')
+				f:close()
+				inform._reload_if_changed(st, {config = {}}, token)
+				assert_eq(reconciles, 1, "an external write still reloads")
+				assert_eq(st.cfgversion, "v3", "external contents loaded")
+			end)
+			inform._firewall = orig_fw
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: _reload_if_changed reloads state and preserves mac/ip/hostname when mtime changes",
 		fn = function()
 			-- Write a real fixture to the redirected state file, distinct

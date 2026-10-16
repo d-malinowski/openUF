@@ -4790,6 +4790,11 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	if mtime == nil or mtime == last_mtime then
 		return last_mtime
 	end
+	-- This process's own state.save: st already holds it. Reloading would
+	-- only rebuild the blocklist table (a drop gap) and re-run the deny sync.
+	if mtime == M._state.last_written then
+		return mtime
+	end
 	local was_adopted = st.adopted
 	local prev = {}
 	for k, v in pairs(st) do prev[k] = v end
