@@ -566,16 +566,17 @@ end
 -- for the known list fields on the ENCODED string -- version-independent.
 -- Safe against false positives: cjson escapes quotes inside string values,
 -- so the unescaped '"field":{}' shape cannot occur inside one.
+-- One pass over the payload, not one per field: each gsub copies the whole
+-- encoded string.
 local _ARRAY_FIELDS = {
-	"if_table", "radio_table", "radio_table_stats", "vap_table",
-	"scan_radio_table", "port_table", "lldp_table",
-	"sta_table", "mac_table", "scan_table",
+	if_table = '"if_table":[]', radio_table = '"radio_table":[]',
+	radio_table_stats = '"radio_table_stats":[]', vap_table = '"vap_table":[]',
+	scan_radio_table = '"scan_radio_table":[]', port_table = '"port_table":[]',
+	lldp_table = '"lldp_table":[]', sta_table = '"sta_table":[]',
+	mac_table = '"mac_table":[]', scan_table = '"scan_table":[]',
 }
 function M._fix_empty_arrays(json_str)
-	for _, f in ipairs(_ARRAY_FIELDS) do
-		json_str = json_str:gsub('("' .. f .. '"):{}', '%1:[]')
-	end
-	return json_str
+	return (json_str:gsub('"([%w_]+)":{}', _ARRAY_FIELDS))
 end
 
 -- One port's `mac_table`: the wired hosts a source reports, minus the two sets
