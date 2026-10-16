@@ -1097,25 +1097,34 @@ M._time = os.time
 
 -- How long a host stays remembered after it was last seen. See M._note_seen.
 M.MAC_FORGET_AFTER = 3600
+-- How often the forget sweep walks the tables. It ran once per sighting, so a
+-- heartbeat with N wired hosts walked them N times.
+M.MAC_SWEEP_EVERY = 60
+M._mac_swept_at = nil
 
 -- Record that key was seen now; returns when it was FIRST seen. Also the only
 -- place the two tables ever shrink: a host not seen for an hour is forgotten,
 -- so a daemon that runs for months does not keep every MAC that ever crossed
 -- the bridge.
 --
--- The sweep runs BEFORE this sighting is recorded, so it applies to `key`
--- itself as well: a host back after an hour away starts a fresh uptime instead
--- of reporting the wall-clock time since it was first seen, which for a host
--- that was gone for most of it is not an uptime at all. That is also what a
--- real switch reports for a re-learned MAC.
+-- The sweep runs at most once a minute; `key` itself is checked every time:
+-- a host back after an hour away starts a fresh uptime instead of reporting
+-- the wall-clock time since it was first seen, which for a host that was gone
+-- for most of it is not an uptime at all. That is also what a real switch
+-- reports for a re-learned MAC.
 function M._note_seen(key, now)
-	for k, last in pairs(M._mac_last_seen) do
-		if now - last > M.MAC_FORGET_AFTER then
-			M._mac_last_seen[k]  = nil
-			M._mac_first_seen[k] = nil
+	local swept = M._mac_swept_at
+	if not swept or now - swept >= M.MAC_SWEEP_EVERY or now < swept then
+		M._mac_swept_at = now
+		for k, last in pairs(M._mac_last_seen) do
+			if now - last > M.MAC_FORGET_AFTER then
+				M._mac_last_seen[k]  = nil
+				M._mac_first_seen[k] = nil
+			end
 		end
 	end
-	local first = M._mac_first_seen[key]
+	local first, last = M._mac_first_seen[key], M._mac_last_seen[key]
+	if first and last and now - last > M.MAC_FORGET_AFTER then first = nil end
 	if not first then
 		first = now
 		M._mac_first_seen[key] = now

@@ -807,6 +807,38 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: the forget sweep runs once a minute, not once per wired host",
+		fn = function()
+			-- It walked every remembered host on every sighting: N hosts per
+			-- heartbeat made it N*N steps. A host back after the window still
+			-- starts a fresh uptime when the sweep hasn't reached it yet.
+			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+			sysinfo._mac_swept_at = nil
+			local A, B, C, E = "eth1 aa:bb:cc:dd:ee:01", "eth1 aa:bb:cc:dd:ee:02",
+				"eth1 aa:bb:cc:dd:ee:03", "eth1 aa:bb:cc:dd:ee:05"
+			sysinfo._note_seen(A, 1000)                 -- sweeps (first ever)
+			sysinfo._note_seen(B, 1050)                 -- inside the minute: no sweep
+			sysinfo._note_seen(E, 1055)
+			sysinfo._note_seen(C, 4601)                 -- sweeps: A is 3601 s old
+			assert_nil(sysinfo._mac_last_seen[A], "A forgotten by the sweep")
+			sysinfo._note_seen(C, 4652)                 -- B is 3602 s old, but no sweep yet
+			assert_not_nil(sysinfo._mac_last_seen[B], "B waits for the next sweep")
+			assert_eq(sysinfo._note_seen(B, 4655), 4655,
+				"yet B back now is a fresh sighting, not one from 1050")
+			sysinfo._note_seen(C, 4661)                 -- a minute after 4601: sweeps
+			assert_nil(sysinfo._mac_last_seen[E], "E (3606 s old) forgotten")
+			assert_nil(sysinfo._mac_first_seen[E], "from both halves")
+			assert_eq(sysinfo._note_seen(B, 4662), 4655, "B keeps its new stamp")
+			-- A clock stepped back must not stall the sweep until it catches up.
+			local F = "eth1 aa:bb:cc:dd:ee:06"
+			sysinfo._note_seen(F, 100)
+			sysinfo._note_seen(C, 3800)
+			assert_nil(sysinfo._mac_last_seen[F], "swept after the clock stepped back")
+			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+			sysinfo._mac_swept_at = nil
+		end
+	},
+	{
 		-- Both swconfig fixtures are verbatim captures from the two real APs
 		-- (MACs anonymized): an AR9344 that exposes per-port MIB counters and
 		-- an AR8327 that answers "mib: ???" because its poll interval is 0.
