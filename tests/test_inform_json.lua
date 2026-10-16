@@ -35,6 +35,7 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 	inform._sysinfo._phy_info_cache = {}
 	inform._sysinfo._uplink_cache   = {}
 	inform._sysinfo._ps_phy_cache   = {}
+	inform._sysinfo._peer_cache     = {}
 	inform._sysinfo.end_pass()
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end

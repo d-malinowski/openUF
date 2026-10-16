@@ -935,7 +935,10 @@ it beacons (OUI `00:15:6d`, its device MAC in TLV `0x81`), so on a mixed site op
 as a UniFi AP of the site. The reverse does not hold: a real UniFi AP still reports openUF APs
 as third-party, since openUF does not beacon Ubiquiti's element. A UniFi AP that belongs to a
 different site is tagged too; the controller finds no such device in this site and falls back
-to its usual SSID check, so it changes nothing there.
+to its usual SSID check, so it changes nothing there. The element is read once per BSSID,
+not every heartbeat: a sibling's tag is kept for an hour, and a BSS without one is read again
+after ten minutes. So an AP that starts beaconing the element under a BSSID already seen (a
+neighbour just switched to openUF) can stay flagged for up to ten minutes.
 
 openUF closes that gap the way Ubiquiti's Channel AI describes — *"neighbor reports and
 automated RRM scans"* — rather than by scanning. Every `rrm_request_interval` seconds

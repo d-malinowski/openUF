@@ -554,6 +554,12 @@ function M.peer_match_ucode()
 		.. 'return null;}'
 end
 
+-- The reader's last line, printed once it has walked the whole scan cache.
+-- A dump that returned nothing at all prints no such line: nl80211 answers an
+-- empty cache and a failed request alike (null, checked on the C5), and the
+-- reader only runs when `iw` has just listed BSSes, so null is the failure.
+M.PEER_SCAN_DONE = "openuf-peer-scan-done"
+
 function M.peer_scan_cmd(ifname)
 	if type(ifname) ~= "string" or not ifname:match("^[%w%.%-_]+$") then return nil end
 	local script = M.peer_match_ucode()
@@ -563,20 +569,68 @@ function M.peer_scan_cmd(ifname)
 		.. 'for(let l in [b.information_elements||[],b.beacon_ies||[]]){let hit=null;'
 		.. 'for(let e in l){if(e.type==221){hit=pm(e.data);if(hit)break;}}'
 		.. 'if(hit){print(b.bssid," ",hit,"\\n");break;}}}'
+		.. 'if(r!=null)print("' .. M.PEER_SCAN_DONE .. '\\n");'
 	return "ucode -e '" .. script .. "' 2>/dev/null"
 end
 
 -- {bssid = identity MAC} for every BSS in ifname's scan cache that carries
--- the sibling-AP element.
+-- the sibling-AP element, and whether the reader ran to its end: without the
+-- closing line (no ucode, no nl80211 module, killed) a BSS missing from the
+-- map is unknown, not a stranger.
 function M.peer_macs(ifname)
 	local cmd = M.peer_scan_cmd(ifname)
-	if not cmd then return {} end
+	if not cmd then return {}, false end
+	local out = M._run_cmd(cmd) or ""
 	local peers = {}
-	for bssid, mac in (M._run_cmd(cmd) or ""):gmatch(
+	for bssid, mac in out:gmatch(
 			"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)") do
 		peers[bssid:lower()] = mac:lower()
 	end
-	return peers
+	return peers, out:find(M.PEER_SCAN_DONE, 1, true) ~= nil
+end
+
+-- The reader is a ucode fork that loads the nl80211 module, and it was made
+-- per radio per heartbeat to learn something that only changes when a BSS
+-- does. So its answer is kept per BSSID, and the
+-- reader runs only when the scan holds a BSSID it has no live answer for. A
+-- sibling is kept an hour. A stranger is kept ten minutes, so that a BSS which
+-- starts carrying the element under the same BSSID (a neighbour upgraded to
+-- openUF, or one that beaconed before it knew its identity) is picked up in
+-- that time. A stranger is only recorded from a reader that ran to its end.
+M.PEER_TTL_SIBLING  = 3600
+M.PEER_TTL_STRANGER = 600
+M._peer_cache = {}   -- [ifname] = {[bssid] = {mac = mac|false, until_up = s}}
+
+local function peer_tag(ifname, nets, now_up)
+	if now_up <= 0 then -- no clock to age entries by: read every time
+		local peers = M.peer_macs(ifname)
+		for _, n in ipairs(nets) do n.peer_mac = peers[n.bssid:lower()] end
+		return
+	end
+	local cache = M._peer_cache[ifname] or {}
+	M._peer_cache[ifname] = cache
+	for bssid, e in pairs(cache) do
+		if e.until_up <= now_up then cache[bssid] = nil end
+	end
+	local stale = false
+	for _, n in ipairs(nets) do
+		if not cache[n.bssid:lower()] then stale = true break end
+	end
+	if stale then
+		local peers, done = M.peer_macs(ifname)
+		for _, n in ipairs(nets) do
+			local bssid = n.bssid:lower()
+			if peers[bssid] then
+				cache[bssid] = {mac = peers[bssid], until_up = now_up + M.PEER_TTL_SIBLING}
+			elseif done then
+				cache[bssid] = {mac = false, until_up = now_up + M.PEER_TTL_STRANGER}
+			end
+		end
+	end
+	for _, n in ipairs(nets) do
+		local e = cache[n.bssid:lower()]
+		n.peer_mac = e and e.mac or nil
+	end
 end
 
 -- Returns a table of neighboring wireless networks visible to ifname, by
@@ -734,10 +788,7 @@ function M.scan_table(ifname)
 		end
 	end
 	flush()
-	if #nets > 0 then
-		local peers = M.peer_macs(ifname)
-		for _, n in ipairs(nets) do n.peer_mac = peers[n.bssid:lower()] end
-	end
+	if #nets > 0 then peer_tag(ifname, nets, now_up) end
 	return nets
 end
 

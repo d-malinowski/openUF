@@ -25,6 +25,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	-- entry left behind would memoize one test's fixtures into the next.
 	sysinfo.end_pass()
 	sysinfo._uplink_cache = {}
+	sysinfo._peer_cache = {}
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -42,6 +43,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	sysinfo._run_cmd   = orig_cmd
 	sysinfo._phy_info_cache = {}
 	sysinfo._uplink_cache = {}
+	sysinfo._peer_cache = {}
 	sysinfo.end_pass()
 	if not ok then error(err, 2) end
 end
@@ -1023,6 +1025,85 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: scan_table() reads sibling tags once per BSSID, not per heartbeat",
+		fn = function()
+			-- The ucode reader is a fork per radio per heartbeat, for an
+			-- answer that only changes when a BSS does: it runs only when the
+			-- scan holds a BSSID without a live cached answer.
+			local files = {["/proc/uptime"] = "1000.00 0\n"}
+			local scan = fixture("iw_scan_dump.txt")
+			local reads, reply = 0, "AA:BB:CC:DD:EE:01 00:00:5E:00:53:20\n"
+				.. sysinfo.PEER_SCAN_DONE .. "\n"
+			local cmds = {["scan dump"] = scan}
+			with_fixtures(files, cmds, function()
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd)
+					if cmd:find("ucode -e", 1, true) then reads = reads + 1 return reply end
+					return orig(cmd)
+				end
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(reads, 1, "first heartbeat reads")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20", "sibling tagged")
+				assert_eq(nets[2].peer_mac, nil, "stranger untagged")
+				nets = sysinfo.scan_table("wlan0")
+				assert_eq(reads, 1, "same BSSIDs: no second read")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20", "sibling still tagged from the cache")
+				assert_eq(nets[2].peer_mac, nil, "stranger still untagged from the cache")
+				sysinfo.scan_table("wlan1")
+				assert_eq(reads, 2, "another radio has its own cache")
+
+				cmds["scan dump"] = scan .. "BSS 00:00:5e:00:53:31(on wlan0)\n\tfreq: 2412\n"
+				nets = sysinfo.scan_table("wlan0")
+				assert_eq(reads, 3, "a new BSSID reads once")
+				assert_eq(#nets, 3, "and is reported")
+				sysinfo.scan_table("wlan0")
+				assert_eq(reads, 3, "then is cached too")
+
+				files["/proc/uptime"] = "1599.00 0\n"
+				sysinfo.scan_table("wlan0")
+				assert_eq(reads, 3, "a stranger is kept for ten minutes")
+				files["/proc/uptime"] = "1600.00 0\n"
+				sysinfo.scan_table("wlan0")
+				assert_eq(reads, 4, "and read again after them")
+
+				-- Down to the sibling alone: the strangers have expired by
+				-- now, the sibling's tag holds for its hour from the last read.
+				cmds["scan dump"] = scan:match("^(.-)\nBSS ") .. "\n"
+				reply = "garbage"
+				files["/proc/uptime"] = "5199.00 0\n"
+				nets = sysinfo.scan_table("wlan0")
+				assert_eq(reads, 4, "a sibling is kept for an hour")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20", "with its tag")
+				files["/proc/uptime"] = "5200.00 0\n"
+				nets = sysinfo.scan_table("wlan0")
+				assert_eq(reads, 5, "and read again after it")
+				assert_eq(nets[1].peer_mac, nil, "a reader that did not finish names no sibling")
+				sysinfo.scan_table("wlan0")
+				assert_eq(reads, 6, "...and records no stranger, so the next heartbeat reads again")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() without a clock reads sibling tags every time",
+		fn = function()
+			local reads = 0
+			with_fixtures({}, {["scan dump"] = fixture("iw_scan_dump.txt")}, function()
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd)
+					if cmd:find("ucode -e", 1, true) then
+						reads = reads + 1
+						return "AA:BB:CC:DD:EE:01 00:00:5E:00:53:20\n" .. sysinfo.PEER_SCAN_DONE .. "\n"
+					end
+					return orig(cmd)
+				end
+				local nets = sysinfo.scan_table("wlan0")
+				nets = sysinfo.scan_table("wlan0")
+				assert_eq(reads, 2, "no /proc/uptime: no ageing, so no cache")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20", "still tagged")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: peer_scan_cmd() matches exactly the element peer_ie_hex() builds",
 		fn = function()
 			local hex = sysinfo.peer_ie_hex("00:00:5E:00:53:20")
@@ -1035,6 +1116,8 @@ return {
 			assert_true(cmd:find('"' .. want .. '"', 1, true) ~= nil, "prefix matches the builder")
 			assert_true(cmd:find("n==13&&substr(d,0,7)==", 1, true) ~= nil, "body length is 0x0d")
 			assert_true(cmd:find('dev:"phy0-ap0"', 1, true) ~= nil, "asks about the right interface")
+			local tail = 'if(r!=null)print("' .. sysinfo.PEER_SCAN_DONE .. '\\n");\' 2>/dev/null'
+			assert_eq(cmd:sub(-#tail), tail, "the done line is printed last, after the walk, and only for a dump that answered")
 			assert_eq(sysinfo.peer_scan_cmd("x'; reboot; '"), nil, "an interface name cannot break out of the quoting")
 			assert_eq(sysinfo.peer_ie_hex(nil), nil, "no identity, no IE")
 			assert_eq(sysinfo.peer_ie_hex("not-a-mac"), nil, "garbage, no IE")
