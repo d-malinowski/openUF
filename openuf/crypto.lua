@@ -74,17 +74,21 @@ end
 
 -- Backend detection. lua-openssl is preferred; luacrypto is a legacy fallback.
 --
--- Lua's default package.path includes "./?.lua", so when this file is run
--- from its own directory (e.g. /opt/openuf, exactly how install.sh deploys
--- it) require("crypto") can resolve right back to this same crypto.lua file
--- instead of failing -- there's no real luacrypto binding installed, but the
--- name collides. Guard against that by checking the returned module actually
--- has luacrypto's shape (an `encrypt` function); this module's own table
--- doesn't, so the false-positive match now correctly falls through to the
--- openssl(1) CLI backend instead of erroring on a missing method.
+-- luacrypto is only looked for without lua-openssl, and only as the C module
+-- it is: Lua's default package.path includes "./?.lua", and the daemons run
+-- from /opt/openuf, so require("crypto") resolved right back to this file and
+-- loaded a second copy of it into package.loaded for the life of the process.
+-- package.path is emptied for that one require. The shape check stays as a
+-- belt: this module's own table has no `encrypt`.
 local _ossl_ok,   _ossl    = pcall(require, "openssl")
-local _crypto_ok, _lcrypto = pcall(require, "crypto")
-_crypto_ok = _crypto_ok and type(_lcrypto) == "table" and type(_lcrypto.encrypt) == "function"
+local _crypto_ok, _lcrypto = false, nil
+if not _ossl_ok then
+	local path = package.path
+	package.path = ""
+	_crypto_ok, _lcrypto = pcall(require, "crypto")
+	package.path = path
+	_crypto_ok = _crypto_ok and type(_lcrypto) == "table" and type(_lcrypto.encrypt) == "function"
+end
 
 -- Internal: unpredictable temp path for the openssl(1) CLI fallback. Names in
 -- the old code were "/tmp/uf_cbc_in_<os.time()>" — guessable to any local user,

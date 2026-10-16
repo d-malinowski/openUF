@@ -244,4 +244,44 @@ return {
 			assert_true(crypto.encrypt == nil, "module has no top-level encrypt field")
 		end
 	},
+	{
+		name = "crypto: looking for luacrypto never loads a second copy of this module",
+		fn = function()
+			-- The daemons run from /opt/openuf, where "./?.lua" made
+			-- require("crypto") load this file again and keep that copy in
+			-- package.loaded for the life of the process. Reproduce the
+			-- directory with "openuf/?.lua" on the path, with lua-openssl
+			-- present and with it missing.
+			local path, preload = package.path, package.preload.openssl
+			local had_ossl, had_crypto = package.loaded.openssl, package.loaded.crypto
+			local function load_from_openuf_dir()
+				package.loaded.crypto = nil
+				package.path = "openuf/?.lua;" .. path
+				local ok, err = pcall(dofile, "openuf/crypto.lua")
+				package.path = path
+				assert_true(ok, tostring(err))
+				local c = package.loaded.crypto
+				return c == nil or type(c.encrypt) == "function"
+			end
+			local ok, err = pcall(function()
+				local orig_require, asks = require, 0
+				require = function(name)
+					if name == "crypto" then asks = asks + 1 end
+					return orig_require(name)
+				end
+				package.loaded.openssl = nil
+				package.preload.openssl = function() return {} end  -- loads; never called here
+				local fine = load_from_openuf_dir()
+				require = orig_require
+				assert_true(fine, "with lua-openssl")
+				assert_eq(asks, 0, "with lua-openssl, luacrypto is not looked for at all")
+				package.loaded.openssl = nil
+				package.preload.openssl = function() error("lua-openssl absent") end
+				assert_true(load_from_openuf_dir(), "without lua-openssl")
+			end)
+			package.path, package.preload.openssl = path, preload
+			package.loaded.openssl, package.loaded.crypto = had_ossl, had_crypto
+			if not ok then error(err, 0) end
+		end
+	},
 }
