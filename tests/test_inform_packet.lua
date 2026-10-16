@@ -3689,6 +3689,48 @@ return {
 		end
 	},
 	{
+		name = "inform packet: zlib is looked up and the inflater loaded once, not per packet",
+		fn = function()
+			-- A failed require is not remembered by Lua: asking for zlib per
+			-- packet walked every package.path/cpath entry on every inform and
+			-- notification, and the inflater was dofile'd per compressed reply.
+			-- A fresh inform instance, so an earlier test's lookup doesn't count.
+			local zlib_asks, inflate_loads = 0, 0
+			local orig_require, orig_dofile = require, dofile
+			require = function(name)
+				if name == "zlib" then zlib_asks = zlib_asks + 1 end
+				return orig_require(name)
+			end
+			dofile = function(path)
+				if tostring(path):find("inflate", 1, true) then inflate_loads = inflate_loads + 1 end
+				return orig_dofile(path)
+			end
+			local ok, err = pcall(function()
+				local fresh = dofile("openuf/inform.lua")
+				fresh._crypto = inform._crypto
+				local st = sample_state()
+				local ff = io.open("tests/fixtures/zlib_response.bin", "rb")
+				local compressed = ff:read("*a"); ff:close()
+				local ct = crypto.aes_cbc_encrypt(st.authkey, FIXED_IV, compressed)
+				local function u32(n)
+					return string.char(math.floor(n/16777216)%256, math.floor(n/65536)%256,
+						math.floor(n/256)%256, n%256)
+				end
+				local pkt = MAGIC .. u32(1) .. "\170\187\204\221\238\255"
+					.. string.char(0, 3) .. FIXED_IV .. u32(1) .. u32(#ct) .. ct
+				for _ = 1, 3 do
+					fresh.build_packet('{"x":1}', st)
+					assert_true(fresh.parse_packet(pkt, st):find("setparam", 1, true) ~= nil,
+						"the reply still inflates")
+				end
+			end)
+			require, dofile = orig_require, orig_dofile
+			if not ok then error(err, 0) end
+			assert_true(zlib_asks <= 1, "zlib asked for at most once, got " .. zlib_asks)
+			assert_true(inflate_loads <= 1, "inflater loaded at most once, got " .. inflate_loads)
+		end
+	},
+	{
 		name = "inform packet: parse_packet errors on snappy-compressed response",
 		fn = function()
 			-- Build a raw packet with FLAG_SNAPPY (0x04) set

@@ -409,6 +409,25 @@ end
 
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
+-- A native zlib binding, looked up once: a failed require is not remembered
+-- by Lua, so asking per packet walked every package.path and cpath entry on
+-- every inform and notification. false = none (OpenWrt ships none).
+local _zlib
+local function zlib_binding()
+	if _zlib == nil then
+		local ok, z = pcall(require, "zlib")
+		_zlib = ok and type(z) == "table" and z or false
+	end
+	return _zlib
+end
+
+-- The pure-Lua inflater, loaded on the first compressed response only.
+local _inflate
+local function inflater()
+	_inflate = _inflate or _require_sibling("inflate")
+	return _inflate
+end
+
 -- Build a TNBU binary packet from a JSON string.
 -- st: state table (authkey, mac, use_gcm)
 -- GCM AAD = first 40 bytes of the packet header (per amd989/unifi-gateway encode_inform)
@@ -419,8 +438,8 @@ function M.build_packet(json_str, st)
 
 	-- Compress with zlib if available
 	local flags = FLAG_ENCRYPTED
-	local ok_zlib, zlib = pcall(require, "zlib")
-	if ok_zlib and zlib.compress then
+	local zlib = zlib_binding()
+	if zlib and zlib.compress then
 		local compressed = zlib.compress(payload)
 		if compressed and #compressed < #payload then
 			payload = compressed
@@ -503,16 +522,15 @@ function M.parse_packet(raw, st)
 	if bit.band(flags, FLAG_COMPRESSED) ~= 0 then
 		local done = false
 		-- Prefer a native zlib binding if the host happens to have one...
-		local ok_zlib, zlib = pcall(require, "zlib")
-		if ok_zlib and type(zlib) == "table" and zlib.decompress then
+		local zlib = zlib_binding()
+		if zlib and zlib.decompress then
 			local ok_d, out = pcall(zlib.decompress, payload)
 			if ok_d and out then payload = out; done = true end
 		end
 		-- ...otherwise fall back to the in-tree pure-Lua inflater (OpenWrt 25.12
 		-- ships no Lua zlib binding, so this is the normal path there).
 		if not done then
-			local inflate = _require_sibling("inflate")
-			payload = inflate.zlib_decompress(payload)
+			payload = inflater().zlib_decompress(payload)
 		end
 	end
 
