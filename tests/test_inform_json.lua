@@ -944,6 +944,33 @@ return {
 		end
 	},
 	{
+		name = "inform json: build_json closes a ucihelper pass it opened, never one it joined",
+		fn = function()
+			-- _tick holds one pass from its first resync to the payload; the
+			-- payload closing it would leave the rest of the cycle uncached.
+			local open, ends = false, 0
+			local function pass_mock()
+				inject_ucihelper()
+				inform._ucihelper.begin_pass = function()
+					if open then return false end
+					open = true
+					return true
+				end
+				inform._ucihelper.end_pass = function() open = false; ends = ends + 1 end
+			end
+			pass_mock()
+			open = true
+			build({})
+			assert_true(open, "a joined pass is still open after the payload")
+			assert_eq(ends, 0, "and build_json never ended it")
+			open = false
+			pass_mock()
+			build({})
+			assert_false(open, "called on its own, it closes the pass it opened")
+			assert_eq(ends, 1, "once")
+		end
+	},
+	{
 		name = "inform json: a steady station's AKM is asked of hostapd once, not every heartbeat",
 		fn = function()
 			inform._sta_stats_cache = {}

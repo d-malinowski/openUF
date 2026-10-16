@@ -786,14 +786,17 @@ function M.build_json(st, cfg, ufhw)
 	-- ufuci: VAP/radio info (require("uci") calls inside it can legitimately
 	-- fail off-target, so individual calls are still pcall-wrapped below)
 	local ufuci = M._ucihelper
+	local own_uci_pass = false
 	if ufuci and ufuci.get_vap_table then
 		-- One `ubus call network.wireless status` for the whole payload: every
 		-- get_ifname_for_radio/vap below (one per VAP in get_vap_table, one
 		-- per radio, one per VAP again) otherwise re-runs it for the same
 		-- answer -- ten identical forks per heartbeat on a two-radio,
 		-- four-SSID box. Feature-detected: test doubles inject a ucihelper
-		-- without it. _tick() ends the pass even when this function throws.
-		if ufuci.begin_pass then ufuci.begin_pass() end
+		-- without it. _tick() opens the pass for its whole cycle, and then
+		-- this joins it; called on its own, this opens one and closes it on
+		-- return. _tick() ends the pass even when this function throws.
+		own_uci_pass = ufuci.begin_pass and ufuci.begin_pass()
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
 		-- The modelmap's hwassign restricts which radios are reported; absent,
@@ -2083,7 +2086,7 @@ function M.build_json(st, cfg, ufhw)
 		lldp_table       = arr(lldp_table),
 	}
 
-	if ufuci and ufuci.end_pass then ufuci.end_pass() end
+	if own_uci_pass and ufuci.end_pass then ufuci.end_pass() end
 	if M._sysinfo.end_pass then M._sysinfo.end_pass() end
 	M._notif_identity = {
 		mac = payload.mac, serial = payload.serial, model = payload.model,
@@ -5501,6 +5504,19 @@ function M._tick(st, cfg, ufhw, ctx)
 	ctx.interval = ctx.interval or ctx.base_interval
 	ctx.backoff  = ctx.backoff  or ctx.interval
 
+	-- One ucihelper lookup pass from here to the payload: the resyncs below
+	-- (three of them each asked netifd for the VAP list on the same tick
+	-- once a minute), the WLAN schedule check and build_json share one
+	-- `ubus call network.wireless status` and one read of the wireless
+	-- config. Ended and reopened, never joined: a pass a throw left open
+	-- holds the last cycle's answers. A `wifi reload` inside it (a Forget)
+	-- drops what it held. Closed after build_json, below, before
+	-- handle_response can change the config.
+	local ufuci = M._ucihelper
+	if ufuci and ufuci.begin_pass and ufuci.end_pass then
+		ufuci.end_pass()
+		ufuci.begin_pass()
+	end
 	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
 	pcall(M._stun_tick, st)
 	-- Before build_json, so anything a client reported since the last cycle
@@ -5520,10 +5536,11 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- Reported as spectrum_scanning = true by this inform; swept below.
 	local spectrum_due = M._spectrum_pending
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
-	-- build_json opens a ucihelper lookup pass and closes it on its normal
-	-- return; an error skips that close, and a stale pass would then feed
-	-- handle_response's own lookups pre-reload interface names.
-	if M._ucihelper and M._ucihelper.end_pass then pcall(M._ucihelper.end_pass) end
+	-- The cycle's ucihelper pass, opened above, ends here whether or not
+	-- build_json returned: a pass left open would feed handle_response's own
+	-- lookups pre-reload interface names. build_json closes its sysinfo pass
+	-- on return; an error skips that, so it is closed here too.
+	if ufuci and ufuci.end_pass then pcall(ufuci.end_pass) end
 	if M._sysinfo and M._sysinfo.end_pass then pcall(M._sysinfo.end_pass) end
 	if not ok_b then
 		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")

@@ -3441,6 +3441,80 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: a pass reads the wireless config once for the schedule check and the payload",
+		fn = function()
+			-- schedule_vaps runs every tick, get_vap_table and get_radio_table
+			-- every heartbeat; each opened its own cursor and walked the
+			-- package again for the same answer.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				local seed = ucihelper._uci.cursor()
+				seed:set("wireless", "openuf_radio0_a", "wifi-iface")
+				seed:set("wireless", "openuf_radio0_a", "device", "radio0")
+				seed:set("wireless", "openuf_radio0_a", "ssid", "a")
+				seed:set("wireless", "openuf_radio0_a", "openuf_wlanconf_id", "w1")
+				seed:set("wireless", "openuf_radio0_a", "openuf_schedule", "mon|0000-0600")
+				seed:set("wireless", "openuf_radio0_b", "wifi-iface")
+				seed:set("wireless", "openuf_radio0_b", "device", "radio0")
+				seed:set("wireless", "openuf_radio0_b", "ssid", "b")
+				seed:set("wireless", "openuf_radio0_b", "openuf_wlanconf_id", "w2")
+				ucihelper.get_ifnames_for_vap = function(_, ssid) return {"phy0-" .. ssid} end
+				local cursors, walks = 0, 0
+				local real_cursor = ucihelper._uci.cursor
+				-- The mock hands out one shared cursor object: wrap its
+				-- foreach once.
+				local counted = {}
+				ucihelper._uci.cursor = function(...)
+					cursors = cursors + 1
+					local c = real_cursor(...)
+					if not counted[c] then
+						counted[c] = true
+						local real_foreach = c.foreach
+						c.foreach = function(self, pkg, typ, fn)
+							if typ == "wifi-iface" then walks = walks + 1 end
+							return real_foreach(self, pkg, typ, fn)
+						end
+					end
+					return c
+				end
+				local ok, err = pcall(function()
+					ucihelper.end_pass()
+					local before_s = ucihelper.schedule_vaps()
+					local before_v = ucihelper.get_vap_table()
+					assert_eq(walks, 2, "no pass open -- each reader walks, as before")
+
+					cursors, walks = 0, 0
+					assert_true(ucihelper.begin_pass(), "begin_pass opened the pass")
+					assert_false(ucihelper.begin_pass(), "a nested begin_pass joins it")
+					local s = ucihelper.schedule_vaps()
+					local v = ucihelper.get_vap_table()
+					ucihelper.get_radio_table()
+					local w = ucihelper.wlanconf_ifnames({w2 = true})
+					assert_eq(cursors, 1, "one cursor for the pass")
+					assert_eq(walks, 1, "one walk of the wifi-iface sections")
+					assert_eq(#s, 1, "the schedule check still sees its one VAP")
+					assert_eq(s[1].ifnames[1], before_s[1].ifnames[1], "the same one")
+					assert_eq(#v, #before_v, "the payload lists the same VAPs")
+					for i = 1, #v do
+						assert_eq(v[i].name, before_v[i].name, "in the same order")
+						assert_eq(v[i].id, before_v[i].id, "with the same ids")
+					end
+					assert_eq(#w, 1, "and the guest lookup filters the shared rows")
+					assert_eq(w[1].ssid, "b", "to the right VAP")
+
+					ucihelper.end_pass()
+					walks = 0
+					ucihelper.schedule_vaps()
+					ucihelper.schedule_vaps()
+					assert_eq(walks, 2, "the pass is closed -- every call walks again")
+				end)
+				ucihelper._uci.cursor = real_cursor
+				ucihelper.end_pass()
+				if not ok then error(err, 0) end
+			end)
+		end
+	},
+	{
 		name = "ucihelper: nothing read before a `wifi reload` is reused after it",
 		fn = function()
 			-- The radio rows come from the very config apply_config just

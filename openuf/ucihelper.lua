@@ -70,6 +70,26 @@ local function pass_memo(key, fn)
 	return value
 end
 
+-- One cursor per pass: libuci keeps a package a cursor has loaded, so
+-- /etc/config/wireless is parsed once per tick however many readers ask.
+local function pass_cursor()
+	return pass_memo("cursor", function() return get_uci().cursor() end)
+end
+
+-- Call fn on every wifi-iface section, in file order, as cursor:foreach
+-- would. Inside a pass the sections are collected once: schedule_vaps runs
+-- every tick and get_vap_table every heartbeat, and each walked the package
+-- for the same answer. The section tables are shared between callers, which
+-- only read them.
+local function each_iface(fn)
+	local rows = pass_memo("iface_sections", function()
+		local out = {}
+		pass_cursor():foreach("wireless", "wifi-iface", function(s) out[#out + 1] = s end)
+		return out
+	end)
+	for _, s in ipairs(rows) do fn(s) end
+end
+
 -- Load an enforcement sibling by path, mirroring inform.lua's _require_sibling:
 -- openUF's modules are not on package.path, and the working directory differs
 -- between running from openuf/ and from an install root. Returns nil rather
@@ -1784,8 +1804,7 @@ end
 -- radio/channel/tx_power against.
 local function radio_rows()
 	return pass_memo("radio_rows", function()
-	local uci = get_uci()
-	local cursor = uci.cursor()
+	local cursor = pass_cursor()
 	local radios = {}
 	cursor:foreach("wireless", "wifi-device", function(s)
 		radios[#radios + 1] = {
@@ -1887,7 +1906,7 @@ end
 -- name. Returns nil if unresolvable (e.g. off-target, radio disabled).
 -- The decoded `ubus call network.wireless status`, shared by the two lookups
 -- below. Cached only INSIDE a pass opened by begin_pass() -- inform.lua's
--- build_json opens one per payload and closes it on return -- and dropped by
+-- _tick opens one per cycle and closes it after the payload -- and dropped by
 -- end_pass() and after every `wifi reload`, so a netdev name read before
 -- netifd rebuilt the interfaces is never reused after. Outside a pass every
 -- call forks ubus exactly as before, which is also what keeps the test suite's
@@ -1895,7 +1914,15 @@ end
 -- be ten identical forks per heartbeat on a two-radio, four-SSID box is one.
 M._ws_cache = nil      -- {status = <decoded table> | false} while a pass is open
 M._ws_pass  = false
-function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil; M._pass_cache = {} end
+-- Nest-safe: returns true only when it opened the pass, and only that caller
+-- closes it. inform._tick opens one for the whole cycle, so the once-a-minute
+-- resyncs and the payload share one ubus answer and one config read; a
+-- build_json called on its own still opens (and closes) its own.
+function M.begin_pass()
+	if M._ws_pass then return false end
+	M._ws_pass = true; M._ws_cache = nil; M._pass_cache = {}
+	return true
+end
 function M.end_pass()   M._ws_pass = false; M._ws_cache = nil; M._pass_cache = nil end
 
 local function wireless_status()
@@ -2064,8 +2091,7 @@ end
 function M.wlanconf_ifnames(ids)
 	local out = {}
 	if type(ids) ~= "table" or next(ids) == nil then return out end
-	local cursor = get_uci().cursor()
-	cursor:foreach("wireless", "wifi-iface", function(s)
+	each_iface(function(s)
 		if s.disabled == "1" or not (s.openuf_wlanconf_id and ids[s.openuf_wlanconf_id]) then return end
 		local ok_if, ifnames = pcall(M.get_ifnames_for_vap, s.device, s.ssid)
 		if not ok_if then return end
@@ -2082,8 +2108,7 @@ end
 -- lines apply_config stored.
 function M.schedule_vaps()
 	local out = {}
-	local cursor = get_uci().cursor()
-	cursor:foreach("wireless", "wifi-iface", function(s)
+	each_iface(function(s)
 		if s.disabled == "1" or not s.openuf_wlanconf_id or not s.openuf_schedule then return end
 		local ok_if, ifnames = pcall(M.get_ifnames_for_vap, s.device, s.ssid)
 		if not ok_if or #ifnames == 0 then return end
@@ -2113,14 +2138,11 @@ end
 
 -- Return a table of VAP (virtual AP) info for the inform payload.
 function M.get_vap_table()
-	local uci = get_uci()
-	local cursor = uci.cursor()
-
 	local radio_by_name = {}
 	for _, r in ipairs(M.get_radio_table()) do radio_by_name[r.name] = r end
 
 	local vaps = {}
-	cursor:foreach("wireless", "wifi-iface", function(s)
+	each_iface(function(s)
 		-- Skip foreign SSIDs that are switched off: a disabled section with no
 		-- wlanconf id is not openUF's and is not on the air (typically
 		-- OpenWrt's stock "OpenWrt" default_radioN sections, which

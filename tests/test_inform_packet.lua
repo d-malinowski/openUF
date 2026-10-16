@@ -4118,6 +4118,75 @@ return {
 		end
 	},
 	{
+		name = "inform: a tick's resyncs and payload share one netifd answer",
+		fn = function()
+			-- Once a minute the l2guard and usteer resyncs each asked netifd
+			-- for the VAP list, and the payload asked again: three
+			-- `ubus call network.wireless status` on the same tick.
+			local u = dofile("openuf/ucihelper.lua")
+			local orig = {
+				ucihelper = inform._ucihelper,
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				l2guard = inform._l2guard, usteer = inform._usteer, popen = u._popen,
+				l2_next = inform._l2guard_next, us_next = inform._usteer_filter_next,
+				us_built = inform._usteer_filter_built,
+			}
+			local asks = 0
+			u._popen = function(cmd)
+				if cmd:find("network.wireless status", 1, true) then
+					asks = asks + 1
+					return '{"radio0":{"interfaces":[{"ifname":"phy0-ap0","config":{"ssid":"a"}}]}}'
+				end
+				return ""
+			end
+			inform._ucihelper = u
+			local in_payload
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function()
+				in_payload = u.get_ifname_for_radio("radio0")
+				return "{}"
+			end
+			inform.build_packet = function() return "pkt" end
+			inform.http_post = function() return "body" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform._l2guard = {reconcile = function() end}
+			inform._usteer = {reconcile_filter = function() end, filter_wanted = function() return true end}
+			local st = {inform_url = "http://unifi:8080/inform",
+				l2guard = {bpdu = true, ifnames = {"phy0-ap0"}}}
+			local ctx = {interval = 10, backoff = 10}
+			local ok, err = pcall(function()
+				inform._l2guard_next, inform._usteer_filter_next = 0, 0
+				inform._usteer_filter_built = nil
+				inform._tick(st, nil, nil, ctx)
+				assert_eq(in_payload, "phy0-ap0", "the payload resolved its VAP")
+				assert_eq(inform._usteer_filter_built, "phy0-ap0", "the usteer resync ran")
+				assert_eq(asks, 1, "one ubus call for the resyncs and the payload")
+				assert_false(u._ws_pass, "the pass ends with the payload")
+
+				inform._tick(st, nil, nil, ctx)
+				assert_eq(asks, 2, "the next tick asks again")
+
+				-- A pass a throw left open holds the last cycle's answer.
+				u.begin_pass()
+				u.get_ifname_for_radio("radio0")
+				asks = 0
+				inform._tick(st, nil, nil, ctx)
+				assert_eq(asks, 1, "a tick never joins a pass left open")
+			end)
+			inform.build_json, inform.build_packet, inform.http_post, inform.parse_packet =
+				orig.build_json, orig.build_packet, orig.http_post, orig.parse_packet
+			inform._reload_if_changed, inform._rrm_tick = orig.reload, orig.rrm
+			inform._l2guard, inform._usteer, u._popen = orig.l2guard, orig.usteer, orig.popen
+			inform._l2guard_next, inform._usteer_filter_next = orig.l2_next, orig.us_next
+			inform._usteer_filter_built = orig.us_built
+			inform._ucihelper = orig.ucihelper
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: a heartbeat that raises costs one cycle, not the daemon",
 		fn = function()
 			-- Regression test: the loop body called build_json, build_packet
