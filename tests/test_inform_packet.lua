@@ -1070,6 +1070,58 @@ return {
 		end
 	},
 	{
+		name = "inform packet: a DSA push works out the switch block and uplink socket once",
+		fn = function()
+			-- Both the port-VLAN set handed to the WiFi pass and the switch
+			-- pass after it need the parsed switch.* block and the socket the
+			-- uplink cable is in. Each consumer used to work both out again,
+			-- and the uplink is a `bridge fdb` dump.
+			local st = sample_state()
+			local si, sv = inform._sysinfo, inform._switchvlan
+			local orig_parse = inform._parse_switch_system_cfg
+			local orig_bo, orig_up = si.bridge_of, si.uplink_bridge_port
+			local parses, fdb_dumps, seen = 0, 0, {}
+			inform._parse_switch_system_cfg = function(raw)
+				parses = parses + 1
+				return orig_parse(raw)
+			end
+			si.bridge_of = function() return "br-lan" end
+			si.uplink_bridge_port = function(br)
+				fdb_dumps = fdb_dumps + 1
+				assert_eq(br, "br-lan", "asked of the LAN bridge")
+				return "wan"
+			end
+			inform._switchvlan = {
+				dsa_members = function(sw, _, up) seen.members = {sw = sw, up = up}; return {} end,
+				apply = function(sw, _, _, _, phys, ifname)
+					seen.apply = {sw = sw, phys = phys, ifname = ifname}
+				end,
+				restore = function() seen.restore = true end,
+			}
+			local sys_cfg = "switch.status=enabled\nswitch.vlan.status=enabled\n"
+				.. "switch.port.2.name=Data\nswitch.port.2.opmode=switch\n"
+				.. "switch.port.2.pvid=20\n"
+				.. "switch.vlan.1.id=1\nswitch.vlan.1.mode=untagged\nswitch.vlan.1.status=enabled\n"
+				.. "switch.vlan.2.id=20\nswitch.vlan.2.mode=tagged\nswitch.vlan.2.status=enabled\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
+			local ok, err = pcall(inform.handle_response, resp, st, nil)
+			inform._parse_switch_system_cfg = orig_parse
+			si.bridge_of, si.uplink_bridge_port = orig_bo, orig_up
+			inform._switchvlan = sv
+			if not ok then error(err, 0) end
+			assert_eq(parses, 1, "switch.* parsed once")
+			assert_eq(fdb_dumps, 1, "uplink socket looked up once")
+			assert_not_nil(seen.members, "the port-VLAN set was asked for")
+			assert_not_nil(seen.apply, "and the switch pass ran")
+			assert_eq(seen.members.up, "wan", "port-VLAN set gets the uplink")
+			assert_eq(seen.apply.ifname, "wan", "switch pass gets the same uplink")
+			assert_nil(seen.apply.phys, "no swconfig ARL lookup on DSA")
+			assert_true(seen.apply.sw ~= nil and seen.apply.sw == seen.members.sw,
+				"both get the same parsed switch block")
+			assert_true(seen.apply.sw.enabled, "and it is the enabled one that was pushed")
+		end
+	},
+	{
 		name = "inform packet: a tagged SSID's VLAN reaches switchvlan as a trunk request",
 		fn = function()
 			-- The switch drops frames for a VID it has no entry for, so a

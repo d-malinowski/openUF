@@ -3616,6 +3616,21 @@ function M.handle_response(json_str, st, cfg)
 			-- replaces the record outright.
 			st.guest_wlans = M._guest_wlans(vap_table, sys_raw)
 
+			-- The switch.* block and, on DSA, the socket the uplink cable is
+			-- in: both the port-VLAN set below and the switch pass after the
+			-- WiFi pass need them. Each is worked out once per push (the
+			-- uplink is a `bridge fdb` dump), not once per consumer.
+			local sw = M._parse_switch_system_cfg(sys_raw)
+			local dsa_uplink, dsa_uplink_known = nil, false
+			local function dsa_uplink_port()
+				if not dsa_uplink_known then
+					local br = M._sysinfo.bridge_of(cfg and cfg.net and cfg.net.lan_cpueth)
+					dsa_uplink = br and M._sysinfo.uplink_bridge_port(br) or nil
+					dsa_uplink_known = true
+				end
+				return dsa_uplink
+			end
+
 			-- VLANs that a WIRED port is assigned to. Computed before the
 			-- WiFi pass because their L2 is the same bridge a tagged SSID
 			-- uses, and apply_config prunes any bridge no WLAN wants --
@@ -3626,10 +3641,7 @@ function M.handle_response(json_str, st, cfg)
 			local port_vlans = {}
 			if M._switchvlan and M._switchvlan.dsa_members
 				and not (cfg and cfg.vlan and cfg.vlan.ports) then
-				local br = M._sysinfo.bridge_of(cfg and cfg.net and cfg.net.lan_cpueth)
-				local up = br and M._sysinfo.uplink_bridge_port(br) or nil
-				local ok_pv, m = pcall(M._switchvlan.dsa_members,
-					M._parse_switch_system_cfg(sys_raw), cfg, up)
+				local ok_pv, m = pcall(M._switchvlan.dsa_members, sw, cfg, dsa_uplink_port())
 				if ok_pv then
 					for vid in pairs(m or {}) do port_vlans[vid] = true end
 				end
@@ -3680,10 +3692,8 @@ function M.handle_response(json_str, st, cfg)
 						local swst = M._sysinfo.switch_status(cfg.vlan.device)
 						uplink_phys = M._sysinfo.uplink_phys_port(swst.arl)
 					else
-						local br = M._sysinfo.bridge_of(cfg and cfg.net and cfg.net.lan_cpueth)
-						if br then uplink_ifname = M._sysinfo.uplink_bridge_port(br) end
+						uplink_ifname = dsa_uplink_port()
 					end
-					local sw = M._parse_switch_system_cfg(sys_raw)
 					-- Turning Port VLAN off does not always announce itself.
 					-- The gates were once observed staying on the wire at
 					-- =disabled, but a device that has HAD the feature on and
