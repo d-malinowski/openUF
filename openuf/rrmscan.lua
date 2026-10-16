@@ -357,9 +357,9 @@ end
 -- Every line is prefixed with /proc/uptime when it arrives, because a
 -- notification carries no timestamp of its own and assoctrack.lua measures
 -- connection stages from these (auth -> assoc -> authorized, ~40 and ~120 ms
--- apart on the Archer C5). `read` and `printf` are ash builtins, so the loop
--- forks nothing per line -- it runs for every probe request in range, a few
--- per second.
+-- apart on the Archer C5). `case`, `read` and `printf` are ash builtins, so
+-- the loop forks nothing per line -- it runs for every probe request in
+-- range, a few per second.
 --
 -- opts.on_auth, when given, is a shell fragment run the moment an "auth"
 -- line arrives, with the station's MAC in $m. It exists for work that cannot
@@ -386,6 +386,10 @@ function M.collector_script(opts)
 		lines[#lines + 1] = "done &"
 	end
 	lines[#lines + 1] = 'ubus subscribe "$@" | while IFS= read -r l; do'
+	-- Probe requests are most of what hostapd notifies (57 of 57 lines in
+	-- one living-room sample) and nothing reads them: dropped here, they are
+	-- never stamped, written, re-read every ROAM_POLL_S and parsed.
+	lines[#lines + 1] = "	case \"$l\" in *'{ \"probe\": '*) continue ;; esac"
 	lines[#lines + 1] = "	read -r u _ < /proc/uptime"
 	if opts.on_auth then
 		lines[#lines + 1] = "	case \"$l\" in"

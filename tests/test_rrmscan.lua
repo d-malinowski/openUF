@@ -611,6 +611,47 @@ return {
 		end
 	},
 	{
+		-- Run for real: a stub `ubus` replays the captured events through the
+		-- script under sh. Probe requests never reach the file; every event a
+		-- consumer reads does, stamped.
+		name = "rrmscan: the collector drops probe requests in the shell, keeps the rest",
+		fn = function()
+			local dir = os.tmpname()
+			os.remove(dir)
+			assert_true(os.execute("mkdir " .. dir) ~= false, "tmp dir")
+			local fixture = read_fixture("ubus_assoc_events.txt")
+			local raw = {}
+			for line in fixture:gmatch("[^\n]+") do raw[#raw + 1] = (line:gsub("^%d+%.%d+ ", "")) end
+			local events = table.concat(raw, "\n") .. "\n"
+			local function put(name, body)
+				local f = io.open(dir .. "/" .. name, "w"); f:write(body); f:close()
+			end
+			put("events", events)
+			put("uptime", "123.45 6.78\n")
+			put("ubus", "#!/bin/sh\ncat " .. dir .. "/events\n")
+			os.execute("chmod +x " .. dir .. "/ubus")
+			local script = rrmscan.collector_script({on_auth = ":"}):gsub("/proc/uptime", dir .. "/uptime")
+			put("collect.sh", script)
+			local p = io.popen("PATH=" .. dir .. ":$PATH sh " .. dir .. "/collect.sh 2>&1")
+			local out = p:read("*a")
+			p:close()
+			os.execute("rm -rf " .. dir)
+			assert_true(events:find('{ "probe": ', 1, true) ~= nil, "the fixture has a probe to drop")
+			assert_true(out:find('"probe"', 1, true) == nil, "no probe line written")
+			local n_in, n_out = 0, 0
+			for line in events:gmatch("[^\n]+") do
+				if not line:find('{ "probe": ', 1, true) then n_in = n_in + 1 end
+			end
+			for line in out:gmatch("[^\n]+") do
+				n_out = n_out + 1
+				assert_true(line:sub(1, 7) == "123.45 ", "stamped: " .. line)
+			end
+			assert_eq(n_out, n_in, "every other event kept")
+			local evs = dofile("openuf/assoctrack.lua").parse_events(out)
+			assert_true(#evs >= 4, "auth/assoc/authorized/disassoc still parse")
+		end
+	},
+	{
 		-- A wifi reload kills the subscriber, never the monitor: each restart
 		-- would otherwise leave one more `bridge monitor` behind.
 		name = "rrmscan: the fdb half is killed before every start and on stop",

@@ -1096,6 +1096,8 @@ Troubleshooting:
 - `nft list table bridge openuf_assoc` must exist. Its sets fill while a client connects.
 - `head /tmp/openuf-rrm.jsonl` lines must start with a number (the uptime stamp). Unstamped
   lines come from a collector an older openUF started. It is replaced within a minute.
+  The file is drained every 250 ms and the collector drops probe requests, which nothing
+  reads, so it is usually empty; lines appear around a connection or a beacon report.
 - A connection on a BSS that has no `vap_table` entry yet (right after a config push) is
   dropped rather than filed under the wrong band.
 

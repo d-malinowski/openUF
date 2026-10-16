@@ -5493,16 +5493,20 @@ return {
 			inform._vap_by_ifname = {["phy1-ap0"] = "openuf_radio1_home"}
 			inform._roam_st = {adopted = true, inform_url = "u"}
 			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
-			inform._pre_blob = nil
+			inform._pre_blob, inform._roam_keep = nil, true
 			local ok, err = pcall(function()
 				inform._roam_poll()
 				assert_eq(#posts, 1, "one POST")
 				assert_eq(posts[1].event_type, "association", "the roam report")
 				assert_eq(posts[1].auth_algo, "ft", "auth_algo")
 				assert_true(at._stas[STA] ~= nil, "the funnel's attempt is open, for the heartbeat")
-				assert_eq(inform._pre_blob, lines, "lines kept for the harvest")
+				assert_eq(table.concat(inform._pre_blob), lines, "lines kept for the harvest")
 				inform._roam_poll()
 				assert_eq(#posts, 1, "an empty file costs nothing more")
+				-- A second drain is appended as its own chunk, not recopied.
+				local h = io.open(file, "w"); h:write("101.00 tail0\n"); h:close()
+				inform._roam_poll()
+				assert_eq(#inform._pre_blob, 2, "one chunk per drain")
 			end)
 			-- The heartbeat folds those lines into what harvest sees.
 			local harvested
@@ -5518,11 +5522,49 @@ return {
 			os.remove(file)
 			inform._rrmscan, inform.http_post, inform.build_packet = o.rrm, o.post, o.build
 			inform._notif_identity, inform._vap_by_ifname = o.ident, o.map
-			inform._roam_st, inform._roam_fast, inform._pre_blob = nil, false, nil
+			inform._roam_st, inform._roam_fast, inform._pre_blob, inform._roam_keep = nil, false, nil, false
 			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
 			if not ok then error(err, 0) end
 			if not ok2 then error(err2, 0) end
-			assert_eq(harvested, lines .. "200.0 tail\n", "pre-drained lines first, then the heartbeat's own")
+			assert_eq(harvested, lines .. "101.00 tail0\n200.0 tail\n", "pre-drained lines first, then the heartbeat's own")
+		end
+	},
+	{
+		-- With enrichment off nothing harvests beacon reports, so _idle's
+		-- drains are ingested for the roam reports and then let go.
+		name = "inform: _roam_poll keeps nothing for a harvest that will not run",
+		fn = function()
+			local at = inform._assoctrack
+			local file = os.tmpname()
+			local f = io.open(file, "w")
+			f:write('100.10 { "disassoc": {"address":"00:00:5e:00:53:01","ifname":"phy1-ap0"} }\n')
+			f:close()
+			local o_rrm = inform._rrmscan
+			inform._rrmscan = {EVENT_FILE = file, drain = function()
+				local h = io.open(file, "r"); local b = h:read("*a"); h:close()
+				h = io.open(file, "w"); h:close()
+				return b
+			end, collector_ensure = function() end}
+			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
+			local o_time = inform._time
+			inform._time = function() return 1 end
+			inform._rrm_collector_next = 10
+			local ok, err = pcall(function()
+				inform._pre_blob = {"stale"}
+				inform._rrm_tick({config = {rrm_enrichment = false}}, {notif_assoc_stat = true})
+				assert_true(inform._roam_fast, "connection tracking still polls")
+				assert_eq(inform._pre_blob, nil, "a kept chunk list is dropped once enrichment is off")
+				f = io.open(file, "w"); f:write("101.00 x\n"); f:close()
+				inform._roam_poll()
+				assert_eq(inform._pre_blob, nil, "and nothing new is kept")
+			end)
+			inform._time = o_time
+			inform._rrm_collector_next = 0
+			os.remove(file)
+			inform._rrmscan = o_rrm
+			inform._roam_st, inform._roam_fast, inform._pre_blob, inform._roam_keep = nil, false, nil, false
+			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
+			if not ok then error(err, 0) end
 		end
 	},
 	{

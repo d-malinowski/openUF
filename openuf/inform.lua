@@ -167,9 +167,12 @@ M.NOTIFS_PER_CYCLE   = 8
 -- connection tracking is on, _idle wakes this often to read the collector's
 -- file and sends any roam report at once. _roam_fast and _roam_st are set by
 -- each _tick; _pre_blob holds what _idle drained, for the heartbeat's
--- beacon-report harvest.
+-- beacon-report harvest, and only while that harvest runs (_roam_keep). It
+-- is a list of chunks, joined once by the harvest: _idle drains ~60 times a
+-- heartbeat, and appending to one string recopied it each time.
 M.ROAM_POLL_S        = 0.25
 M._roam_fast         = false
+M._roam_keep         = false
 M._roam_st           = nil
 M._pre_blob          = nil
 
@@ -4955,7 +4958,8 @@ function M._rrm_tick(cfg, st)
 	local rrm_on   = cfg and cfg.config and cfg.config.rrm_enrichment
 	local assoc_on = M._assoc_enabled(st, cfg)
 	M._roam_fast, M._roam_st = assoc_on and rrm.drain ~= nil, st
-	if not assoc_on then M._pre_blob = nil end
+	M._roam_keep = rrm_on and true or false
+	if not (assoc_on and rrm_on) then M._pre_blob = nil end
 	if not rrm_on and not assoc_on then
 		-- Enrichment is off, but a collector from an earlier run with it ON may
 		-- still be alive: it is a detached `ubus subscribe` child reparented to
@@ -5017,12 +5021,14 @@ function M._rrm_tick(cfg, st)
 		local ok_a, err_a = pcall(M._assoc_poll, blob)
 		if not ok_a then io.stderr:write("inform: assoctrack: " .. tostring(err_a) .. "\n") end
 	end
+	if not rrm_on then return true end
 	-- Lines _idle drained since the last heartbeat were ingested there; the
 	-- beacon reports among them are still the harvest's.
 	if M._pre_blob then
-		blob, M._pre_blob = M._pre_blob .. (blob or ""), nil
+		local chunks = M._pre_blob
+		chunks[#chunks + 1] = blob or ""
+		blob, M._pre_blob = table.concat(chunks), nil
 	end
-	if not rrm_on then return true end
 
 	local ok, fresh, reporters = pcall(rrm.harvest, blob)
 	if ok then
@@ -5442,7 +5448,11 @@ function M._roam_poll()
 	if not size or size == 0 then return end
 	local blob = rrm.drain()
 	if not blob or blob == "" then return end
-	M._pre_blob = (M._pre_blob or "") .. blob
+	if M._roam_keep then
+		local chunks = M._pre_blob or {}
+		chunks[#chunks + 1] = blob
+		M._pre_blob = chunks
+	end
 	local evs = at.parse_events(blob)
 	at.ingest(evs)
 	at.roam_ingest(evs, M._vap_by_ifname)
