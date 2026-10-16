@@ -74,29 +74,32 @@ function M.neighbors()
 	local now = M._time()
 	local c = M._neighbours_cache
 	if c and (now - c.at) < M.NEIGHBOURS_TTL then return c.value end
-	local value = M._neighbors_uncached()
-	-- Only a real answer is cached. No lldpd, a failed fork or a truncated
-	-- reply all come back empty, and pinning that for a minute would blank the
-	-- topology on a transient the very next heartbeat would have fixed.
-	if #value > 0 then M._neighbours_cache = {value = value, at = now} end
+	local value, answered = M._neighbors_uncached()
+	-- Only an answer from lldpd is cached, including its "no neighbours"
+	-- ({"lldp":{}}), which is the steady state on most ports. No lldpd, a
+	-- failed fork or a truncated reply print nothing or unparsable JSON, and
+	-- pinning that for a minute would blank the topology on a transient the
+	-- very next heartbeat would have fixed.
+	if answered then M._neighbours_cache = {value = value, at = now} end
 	return value
 end
 
+-- Returns the neighbour list and whether lldpd actually answered.
 function M._neighbors_uncached()
 	local output = M._run_cmd("lldpctl -f json")
-	if not output or output == "" then return {} end
+	if not output or output == "" then return {}, false end
 
 	local ok, data = pcall(cjson.decode, output)
-	if not ok or type(data) ~= "table" then return {} end
+	if not ok or type(data) ~= "table" then return {}, false end
 
 	local result = {}
 
 	-- lldpctl -f json structure: {"lldp": {"interface": {...}}}
 	local lldp = data.lldp
-	if type(lldp) ~= "table" then return {} end
+	if type(lldp) ~= "table" then return {}, false end
 
 	local ifaces = lldp.interface
-	if type(ifaces) ~= "table" then return {} end
+	if type(ifaces) ~= "table" then return {}, true end
 
 	-- ifaces can be a single object or array depending on lldpd version
 	local iface_list = {}
@@ -123,7 +126,7 @@ function M._neighbors_uncached()
 		end
 	end
 
-	return result
+	return result, true
 end
 
 -- Parse a single neighbor table from lldpctl JSON output.

@@ -168,6 +168,43 @@ return {
 			up = true
 			assert_eq(#lldp.neighbors(), 1, "and the neighbour lands immediately, not in a minute")
 
+			for _, junk in ipairs({'{"lldp":{"interf', '{"other":1}', "[1]"}) do
+				lldp._neighbours_cache = nil
+				up = false
+				local reply = junk
+				lldp._run_cmd = function() return up and fixture("lldpctl_output.json") or reply end
+				assert_eq(#lldp.neighbors(), 0, "garbage reads as nothing: " .. junk)
+				up = true
+				assert_eq(#lldp.neighbors(), 1, "and is not pinned: " .. junk)
+			end
+
+			lldp._run_cmd, lldp._time = orig_cmd, orig_time
+			lldp._neighbours_cache = nil
+		end
+	},
+	{
+		name = "lldp: lldpd's own 'no neighbours' answer is cached like any other",
+		fn = function()
+			-- lldpctl prints {"lldp":{}} (pretty-printed) when lldpd runs
+			-- but has heard no one: the steady state on a port facing a switch
+			-- without LLDP. Not caching it forked lldpctl every heartbeat.
+			local orig_cmd, orig_time = lldp._run_cmd, lldp._time
+			local clock, forks = 9000, 0
+			lldp._time = function() return clock end
+			lldp._neighbours_cache = nil
+			lldp._run_cmd = function()
+				forks = forks + 1
+				return '{\n  "lldp": {\n    \n  }\n}\n'
+			end
+
+			assert_eq(#lldp.neighbors(), 0, "no neighbours")
+			lldp.neighbors(); lldp.neighbors()
+			assert_eq(forks, 1, "one lldpctl fork serves a minute of heartbeats")
+
+			clock = clock + lldp.NEIGHBOURS_TTL + 1
+			lldp.neighbors()
+			assert_eq(forks, 2, "and it is asked again once the TTL is up")
+
 			lldp._run_cmd, lldp._time = orig_cmd, orig_time
 			lldp._neighbours_cache = nil
 		end

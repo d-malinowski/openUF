@@ -1423,9 +1423,10 @@ The neighbour table is included in every inform, but `lldpctl` is only re-run
 once a minute rather than on every 10-second heartbeat: `lldpd` advertises on a
 30-second interval, so polling it faster only cost a process spawn and a JSON
 decode. A topology change — a new neighbour, or a moved cable — can therefore
-take up to a minute to show up on the controller's map. An *empty* answer is
-never cached, so a device that starts before `lldpd` picks its neighbours up on
-the very next heartbeat.
+take up to a minute to show up on the controller's map, and so can the first
+neighbour on a port that had none. Only an answer from `lldpd` is cached: when
+`lldpd` isn't running yet, `lldpctl` prints nothing, so a device that starts
+before `lldpd` picks its neighbours up on the very next heartbeat.
 
 ### Point lldpd's chassis ID at the same interface as `lan_cpueth`
 
