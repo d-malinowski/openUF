@@ -12,6 +12,10 @@ instances (`announce`, `inform`) from `/opt/openuf/`.
   `bcfilter.lua` (`bridge openuf_bcfilt`), `shaper.lua`, `l2guard.lua`
 - `switchvlan.lua` (swconfig + DSA per-port VLAN), `sysinfo.lua` (iw/proc/bridge reads),
   `state.lua` (`/etc/openuf/state.json`, explicit `M.FIELDS` list), `crypto.lua`, `inflate.lua`
+- `util.lua`: shared helpers (file/command reads, `exec_ok`, `is_mac`, `valid_ifname`, the
+  bit shim, sysfs `master_of`/`driver_of`). Load it through `package.loaded["openuf.util"]`
+  or by path as the modules do, never with a bare `require "util"`. Point a module's
+  `M._read_file`-style seams at it rather than copying a helper.
 - `modelmap/` = board hardware profile, `ufmodel/` = presented UniFi identity
 - `PROTOCOL-VALIDATION.md` — the evidence log for every wire-format claim. Read the
   relevant section before touching a protocol field; add to it when you establish one.

@@ -9,6 +9,8 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable seams for tests
 M._uci        = nil  -- override with a mock UCI table; nil = require("uci")
@@ -18,26 +20,14 @@ M._bcfilter   = nil  -- nil = load openuf/bcfilter.lua on first use
 -- "WiFi Speed Limit" enforcement (tc). Injectable for the same reason.
 -- Minimum RSSI's constants (wire offset, refusal margin).
 M._minrssi    = nil  -- nil = load openuf/minrssi.lua on first use
-M._run_cmd    = function(cmd) return os.execute(cmd) end
+M._run_cmd    = os.execute
 
 -- Injectable: command execution that captures stdout (for read-only introspection,
 -- as opposed to M._run_cmd which only reports success/failure for mutating commands).
-M._popen = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._popen = util.capture
 
 -- Injectable: file reader, for sysfs lookups (e.g. interface MAC address).
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- Static radio capability defaults, used when UCI/driver introspection can't
 -- supply a real value. Tune per target hardware (see u6iw.lua's fw.ver note
@@ -841,10 +831,7 @@ end
 
 -- The bridge a netdev is enslaved to, or nil when it carries its own address.
 local function master_of(ifname)
-	local m = M._popen("readlink /sys/class/net/" .. tostring(ifname) .. "/master")
-	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
-	if m and m ~= "" and m ~= ifname then return m end
-	return nil
+	return util.master_of(ifname, M._read_file)
 end
 
 -- Give the management bridge the MAC openUF identifies as.

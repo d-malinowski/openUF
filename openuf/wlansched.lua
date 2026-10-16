@@ -37,6 +37,8 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Index - 1 is the weekday as `date +%w` counts it: 0 is Sunday.
 M.DAYS = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
@@ -45,21 +47,9 @@ M.DAYS = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
 M.MAX_INDEX = 98
 
 -- Injectable seams, as in the other modules.
-M._exec = function(cmd) return os.execute(cmd) end
-M._popen = function(cmd)
-	local p = io.popen(cmd)
-	if not p then return nil end
-	local out = p:read("*a")
-	p:close()
-	return out
-end
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._exec = os.execute
+M._popen = util.popen
+M._read_file = util.read_file
 
 -- ubntbox's sscanf("%2d%2d-%2d%2d"): "0700-2200" -> "07:00-22:00". nil when
 -- it does not parse.
@@ -136,9 +126,7 @@ function M.down_set(vaps, wday, now)
 	return down
 end
 
-local function valid_ifname(n)
-	return type(n) == "string" and n:match("^[%w%-%._]+$") ~= nil
-end
+local valid_ifname = util.valid_ifname
 
 -- IFF_UP from sysfs. nil when the netdev does not exist.
 function M.is_up(ifname)

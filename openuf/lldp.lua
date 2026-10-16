@@ -15,24 +15,14 @@
 local cjson = require("cjson")
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable: override in tests to return fixture lldpctl output
-M._run_cmd = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._run_cmd = util.capture
 
 -- Injectable: override in tests to return fixture file contents
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- Injectable: override in tests to control elapsed time deterministically.
 M._time = os.time

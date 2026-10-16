@@ -21,8 +21,8 @@ local function with_fixtures(file_map, cmd_map, fn)
 	-- feeding a canned phy dump must not leak those caps into a later one.
 	sysinfo._phy_info_cache = {}
 	-- Same reasoning for the lookup pass and for the uplink cache, which holds
-	-- a `readlink` and an `ip route` answer for five minutes: a pass or an
-	-- entry left behind would memoize one test's fixtures into the next.
+	-- an `ip route` answer for five minutes: a pass or an entry left behind
+	-- would memoize one test's fixtures into the next.
 	sysinfo.end_pass()
 	sysinfo._uplink_cache = {}
 	sysinfo._peer_cache = {}
@@ -235,18 +235,21 @@ return {
 		end
 	},
 	{
-		name = "sysinfo: wifi_driver() reads the netdev's driver once",
+		name = "sysinfo: wifi_driver() reads the netdev's driver once, without a fork",
 		fn = function()
 			sysinfo._driver_cache = {}
-			local calls = 0
-			with_fixtures({}, {["readlink"] = "../../../../bus/platform/drivers/mt798x-wmac\n"}, function()
-				local orig = sysinfo._run_cmd
-				sysinfo._run_cmd = function(cmd) calls = calls + 1; return orig(cmd) end
-				assert_eq(sysinfo.wifi_driver("phy1-ap0"), "mt798x-wmac", "basename of the link")
+			local reads, forks = 0, 0
+			with_fixtures({["/sys/class/net/phy1-ap0/device/uevent"] =
+				"OF_NAME=wifi\nDRIVER=mt798x-wmac\nMODALIAS=of:Nwifi\n"}, {}, function()
+				local orig, orig_cmd = sysinfo._read_file, sysinfo._run_cmd
+				sysinfo._read_file = function(p) reads = reads + 1; return orig(p) end
+				sysinfo._run_cmd = function(cmd) forks = forks + 1; return orig_cmd(cmd) end
+				assert_eq(sysinfo.wifi_driver("phy1-ap0"), "mt798x-wmac", "the uevent's DRIVER=")
 				assert_eq(sysinfo.wifi_driver("phy1-ap0"), "mt798x-wmac", "cached")
-				sysinfo._run_cmd = orig
+				sysinfo._read_file, sysinfo._run_cmd = orig, orig_cmd
 			end)
-			assert_eq(calls, 1, "one readlink per netdev")
+			assert_eq(reads, 1, "one read per netdev")
+			assert_eq(forks, 0, "and no fork")
 			with_fixtures({}, {}, function()
 				assert_nil(sysinfo.wifi_driver("lo"), "no driver link: nil")
 			end)
@@ -1061,11 +1064,11 @@ return {
 	{
 		name = "sysinfo: bridge_of() names the bridge a socket is enslaved to",
 		fn = function()
-			with_fixtures({}, {["readlink"] =
-				"../../../../../../../../virtual/net/br-lan\n"}, function()
+			with_fixtures({["/sys/class/net/lan3/master/uevent"] =
+				"DEVTYPE=bridge\nINTERFACE=br-lan\nIFINDEX=7\n"}, {}, function()
 					assert_eq(sysinfo.bridge_of("lan3"), "br-lan", "lan3 is in br-lan")
 				end)
-			-- A netdev that is not a bridge port: readlink prints nothing.
+			-- A netdev that is not a bridge port has no master/ at all.
 			with_fixtures({}, {}, function()
 				assert_true(sysinfo.bridge_of("eth0") == nil, "not enslaved -> nil")
 			end)
@@ -2041,24 +2044,23 @@ return {
 		end
 	},
 	{
-		name = "sysinfo: the uplink's near-static inputs are cached, the cable-following ones are not",
+		name = "sysinfo: the uplink's near-static input is cached, the cable-following ones are not",
 		fn = function()
 			-- Which socket the cable is in must stay measured every heartbeat.
-			-- Which BRIDGE a netdev is on, and what the default route's gateway
-			-- IP is, are not measurements of the cable and changed only when
-			-- the network was reconfigured -- two forks a heartbeat, forever.
+			-- What the default route's gateway IP is, is not a measurement of
+			-- the cable and changes only when the network is reconfigured -- a
+			-- fork a heartbeat, forever. Which BRIDGE a netdev is on is a sysfs
+			-- read, asked live and never forked.
 			local orig_cmd, orig_rf, orig_time =
 				sysinfo._run_cmd, sysinfo._read_file, sysinfo._time
 			local clock = 5000
 			sysinfo._time = function() return clock end
 			sysinfo._uplink_cache = {}
-			local readlinks, routes = 0, 0
+			local masters, routes, forks = 0, 0, 0
 			local gw = "192.0.2.1"
 			sysinfo._run_cmd = function(cmd)
-				if cmd:find("readlink") then
-					readlinks = readlinks + 1
-					return "../../../../../virtual/net/br-lan\n"
-				elseif cmd:find("ip route") then
+				forks = forks + 1
+				if cmd:find("ip route") then
 					routes = routes + 1
 					return "default via " .. gw .. " dev br-lan \n"
 				end
@@ -2070,13 +2072,17 @@ return {
 					arp_reads = arp_reads + 1
 					return gw .. " 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
 						.. "192.0.2.9 0x1 0x2 aa:bb:cc:00:00:09 * br-lan\n"
+				elseif path == "/sys/class/net/wan/master/uevent" then
+					masters = masters + 1
+					return "INTERFACE=br-lan\n"
 				end
 				return nil
 			end
 
 			assert_eq(sysinfo.bridge_of("wan"), "br-lan", "the bridge is found")
 			sysinfo.bridge_of("wan"); sysinfo.bridge_of("wan")
-			assert_eq(readlinks, 1, "and asked for once, not once per heartbeat")
+			assert_eq(masters, 3, "asked live each time")
+			assert_eq(forks, 0, "and never forked")
 
 			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:01", "the gateway")
 			sysinfo._default_gateway_mac()
@@ -2096,10 +2102,8 @@ return {
 
 			-- Past the TTL the near-static half is re-asked too.
 			clock = clock + sysinfo.UPLINK_TTL + 1
-			sysinfo.bridge_of("wan")
 			sysinfo._default_gateway_mac()
-			assert_eq(readlinks, 2, "the bridge is re-read once the TTL is up")
-			assert_eq(routes, 2, "and so is the default route")
+			assert_eq(routes, 2, "the default route is re-asked once the TTL is up")
 
 			sysinfo._run_cmd, sysinfo._read_file, sysinfo._time =
 				orig_cmd, orig_rf, orig_time
@@ -2111,20 +2115,22 @@ return {
 		fn = function()
 			-- "No default route" and "not a bridge port" are ordinary states
 			-- during boot, before DHCP has settled or netifd has finished.
-			-- Caching them would leave the device unable to find its uplink for
-			-- the next five minutes.
+			-- Remembering them would leave the device unable to find its uplink
+			-- for the next five minutes.
 			local orig_cmd, orig_rf = sysinfo._run_cmd, sysinfo._read_file
 			sysinfo._uplink_cache = {}
 			local up = false
 			sysinfo._run_cmd = function(cmd)
 				if not up then return "" end
-				if cmd:find("readlink") then return "/sys/devices/virtual/net/br-lan\n" end
 				if cmd:find("ip route") then return "default via 10.0.0.1 dev br-lan \n" end
 				return ""
 			end
 			sysinfo._read_file = function(path)
 				if path == "/proc/net/arp" then
 					return "10.0.0.1 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+				end
+				if up and path == "/sys/class/net/wan/master/uevent" then
+					return "INTERFACE=br-lan\n"
 				end
 				return nil
 			end

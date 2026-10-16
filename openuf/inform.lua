@@ -20,21 +20,6 @@
 	  40+      *   Payload (may be compressed then encrypted)
 ]]--
 
-local bit = (function()
-	local ok, b = pcall(require, "bit")
-	if ok then return b end
-	ok, b = pcall(require, "bit32")
-	if ok then return b end
-	local _l = load or loadstring
-	local function _f(e) return _l("return function(a,b) return "..e.." end")() end
-	return {
-		band   = _f("a&b"),
-		bor    = _l("return function(...) local r=0 for i=1,select('#',...)do r=r|select(i,...)end return r end")(),
-		bxor   = _f("a~b"),
-		lshift = _f("a<<b"),
-		rshift = _f("a>>b"),
-	}
-end)()
 -- socket is lazy-loaded inside http_post/run so the module can be required
 -- in test environments that do not have luasocket installed.
 local cjson  = require("cjson")
@@ -75,6 +60,9 @@ local shaper    = _require_sibling("shaper")
 local rrbguard  = _require_sibling("rrbguard")
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
+local bit = util.bit()
 
 -- Injectable: expose internal modules so tests can inject fixtures
 -- _crypto included: without the seam, a test file's own crypto instance (its
@@ -199,22 +187,10 @@ M._cu_cache = {}
 M._time = os.time
 
 -- Injectable: override in tests to return fixture command output
-M._run_cmd = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._run_cmd = util.capture
 
 -- Injectable: sysfs reader for the per-netdev link attributes below.
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- Negotiated link speed in Mbit/s for a netdev, or nil when the kernel can't
 -- report one (interface down, or a virtual device with no PHY -- reading
@@ -403,9 +379,7 @@ end
 -- before that the inform channel is plain HTTP under the well-known default
 -- key and a forged setparam is within reach of anyone on the path; this is
 -- what keeps that from becoming a shell.
-local function is_mac(s)
-	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
-end
+local is_mac = util.is_mac
 
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
@@ -3756,10 +3730,6 @@ function M.handle_response(json_str, st, cfg)
 						M._switchvlan.apply(sw, cfg, st, wireless_vlans,
 							uplink_phys, uplink_ifname)
 					end
-					-- Either branch may have moved a socket into or out of a
-					-- VLAN bridge, which is the one thing bridge_of's 300 s TTL
-					-- cannot notice on its own.
-					M._sysinfo.forget_uplink_cache()
 				end)
 			end
 

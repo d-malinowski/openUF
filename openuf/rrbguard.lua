@@ -23,6 +23,8 @@
 ]]
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 M.CHECK_INTERVAL = 60
 -- Consecutive stale readings before acting, so a socket caught mid-reload
@@ -37,20 +39,8 @@ M.STA_COUNT_CMD  = "for i in $(iw dev 2>/dev/null | awk '$1==\"Interface\"{print
 	.. "iw dev \"$i\" station dump 2>/dev/null; done | grep -c '^Station'"
 
 -- Injectable seams.
-M._read = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
-M._popen = function(cmd)
-	local p = io.popen(cmd)
-	if not p then return nil end
-	local s = p:read("*a")
-	p:close()
-	return s
-end
+M._read = util.read_file
+M._popen = util.popen
 M._exec = os.execute
 M._log  = function(msg) io.stderr:write("openuf: rrbguard: " .. msg .. "\n") end
 

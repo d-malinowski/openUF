@@ -50,16 +50,12 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Seams, mirroring rrmscan.lua.
-M._popen = function(cmd)
-	local f = io.popen(cmd)
-	if not f then return nil end
-	local out = f:read("*a")
-	f:close()
-	return out
-end
-M._exec = function(cmd) return os.execute(cmd) end
+M._popen = util.popen
+M._exec = os.execute
 M._load_cjson = function()
 	local ok, mod = pcall(require, "cjson")
 	return ok and mod or nil

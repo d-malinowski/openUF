@@ -125,6 +125,7 @@ end
 -- remains useful during incremental development.
 local test_files = {
 	"tests/test_lib.lua",
+	"tests/test_util.lua",
 	"tests/test_announce.lua",
 	"tests/test_state.lua",
 	"tests/test_crypto.lua",

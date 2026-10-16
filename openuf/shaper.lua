@@ -58,33 +58,19 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable seams.
-M._exec = function(cmd) return os.execute(cmd) end
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
-M._popen = function(cmd)
-	local p = io.popen(cmd)
-	if not p then return "" end
-	local out = p:read("*a") or ""
-	p:close()
-	return out
-end
+M._exec = os.execute
+M._read_file = util.read_file
+M._popen = function(cmd) return util.popen(cmd) or "" end
 M._time = function() return os.time() end
 
 -- os.execute returns the raw exit status on Lua 5.1 (0 = success, non-zero =
 -- failure, and BOTH are truthy) and ok/"exit"/code on 5.4+. A bare truth test
 -- passes for a failed tc call on the interpreter the APs actually run.
-local function exec_ok(status)
-	if status == nil or status == false then return false end
-	if type(status) == "number" then return status == 0 end
-	return true
-end
+local exec_ok = util.exec_ok
 M._exec_ok = exec_ok
 
 M.QUANTUM = 1514
@@ -123,9 +109,7 @@ local function run(cmd)
 	return exec_ok(M._exec(cmd .. " 2>/dev/null"))
 end
 
-local function valid_ifname(n)
-	return type(n) == "string" and #n <= 15 and n:match("^[%w%-%._]+$") ~= nil
-end
+local valid_ifname = util.valid_ifname
 
 local function mac_hex(mac)
 	if type(mac) ~= "string" then return nil end

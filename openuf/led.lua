@@ -26,6 +26,8 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 local LED_ROOT = "/sys/class/leds/"
 
@@ -39,13 +41,7 @@ M._write_file = function(path, contents)
 end
 
 -- Injectable: file reader, for reading back an LED's current trigger.
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- The trigger each LED was driving before locate_start took it over, keyed by
 -- sysfs path. In-memory only: a Locate that outlives the daemon leaves the LED

@@ -31,30 +31,16 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
-M._exec      = function(cmd) return os.execute(cmd) end
-M._popen     = function(cmd)
-	local p = io.popen(cmd)
-	if not p then return nil end
-	local out = p:read("*a")
-	p:close()
-	return out
-end
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._exec      = os.execute
+M._popen     = util.popen
+M._read_file = util.read_file
 
 -- 5.1 returns the raw exit status (0 and 1 are both truthy); 5.4 returns
 -- true/nil. Normalise before branching.
-local function exec_ok(status)
-	if status == nil or status == false then return false end
-	if type(status) == "number" then return status == 0 end
-	return true
-end
+local exec_ok = util.exec_ok
 
 M.NFT_FAMILY = "bridge"
 M.NFT_NAME   = "openuf_assoc"
@@ -485,14 +471,6 @@ M._roam_queue = {}
 
 M._time = function() return os.time() end
 
-local function bor(a, b)
-	local r, bit = 0, 1
-	while a > 0 or b > 0 do
-		if a % 2 == 1 or b % 2 == 1 then r = r + bit end
-		a, b, bit = math.floor(a / 2), math.floor(b / 2), bit * 2
-	end
-	return r
-end
 
 -- Called by whoever deauths or steers a station, just before it does.
 function M.note_kick(mac, bits)
@@ -501,7 +479,7 @@ function M.note_kick(mac, bits)
 	local now = M._time()
 	local k = M._kicks[mac]
 	if k and now - k.at <= M.KICK_TTL then
-		k.bits, k.at = bor(k.bits, bits), now
+		k.bits, k.at = util.bit().bor(k.bits, bits), now
 	else
 		M._kicks[mac] = {bits = bits, at = now}
 	end

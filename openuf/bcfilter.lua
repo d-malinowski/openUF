@@ -52,9 +52,11 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable: shell command runner, for real `nft` invocations.
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 
 -- os.execute's contract differs across the Lua versions this module runs on:
 -- 5.1 (the target) returns the raw exit status, so SUCCESS is the number 0 and
@@ -62,19 +64,13 @@ M._exec = function(cmd) return os.execute(cmd) end
 -- A bare `if M._exec(...) then` therefore reports success for every failure on
 -- the very interpreter the APs use, which is how the missing module above went
 -- unnoticed. Normalise before deciding anything.
-local function exec_ok(status)
-	if status == nil or status == false then return false end
-	if type(status) == "number" then return status == 0 end
-	return true
-end
+local exec_ok = util.exec_ok
 
 local NFT_TABLE = "bridge openuf_bcfilt"
 
 -- Exactly "aa:bb:cc:dd:ee:ff": every allow-list entry is spliced into an nft
 -- command line, so the shape is enforced here as well as at the parser.
-local function is_mac(s)
-	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
-end
+local is_mac = util.is_mac
 
 -- Rebuild the filter to exactly match rules, a list of
 -- {ifname = "wlan0", macs = {"aa:bb:..", ...}} entries -- one per VAP that has

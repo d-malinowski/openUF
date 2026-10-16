@@ -49,12 +49,12 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 
-local function exec_ok(status)
-	return status == true or status == 0
-end
+local exec_ok = util.exec_ok
 
 M.BRIDGE_TABLE = "bridge openuf_guest"
 M.NAT_TABLE    = "ip openuf_guest"
@@ -206,21 +206,11 @@ end
 
 -- ─── Apply ───────────────────────────────────────────────────────────────────
 
-local function valid_ifname(s)
-	return type(s) == "string" and s:match("^[%w%-%._]+$") ~= nil and #s <= 15
-end
+local valid_ifname = util.valid_ifname
 
-local function is_mac(s)
-	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
-end
+local is_mac = util.is_mac
 
-M._read = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read = util.read_file
 
 -- The MAC of the bridge a VAP is enslaved to, or nil when it is not bridged.
 function M.bridge_mac(ifname)

@@ -418,8 +418,8 @@ return {
 				c:set("network", "br_lan", "device")
 				c:set("network", "br_lan", "type", "bridge")
 				c:set("network", "br_lan", "name", "br-lan")
-				ucihelper._popen = function() return "../../virtual/net/br-lan" end
 				ucihelper._read_file = function(path)
+					if path:match("/wan/master/uevent") then return "INTERFACE=br-lan\n" end
 					if path:match("/wan/address")    then return "00:00:5e:00:53:01\n" end
 					if path:match("/br%-lan/address") then return "00:00:5e:00:53:02\n" end
 				end
@@ -445,10 +445,17 @@ return {
 				c:set("network", "br_lan", "device")
 				c:set("network", "br_lan", "type", "bridge")
 				c:set("network", "br_lan", "name", "br-lan")
-				ucihelper._popen = function() return "../../virtual/net/br-lan" end
-				ucihelper._read_file = function() return "00:00:5e:00:53:04\n" end
+				local asked_master = false
+				ucihelper._read_file = function(path)
+					if path:match("/eth1/master/uevent") then
+						asked_master = true
+						return "INTERFACE=br-lan\n"
+					end
+					return "00:00:5e:00:53:04\n"
+				end
 				assert_false(ucihelper.ensure_bridge_identity({net = {lan_cpueth = "eth1"}}),
 					"nothing to reconcile")
+				assert_true(asked_master, "the bridge was found, so the MACs were compared")
 				assert_eq(db.network.br_lan.macaddr, nil, "no macaddr written")
 				assert_eq(#cmds, 0, "and no reload")
 			end)
@@ -465,8 +472,8 @@ return {
 				c:set("network", "br_lan", "type", "bridge")
 				c:set("network", "br_lan", "name", "br-lan")
 				c:set("network", "br_lan", "macaddr", "00:00:5e:00:53:01")
-				ucihelper._popen = function() return "../../virtual/net/br-lan" end
 				ucihelper._read_file = function(path)
+					if path:match("/wan/master/uevent") then return "INTERFACE=br-lan\n" end
 					if path:match("/wan/address")     then return "00:00:5e:00:53:01\n" end
 					if path:match("/br%-lan/address") then return "00:00:5e:00:53:02\n" end
 				end
@@ -490,7 +497,6 @@ return {
 				c:set("network", "br_lan", "device")
 				c:set("network", "br_lan", "type", "bridge")
 				c:set("network", "br_lan", "name", "br-lan")
-				ucihelper._popen = function() return "" end
 				ucihelper._read_file = function(path)
 					if path:match("/wan/address")     then return "00:00:5e:00:53:01\n" end
 					if path:match("/br%-lan/address") then return "00:00:5e:00:53:02\n" end

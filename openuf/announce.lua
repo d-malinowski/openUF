@@ -9,17 +9,11 @@
 	When run as a script, call M.run(cfg) at the bottom of this file.
 ]]--
 
-local bit = (function()
-	local ok, b = pcall(require, "bit")
-	if ok then return b end
-	ok, b = pcall(require, "bit32")
-	if ok then return b end
-	local _l = load or loadstring
-	local function _f(e) return _l("return function(a,b) return "..e.." end")() end
-	return {band=_f("a&b"), bor=_f("a|b"), lshift=_f("a<<b"), rshift=_f("a>>b")}
-end)()
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
+local bit = util.bit()
 
 -- Discovery destination addresses and port
 M.BROADCAST_ADDR = "255.255.255.255"
@@ -191,13 +185,9 @@ end
 -- silent and wrong -- announce.run() broadcasts 192.168.1.1 and inform.lua's
 -- build_json reports ip "0.0.0.0", which a controller cannot adopt.
 -- So: try the port, then the bridge it is a member of, before giving up.
--- The bridge a netdev is enslaved to, or nil. /sys/class/net/<if>/master
--- symlinks to the enslaving device (e.g. "../../../../../virtual/net/br-lan").
+-- The bridge a netdev is enslaved to, or nil.
 local function master_of(iface)
-	local m = M._popen("readlink /sys/class/net/" .. iface .. "/master")
-	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
-	if m and m ~= iface and m ~= "" then return m end
-	return nil
+	return util.master_of(iface, M._read_file)
 end
 
 function M.get_ip(iface)
@@ -236,22 +226,10 @@ end
 
 -- Injectable: command execution that captures stdout (same seam convention
 -- as ucihelper._popen), so tests can feed get_hostname() without a shell.
-M._popen = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._popen = util.capture
 
 -- Injectable: file reader, same seam convention as ucihelper._read_file.
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- The device's real system hostname, or nil when unavailable/empty.
 -- Used by the L2-discovery entry point below and by inform.lua's

@@ -45,14 +45,14 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 
 -- os.execute on the device's Lua 5.1 returns the raw exit status (0 =
 -- success, non-zero = failure, both truthy); newer Lua returns true/nil.
-local function exec_ok(status)
-	return status == true or status == 0
-end
+local exec_ok = util.exec_ok
 M._exec_ok = exec_ok
 
 M.NFT_TABLE = "bridge openuf_l2guard"
@@ -116,9 +116,7 @@ end
 
 -- ─── Apply ───────────────────────────────────────────────────────────────────
 
-local function valid_ifname(s)
-	return type(s) == "string" and s:match("^[%w%-%._]+$") ~= nil and #s <= 15
-end
+local valid_ifname = util.valid_ifname
 
 -- Rebuild the table to match spec on exactly these VAP netdevs. Returns the
 -- number of rules installed (0 when there was nothing to enforce or nothing
@@ -190,13 +188,7 @@ M._list_hostapd_confs = function()
 	return out
 end
 
-M._read = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read = util.read_file
 
 M._write = function(path, value)
 	local f = io.open(path, "w")

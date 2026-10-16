@@ -16,7 +16,7 @@
 local M = {}
 
 -- Injectable: shell command runner, for real `ip`/`udhcpc` invocations.
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 
 -- Overridable: where apply_dns() writes. On OpenWrt this is frequently a
 -- symlink into /tmp that netifd owns; writing through it is still the right

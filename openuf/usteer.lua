@@ -33,10 +33,12 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable: UCI module and command runner, for tests.
 M._uci     = nil
-M._run_cmd = function(cmd) return os.execute(cmd) end
+M._run_cmd = os.execute
 
 -- Options in usteer.local that openUF owns. Each is written when set_enabled
 -- wants a value for it and deleted when it wants none, so the daemon falls
@@ -141,17 +143,13 @@ end
 
 M.NFT_TABLE = "bridge openuf_usteer"
 
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 
 -- os.execute on the device's Lua 5.1 returns the raw exit status (0 =
 -- success, non-zero = failure, both truthy); newer Lua returns true/nil.
-local function exec_ok(status)
-	return status == true or status == 0
-end
+local exec_ok = util.exec_ok
 
-local function valid_ifname(s)
-	return type(s) == "string" and s:match("^[%w%-%._]+$") ~= nil and #s <= 15
-end
+local valid_ifname = util.valid_ifname
 
 -- Whether openUF runs usteerd, i.e. whether the filter has anything to do.
 function M.filter_wanted()

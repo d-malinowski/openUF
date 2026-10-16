@@ -6,24 +6,14 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable: override in tests to return fixture file contents
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- Injectable: override in tests to return fixture command output
-M._run_cmd = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._run_cmd = util.capture
 
 
 -- ─── Lookup pass ────────────────────────────────────────────────────────────
@@ -398,8 +388,7 @@ M._driver_cache = {}
 function M.wifi_driver(ifname)
 	if not ifname then return nil end
 	if M._driver_cache[ifname] == nil then
-		local link = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/device/driver")
-		M._driver_cache[ifname] = link:match("([^/%s]+)%s*$") or false
+		M._driver_cache[ifname] = util.driver_of(ifname, M._read_file) or false
 	end
 	return M._driver_cache[ifname] or nil
 end
@@ -1459,20 +1448,19 @@ end
 
 -- Uplink detection is deliberately MEASURED rather than declared (see
 -- M.uplink_phys_port): a modelmap constant is wrong the moment someone moves
--- the cable. But two of its three inputs are not measurements of the cable at
--- all and were re-asked every ten seconds anyway -- which bridge a netdev is
--- enslaved to (a `readlink` fork), and the default route's gateway IP (an
--- `ip route` fork). Both change only when the network is reconfigured.
+-- the cable. But one of its inputs is not a measurement of the cable at all
+-- and was re-asked every ten seconds anyway: the default route's gateway IP
+-- (an `ip route` fork). It changes only when the network is reconfigured.
+-- (Which bridge a netdev sits in is a sysfs read, cheap enough to ask live.)
 --
 -- Cached with the same TTL discipline as PHY_INFO_TTL. What stays live is the
 -- part that actually follows the cable: the gateway's MAC is looked up in the
 -- ARP cache every time, and resolved against the ARL/FDB every time, so a
 -- moved cable is still picked up on the next heartbeat.
 --
--- A nil answer is NOT cached. "No default route yet" and "not a bridge port
--- yet" are both ordinary states during boot, before DHCP has settled or netifd
--- has finished; caching them would leave the device unable to find its uplink
--- for the next five minutes.
+-- A nil answer is NOT cached. "No default route yet" is an ordinary state
+-- during boot, before DHCP has settled; caching it would leave the device
+-- unable to find its uplink for the next five minutes.
 M.UPLINK_TTL = 300
 M._uplink_cache = {}
 local function uplink_memo(key, fn)
@@ -1482,16 +1470,6 @@ local function uplink_memo(key, fn)
 	local value = fn()
 	if value ~= nil then M._uplink_cache[key] = {value = value, at = now} end
 	return value
-end
-
--- Drop everything the TTL cache holds, for the one event the TTL cannot cover:
--- openUF itself moving a socket between bridges. The 300 s here is tuned for
--- "a human moved a cable", which nobody does twice a minute -- but a controller
--- push that reassigns a port VLAN rewrites the answer to bridge_of() in the
--- same second, and a port reporting against the bridge it was in five minutes
--- ago reports no hosts at all. Called on the config path, not the heartbeat.
-function M.forget_uplink_cache()
-	M._uplink_cache = {}
 end
 
 -- The MAC of the default gateway: its IP from the default route, then that
@@ -1545,15 +1523,8 @@ end
 -- wan/lan2/lan3/lan4, all enslaved to br-lan.
 
 -- The bridge a netdev is enslaved to, or nil when it is not a bridge port.
--- /sys/class/net/<if>/master symlinks to the enslaving device.
 function M.bridge_of(ifname)
-	if not ifname then return nil end
-	return uplink_memo("bridge_of:" .. ifname, function()
-		local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
-		m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
-		if m and m ~= "" and m ~= ifname then return m end
-		return nil
-	end)
+	return util.master_of(ifname, M._read_file)
 end
 
 -- {[mac] = port_ifname} for every host the bridge has LEARNED, from one

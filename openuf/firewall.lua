@@ -26,9 +26,11 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable: shell command runner, for real `nft`/`hostapd_cli` invocations.
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 
 local NFT_TABLE = "bridge openuf"
 
@@ -36,9 +38,7 @@ local NFT_TABLE = "bridge openuf"
 -- line; the list comes from the controller (block-sta) by way of state.json,
 -- which is also hand-editable, so this module refuses anything else itself
 -- rather than trusting the caller to have.
-local function is_mac(s)
-	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
-end
+local is_mac = util.is_mac
 
 -- Rebuild the nftables blocklist to exactly match blocked_macs (a list of
 -- MAC address strings). Safe to call with an empty list (leaves an empty,
@@ -62,22 +62,10 @@ function M.reconcile(blocked_macs)
 end
 
 -- Injectable: run a command and return its output.
-M._read = function(cmd)
-	local p = io.popen(cmd)
-	if not p then return "" end
-	local out = p:read("*a") or ""
-	p:close()
-	return out
-end
+M._read = function(cmd) return util.popen(cmd) or "" end
 
 -- Injectable: a file's contents, or nil.
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 local function macs_in(text)
 	local out = {}

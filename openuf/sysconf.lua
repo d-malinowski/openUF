@@ -35,17 +35,13 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable seams, as in the other modules.
 M._uci  = nil                                            -- mock UCI table; nil = require("uci")
-M._exec = function(cmd) return os.execute(cmd) end
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._exec = os.execute
+M._read_file = util.read_file
 -- Sibling temp file and rename, like state.save: crond must never see half a file.
 M._write_file = function(path, content)
 	local tmp = path .. ".tmp"

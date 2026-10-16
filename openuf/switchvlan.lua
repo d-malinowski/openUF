@@ -45,18 +45,14 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 -- Injectable, matching netconfig.lua/shaper.lua's convention.
-M._exec = function(cmd) return os.execute(cmd) end
+M._exec = os.execute
 -- Injectable stdout capture, for read-only switch introspection (the VLAN
 -- table size). Same seam name and shape as ucihelper's.
-M._popen = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._popen = util.capture
 M._uci  = nil   -- set by callers/tests; falls back to require("uci")
 
 local OPENUF_VLAN_PREFIX = "openuf_swvlan"

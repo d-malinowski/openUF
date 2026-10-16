@@ -289,20 +289,16 @@ local function build_dsa(opts)
 	inform._sysinfo._read_file = function(path)
 		if path:find("net/arp") then return fixture("proc_net_arp_dsa.txt") end
 		if path == "/proc/uptime" then dsa_forks.uptime = dsa_forks.uptime + 1 end
+		local m = path:match("^/sys/class/net/([^/]+)/master/uevent$")
+		if m then
+			return "INTERFACE=" .. ((opts.master or {})[m] or "br-lan") .. "\n"
+		end
 		return base_read(path)
 	end
 	inform._sysinfo._run_cmd = function(cmd)
 		if cmd:find("swconfig") then return "" end   -- no such binary on DSA
 		if cmd:find("ip route") then
 			return "default via 192.0.2.1 dev br-lan \n"
-		end
-		local rl = cmd:match("readlink /sys/class/net/(%S+)/master")
-		if rl then
-			local br = (opts.master or {})[rl] or "br-lan"
-			return "../../../../../../../../virtual/net/" .. br .. "\n"
-		end
-		if cmd:find("readlink") then
-			return "../../../../../../../../virtual/net/br-lan\n"
 		end
 		local fdb = opts.fdb or fixture("bridge_fdb_br_dsa.txt")
 		local br = cmd:match("bridge fdb show br (%S+)")
@@ -1083,11 +1079,18 @@ return {
 				ip = "192.168.1.100", hostname = "testap",
 			}
 			local last_vap
+			local base_read = inform._sysinfo._read_file
 			-- One inform, ten seconds after the last: c = {signal, avg,
 			-- noise, tx/rx rate, lifetime tx packets/retries/failed, driver}.
 			local function inform_once(c)
 				inject_ucihelper()
 				inform._sysinfo._phy_info_cache = {}
+				inform._sysinfo._read_file = function(path)
+					if path:find("/device/uevent", 1, true) then
+						return "DRIVER=" .. c.driver .. "\n"
+					end
+					return base_read(path)
+				end
 				inform._sysinfo._run_cmd = function(cmd)
 					if cmd:find("station dump") then
 						return "Station 00:00:5e:00:53:01 (on wlan0)\n" ..
@@ -1102,9 +1105,6 @@ return {
 					if cmd:find("survey dump") then
 						return "Survey data from wlan0\n\tfrequency:\t5180 MHz [in use]\n" ..
 							"\tnoise:\t" .. c.noise .. " dBm\n"
-					end
-					if cmd:find("readlink", 1, true) and cmd:find("device/driver", 1, true) then
-						return "../../../bus/drivers/" .. c.driver .. "\n"
 					end
 					if cmd:find("dev wlan0 info") then return fixture("iw_dev_info.txt") end
 					if cmd:find("phy phy0 info") then return fixture("iw_phy_info_5g.txt") end

@@ -301,20 +301,23 @@ return {
 			-- The real target layout: lan_cpueth names eth1, but eth1 is a
 			-- br-lan member and carries no address -- without the fallback,
 			-- announce broadcasts 192.168.1.1 and inform reports "0.0.0.0".
-			local orig = announce._popen
+			local orig, orig_read = announce._popen, announce._read_file
 			announce._popen = function(cmd)
 				if cmd:match("addr show dev eth1") then return "" end
-				if cmd:match("readlink /sys/class/net/eth1/master") then
-					return "../../../../../virtual/net/br-lan\n"
-				end
 				if cmd:match("addr show dev br%-lan") then
 					return "    inet 192.0.2.3/24 brd 192.0.2.255 scope global br-lan\n"
 				end
 				return ""
 			end
+			announce._read_file = function(path)
+				if path == "/sys/class/net/eth1/master/uevent" then
+					return "DEVTYPE=bridge\nINTERFACE=br-lan\nIFINDEX=5\n"
+				end
+				return nil
+			end
 			local ip = announce.get_ip("eth1")
-			announce._popen = orig
-			assert_not_nil(ip, "bridge address found via master symlink")
+			announce._popen, announce._read_file = orig, orig_read
+			assert_not_nil(ip, "bridge address found via the port's master")
 			assert_eq(table.concat(ip, "."), "192.0.2.3", "bridge octets parsed")
 		end
 	},
@@ -326,25 +329,28 @@ return {
 			-- VLAN 20 becomes eth0.20 and not eth0.1.20 -- so the trunk itself
 			-- is neither addressed nor bridged. Confirmed on a real
 			-- TL-WDR3500, where this reported ip 0.0.0.0 on every inform.
-			local orig = announce._popen
+			local orig, orig_read = announce._popen, announce._read_file
 			announce._popen = function(cmd)
 				if cmd:match("addr show dev eth0%.1") or cmd:match("addr show dev eth0 ") then
 					return ""   -- neither the trunk nor the tagged child is addressed
 				end
-				if cmd:match("readlink /sys/class/net/eth0/master") then return "" end
 				if cmd:match("ls %-d /sys/class/net/eth0%.") then
 					return "/sys/class/net/eth0.1\n"
-				end
-				if cmd:match("readlink /sys/class/net/eth0%.1/master") then
-					return "../../../../../virtual/net/br-lan\n"
 				end
 				if cmd:match("addr show dev br%-lan") then
 					return "    inet 192.0.2.2/24 brd 192.0.2.255 scope global br-lan\n"
 				end
 				return ""
 			end
+			-- eth0 has no master/ at all; only the tagged child is enslaved.
+			announce._read_file = function(path)
+				if path == "/sys/class/net/eth0.1/master/uevent" then
+					return "DEVTYPE=bridge\nINTERFACE=br-lan\nIFINDEX=5\n"
+				end
+				return nil
+			end
 			local ip = announce.get_ip("eth0")
-			announce._popen = orig
+			announce._popen, announce._read_file = orig, orig_read
 			assert_not_nil(ip, "address found two hops away")
 			assert_eq(table.concat(ip, "."), "192.0.2.2", "trunk -> tagged child -> bridge")
 		end
@@ -352,17 +358,28 @@ return {
 	{
 		name = "announce: get_ip returns nil when neither port nor bridge has an address",
 		fn = function()
-			local orig = announce._popen
-			announce._popen = function() return "" end
-			local unbridged = announce.get_ip("eth1")
+			local orig, orig_read = announce._popen, announce._read_file
+			local asked = {}
 			announce._popen = function(cmd)
-				if cmd:match("readlink") then
-					return "../../../../../virtual/net/br-lan\n"
-				end
+				asked[#asked + 1] = cmd
 				return ""
 			end
+			announce._read_file = function() return nil end
+			local unbridged = announce.get_ip("eth1")
+			announce._read_file = function(path)
+				if path == "/sys/class/net/eth1/master/uevent" then
+					return "INTERFACE=br-lan\n"
+				end
+				return nil
+			end
+			asked = {}
 			local bridged = announce.get_ip("eth1")
-			announce._popen = orig
+			announce._popen, announce._read_file = orig, orig_read
+			local asked_bridge = false
+			for _, c in ipairs(asked) do
+				if c:match("addr show dev br%-lan") then asked_bridge = true end
+			end
+			assert_true(asked_bridge, "the bridge was asked")
 			assert_nil(unbridged, "no address and no bridge -> nil")
 			assert_nil(bridged, "bridge exists but has no address -> nil")
 		end

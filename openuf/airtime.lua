@@ -25,18 +25,14 @@
 ]]--
 
 local M = {}
+local util = package.loaded["openuf.util"]
+	or assert(loadfile("util.lua") or loadfile("openuf/util.lua"))()
 
 M.DEBUGFS = "/sys/kernel/debug/ieee80211"
 M.FLAGS_ON = "3"   -- AIRTIME_TX | AIRTIME_RX, mac80211's default
 M.FLAGS_OFF = "0"
 
-M._run_cmd = function(cmd)
-	local h = io.popen(cmd .. " 2>/dev/null")
-	if not h then return "" end
-	local s = h:read("*a")
-	h:close()
-	return s or ""
-end
+M._run_cmd = util.capture
 
 M._write_file = function(path, contents)
 	local f = io.open(path, "w")
@@ -47,13 +43,7 @@ M._write_file = function(path, contents)
 	return ok ~= nil and closed ~= nil and closed ~= false
 end
 
-M._read_file = function(path)
-	local f = io.open(path, "r")
-	if not f then return nil end
-	local s = f:read("*a")
-	f:close()
-	return s
-end
+M._read_file = util.read_file
 
 -- Every phy's airtime_flags file, sorted.
 function M.flag_files()
