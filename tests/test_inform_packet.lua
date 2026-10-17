@@ -4343,6 +4343,25 @@ return {
 		end
 	},
 	{
+		name = "inform: each cycle collects the heartbeat's garbage before it waits",
+		fn = function()
+			local orig = {tick = inform._tick, idle = inform._idle, gc = inform._collectgarbage}
+			local seq = {}
+			local wait = 10
+			inform._tick = function() seq[#seq + 1] = "tick"; return wait end
+			inform._collectgarbage = function(opt) seq[#seq + 1] = "gc " .. tostring(opt) end
+			inform._idle = function(_, w) seq[#seq + 1] = "idle " .. w end
+			inform._cycle({}, nil, nil, {}, {})
+			wait = 0
+			inform._cycle({}, nil, nil, {}, {})
+			inform._tick, inform._idle, inform._collectgarbage = orig.tick, orig.idle, orig.gc
+			assert_eq(table.concat(seq, ", "),
+				"tick, gc collect, idle 10, tick, gc collect",
+				"a full collection after every tick, before the wait; none when there is no wait")
+			assert_true(inform._collectgarbage == collectgarbage, "the real collector by default")
+		end
+	},
+	{
 		name = "inform: a POST failure backs off, and a config push re-informs at once",
 		fn = function()
 			local orig = {
