@@ -1688,6 +1688,12 @@ return {
 				'{"other":{},"my_sta_table":{},"sta_tables":{},"sta_table":{"a":{}}}'),
 				'{"other":{},"my_sta_table":{},"sta_tables":{},"sta_table":{"a":{}}}',
 				"other empty objects and look-alike keys keep their braces")
+			local long = '{"a_very_long_field_name_ending_in_sta_table":{},"radio_table_stats":{}}'
+			assert_eq(inform._fix_empty_arrays(long),
+				'{"a_very_long_field_name_ending_in_sta_table":{},"radio_table_stats":[]}',
+				"a long look-alike keeps its braces, the longest listed name is rewritten")
+			local same = '{"x":{},"y":1}'
+			assert_eq(inform._fix_empty_arrays(same), same, "nothing to rewrite")
 			for _, f in ipairs({"if_table", "radio_table", "radio_table_stats",
 					"vap_table", "scan_radio_table", "port_table", "lldp_table",
 					"sta_table", "mac_table", "scan_table"}) do

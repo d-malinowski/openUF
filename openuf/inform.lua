@@ -559,7 +559,9 @@ end
 -- Safe against false positives: cjson escapes quotes inside string values,
 -- so the unescaped '"field":{}' shape cannot occur inside one.
 -- One pass over the payload, not one per field: each gsub copies the whole
--- encoded string.
+-- encoded string. And a plain find for the '":{}' itself rather than a gsub
+-- on the field name: that tried a match at every quote in the payload (about
+-- 1800 of them, 19 ms on the Archer C5) to find the few empty objects.
 local _ARRAY_FIELDS = {
 	if_table = '"if_table":[]', radio_table = '"radio_table":[]',
 	radio_table_stats = '"radio_table_stats":[]', vap_table = '"vap_table":[]',
@@ -568,7 +570,24 @@ local _ARRAY_FIELDS = {
 	mac_table = '"mac_table":[]', scan_table = '"scan_table":[]',
 }
 function M._fix_empty_arrays(json_str)
-	return (json_str:gsub('"([%w_]+)":{}', _ARRAY_FIELDS))
+	local out, from, at = nil, 1, 1
+	while true do
+		local s = json_str:find('":{}', at, true)
+		if not s then break end
+		-- The field name ends at s-1; the longest listed one is 17 bytes.
+		local name = json_str:sub(math.max(1, s - 24), s - 1):match('"([%w_]+)$')
+		local repl = name and _ARRAY_FIELDS[name]
+		if repl then
+			out = out or {}
+			out[#out + 1] = json_str:sub(from, s - #name - 2)
+			out[#out + 1] = repl
+			from = s + 4
+		end
+		at = s + 4
+	end
+	if not out then return json_str end
+	out[#out + 1] = json_str:sub(from)
+	return table.concat(out)
 end
 
 -- One port's `mac_table`: the wired hosts a source reports, minus the two sets
