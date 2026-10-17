@@ -3637,6 +3637,7 @@ function M.handle_response(json_str, st, cfg)
 							roam_assist_active = roam_assist_active,
 							device_name = device_name, keep_vlans = port_vlans,
 							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac)})
+					M._deny_reloaded()   -- apply_config ran `wifi reload`
 				end
 			end
 
@@ -4568,14 +4569,41 @@ function M._sync_blocked_stas(st, raw)
 	return true
 end
 
--- A block's refusal in hostapd (firewall.deny_sync): repaired every tick
--- while anything is blocked, since a hostapd restart or a BSS reload loses
--- it, and until a pass finds nothing left to clean once the list is empty.
--- Pending at startup, so entries from before a restart get looked at.
+-- A block's refusal in hostapd (firewall.deny_sync) is lost whenever hostapd
+-- restarts or reloads a BSS. A sync forks a shell, one hostapd_cli per BSS
+-- and a grep, so while anything is blocked it runs:
+--   - every tick while _deny_pending: set at startup (entries from before a
+--     restart get looked at), by a block change and a state reload, and kept
+--     by a sync that did not settle (a BSS that did not answer, a change still
+--     to read back), until a pass finds nothing left to clean;
+--   - on any tick that finds a hostapd control socket replaced (a restart, a
+--     BSS rebuilt: firewall.hostapd_sockets, a file read);
+--   - every tick for DENY_SETTLE seconds after openUF's own `wifi reload`
+--     (_deny_reloaded), which lands asynchronously and can reload a BSS in
+--     place, keeping its socket;
+--   - and otherwise every DENY_INTERVAL seconds, the bound on a reload in
+--     place that openUF did not run (LuCI, a `wifi reload` by hand). Until
+--     then the client can associate, and the nft drop still stops its traffic.
+M.DENY_INTERVAL = 60
+M.DENY_SETTLE   = 60
 M._deny_pending = true
+M._deny_at, M._deny_socks, M._deny_settle = nil, nil, nil
+function M._deny_reloaded()
+	M._deny_settle = M._time() + M.DENY_SETTLE
+end
 function M._block_resync(st)
 	local list = st and st.blocked_stas or {}
 	if #list == 0 and not M._deny_pending then return false end
+	local now = M._time()
+	local socks = M._firewall.hostapd_sockets()
+	local since = M._deny_at and now - M._deny_at
+	local settle = M._deny_settle and M._deny_settle - now
+	local due = M._deny_pending or socks ~= M._deny_socks
+		or not since or since < 0 or since >= M.DENY_INTERVAL
+		-- A clock stepped back must not stretch the window.
+		or (settle and settle > 0 and settle <= M.DENY_SETTLE)
+	if not due then return false end
+	M._deny_at, M._deny_socks = now, socks
 	M._deny_pending = M._firewall.deny_sync(list, M._bss_ifnames())
 	return true
 end
@@ -4772,7 +4800,10 @@ function M._forget_controller(prev, cfg)
 	M._controller_interval = nil
 	if M._switchvlan then pcall(M._switchvlan.restore, prev, cfg) end
 	if M._usteer then pcall(M._usteer.set_enabled, false, cfg, false) end
-	if M._ucihelper and M._ucihelper.forget then pcall(M._ucihelper.forget) end
+	if M._ucihelper and M._ucihelper.forget then
+		pcall(M._ucihelper.forget)
+		M._deny_reloaded()   -- forget ran `wifi reload`
+	end
 	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
 	if M._guestportal then pcall(M._guest_enforce, {}) end
 	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end

@@ -68,6 +68,21 @@ M._read = function(cmd) return util.popen(cmd) or "" end
 -- Injectable: a file's contents, or nil.
 M._read_file = util.read_file
 
+-- The hostapd control sockets that exist and which socket each one is, as
+-- one string: a single read of /proc/net/unix, no fork. hostapd opens a
+-- BSS's socket when it sets the BSS up, so the inode changes whenever a
+-- hostapd restart or a BSS torn down and rebuilt has thrown that BSS's
+-- runtime deny list away. A BSS reloaded in place keeps its socket, so this
+-- does not see that.
+function M.hostapd_sockets()
+	local t = {}
+	for inode, path in (M._read_file("/proc/net/unix") or ""):gmatch("(%d+) (/var/run/hostapd/%S+)") do
+		t[#t + 1] = path .. "=" .. inode
+	end
+	table.sort(t)
+	return table.concat(t, " ")
+end
+
 local function macs_in(text)
 	local out = {}
 	for line in (text or ""):gmatch("[^\n]+") do

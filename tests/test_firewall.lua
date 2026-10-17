@@ -162,6 +162,31 @@ return {
 		end
 	},
 	{
+		name = "firewall: hostapd_sockets names each hostapd control socket by its inode, without a fork",
+		fn = function()
+			-- /proc/net/unix as both reference boards print it (2026-10-17):
+			-- 32-bit on the ath79, 64-bit on the filogic, one socket of
+			-- another daemon.
+			local orig = firewall._read_file
+			firewall._read_file = function(path)
+				assert_eq(path, "/proc/net/unix", "one file")
+				return "Num       RefCount Protocol Flags    Type St Inode Path\n"
+					.. "6e6e66c9: 00000003 00000000 00000000 0001 03 125358599 /var/run/hostapd/phy1-ap1\n"
+					.. "722ee422: 00000002 00000000 00000000 0001 03 65409346 /var/run/hostapd/global\n"
+					.. "000000000b05b42b: 00000002 00000000 00010000 0001 01  1666 /var/run/ubus/ubus.sock\n"
+					.. "000000000ed6ee61: 00000003 00000000 00000000 0002 03 2749890 /var/run/hostapd/phy0-ap0\n"
+					.. "0000000012345678: 00000003 00000000 00000000 0001 03 4242\n"
+			end
+			local got = firewall.hostapd_sockets()
+			firewall._read_file = orig
+			assert_eq(got, "/var/run/hostapd/global=65409346 /var/run/hostapd/phy0-ap0=2749890 "
+				.. "/var/run/hostapd/phy1-ap1=125358599", "hostapd's only, sorted, whole inodes")
+			firewall._read_file = function() return nil end
+			assert_eq(firewall.hostapd_sockets(), "", "unreadable: none")
+			firewall._read_file = orig
+		end
+	},
+	{
 		name = "firewall: deny_sync adds each blocked MAC to every BSS's hostapd deny list",
 		fn = function()
 			local r = fake_hostapd({["phy0-ap0"] = "", ["phy1-ap0"] = "aa:bb:cc:dd:ee:01 VLAN_ID=0\n"})

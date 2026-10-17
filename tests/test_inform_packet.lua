@@ -17,7 +17,7 @@ inform._state._state_file = "/tmp/openuf_test_inform.json"
 inform._firewall = {
 	reconcile = function() end,
 	deauth = function() end,
-	deny_sync = function() return false end,
+	hostapd_sockets = function() return "" end, deny_sync = function() return false end,
 }
 -- Same for the controller's L2 hardening (nft) and system settings (UCI
 -- system, root's crontab); the tests that exercise them stub their own.
@@ -2963,7 +2963,7 @@ return {
 				deauth = function(mac, ifnames)
 					deauthed = {mac = mac, ifnames = ifnames}; order[#order + 1] = "deauth"
 				end,
-				deny_sync = function(macs, bsses)
+				hostapd_sockets = function() return "" end, deny_sync = function(macs, bsses)
 					denied = {macs = macs, bsses = bsses}; order[#order + 1] = "deny"
 					return false
 				end,
@@ -3009,7 +3009,7 @@ return {
 			inform._firewall = {
 				reconcile = function(macs) reconciled = macs end,
 				deauth = function() end,
-				deny_sync = function(macs) denied = macs; return true end,
+				hostapd_sockets = function() return "" end, deny_sync = function(macs) denied = macs; return true end,
 			}
 			inform._deny_pending = false
 			local result = inform.handle_response(
@@ -3167,7 +3167,7 @@ return {
 			local now = 1000
 			inform._time = function() return now end
 			inform._state.save = function() end
-			inform._firewall = {reconcile = function() end, deny_sync = function() return false end,
+			inform._firewall = {reconcile = function() end, hostapd_sockets = function() return "" end, deny_sync = function() return false end,
 				deauth = function(mac, ifnames)
 					kicks[#kicks + 1] = {mac = mac, ifnames = ifnames}; order[#order + 1] = "deauth"
 				end}
@@ -3262,7 +3262,7 @@ return {
 			inform._firewall = {
 				reconcile = function(macs) reconciled = macs end,
 				deauth = function(mac, ifnames) deauthed[#deauthed + 1] = mac .. "@" .. table.concat(ifnames, ",") end,
-				deny_sync = function(macs) denied = table.concat(macs, ","); return false end,
+				hostapd_sockets = function() return "" end, deny_sync = function(macs) denied = table.concat(macs, ","); return false end,
 			}
 			inform._ucihelper = bss_mock()
 			inform._deny_pending = false
@@ -3291,33 +3291,135 @@ return {
 		end
 	},
 	{
-		name = "inform packet: _block_resync repairs hostapd every tick while anything is blocked",
+		name = "inform packet: _block_resync syncs hostapd every tick only while a sync is pending",
 		fn = function()
-			-- hostapd's deny list is runtime-only: a hostapd restart or a BSS
-			-- reload empties it, so it is read back and repaired every tick
-			-- while the ledger is non-empty, and until a pass finds nothing
-			-- left to clean once it is empty.
-			local calls, answer = {}, false
+			-- hostapd's deny list is runtime-only. While a sync has not
+			-- settled (a BSS that did not answer, a change to read back) it
+			-- runs every tick, also once the ledger is empty, until a pass
+			-- finds nothing left to clean.
+			local calls, answer, now = {}, true, 1000
+			local real_time = inform._time
+			inform._time = function() return now end
 			inform._firewall = {reconcile = function() end, deauth = function() end,
+				hostapd_sockets = function() return "s" end,
 				deny_sync = function(macs, bsses)
 					calls[#calls + 1] = table.concat(macs, ",") .. "@" .. table.concat(bsses, ",")
 					return answer
 				end}
 			inform._ucihelper = bss_mock()
+			inform._deny_at, inform._deny_socks, inform._deny_settle = nil, nil, nil
 			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
 			inform._deny_pending = false
-			assert_true(inform._block_resync(st), "a blocked MAC: synced")
-			answer = true
-			assert_true(inform._block_resync(st), "and again next tick, though nothing was pending")
+			assert_true(inform._block_resync(st), "first look: synced")
 			assert_eq(calls[1], "aa:bb:cc:dd:ee:01@phy0-ap0,phy0-ap1,phy1-ap0", "on every BSS")
+			assert_true(inform._block_resync(st), "that pass asked for another: synced the same second")
 			st.blocked_stas = {}
 			assert_true(inform._block_resync(st), "empty but pending from the last pass: synced")
 			answer = false
 			assert_true(inform._block_resync(st), "still pending (that pass changed something): synced")
 			assert_false(inform._block_resync(st), "a clean pass: nothing more to do")
+			now = now + 3600
+			assert_false(inform._block_resync(st), "nothing blocked, nothing pending: never")
 			assert_eq(#calls, 4, "no call once clean")
+			inform._time = real_time
 			inform._firewall = { reconcile = function() end, deauth = function() end }
 			inform._ucihelper = nil
+		end
+	},
+	{
+		name = "inform packet: a settled block is re-checked once a minute, or at once when a hostapd socket is replaced",
+		fn = function()
+			local n, now, socks = 0, 1000, "/var/run/hostapd/phy0-ap0=11"
+			local real_time = inform._time
+			inform._time = function() return now end
+			inform._firewall = {reconcile = function() end, deauth = function() end,
+				hostapd_sockets = function() return socks end,
+				deny_sync = function() n = n + 1; return false end}
+			inform._ucihelper = bss_mock()
+			inform._deny_at, inform._deny_socks, inform._deny_settle = nil, nil, nil
+			inform._deny_pending = false
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
+			assert_true(inform._block_resync(st), "first look")
+			for _, dt in ipairs({15, 30, 59}) do
+				now = 1000 + dt
+				assert_false(inform._block_resync(st), "settled: not at +" .. dt .. " s")
+			end
+			now = 1060
+			assert_true(inform._block_resync(st), "DENY_INTERVAL later: again")
+			assert_eq(n, 2, "two syncs in a minute of ticks")
+			-- A hostapd restart, or a BSS torn down and rebuilt, threw the
+			-- runtime list away; its control socket is a new one.
+			now = 1075
+			socks = "/var/run/hostapd/phy0-ap0=12"
+			assert_true(inform._block_resync(st), "a replaced socket: at once")
+			now = 1090
+			assert_false(inform._block_resync(st), "and settled again after")
+			now = 1000
+			assert_true(inform._block_resync(st), "a clock stepped back: looked at, not skipped for an hour")
+			assert_eq(n, 4, "no other syncs")
+			inform._time = real_time
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+		end
+	},
+	{
+		name = "inform packet: after openUF's own wifi reload the deny list is checked every tick for DENY_SETTLE",
+		fn = function()
+			-- `wifi reload` lands asynchronously and can reload a BSS in
+			-- place, keeping its socket: a clean sync the tick after the push
+			-- may have read the list before hostapd dropped it.
+			local n, now = 0, 2000
+			local real_time = inform._time
+			inform._time = function() return now end
+			inform._firewall = {reconcile = function() end, deauth = function() end,
+				hostapd_sockets = function() return "s" end,
+				deny_sync = function() n = n + 1; return false end}
+			inform._ucihelper = bss_mock()
+			inform._deny_at, inform._deny_socks, inform._deny_settle = nil, nil, nil
+			inform._deny_pending = false
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
+			assert_true(inform._block_resync(st), "first look")
+			inform._deny_reloaded()
+			for _, dt in ipairs({0, 15, 30, 59}) do
+				now = 2000 + dt
+				assert_true(inform._block_resync(st), "within the settle window: +" .. dt .. " s")
+			end
+			now = 2060
+			assert_false(inform._block_resync(st), "window over, and the last sync was 1 s ago")
+			now = 2119
+			assert_true(inform._block_resync(st), "back to once a minute")
+			inform._deny_reloaded()          -- settle until 2179
+			now = 1000                       -- a clock stepped back 1119 s
+			assert_true(inform._block_resync(st), "stepped back: one look")
+			now = 1010
+			assert_false(inform._block_resync(st), "but the window is not stretched over the step")
+			inform._time = real_time
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+		end
+	},
+	{
+		name = "inform packet: a WiFi push and a Forget open the deny-sync settle window",
+		fn = function()
+			local real_time = inform._time
+			inform._time = function() return 5000 end
+			inform._deny_settle = nil
+			local orig = inform._usteer.set_enabled
+			inform._usteer.set_enabled = function() end
+			inform._ucihelper = {apply_config = function() end}
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			inform.handle_response(('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg),
+				sample_state(), {net = {lan_cpueth = "eth0"}})
+			assert_eq(inform._deny_settle, 5000 + inform.DENY_SETTLE, "the push ran wifi reload")
+			inform._deny_settle = nil
+			inform._ucihelper = {forget = function() end}
+			inform._forget_controller()
+			assert_eq(inform._deny_settle, 5000 + inform.DENY_SETTLE, "so did the Forget")
+			inform._usteer.set_enabled = orig
+			inform._deny_settle = nil
+			inform._ucihelper = nil
+			inform._time = real_time
 		end
 	},
 	{
@@ -3993,7 +4095,7 @@ return {
 			local reconciles = 0
 			local orig_fw = inform._firewall
 			inform._firewall = {reconcile = function() reconciles = reconciles + 1 end,
-				deauth = function() end, deny_sync = function() return false end}
+				deauth = function() end, hostapd_sockets = function() return "" end, deny_sync = function() return false end}
 			local ok, err = pcall(function()
 				-- A save from inside the daemon (a setparam, a guest cmd ...).
 				local st = sample_state({adopted = true, cfgversion = "v2"})
@@ -4092,7 +4194,7 @@ return {
 			-- Startup leaves hostapd's deny lists to look at; the tick does it.
 			local orig_fw = inform._firewall
 			inform._firewall = {reconcile = function() end, deauth = function() end,
-				deny_sync = function() events[#events + 1] = "deny"; return false end}
+				hostapd_sockets = function() return "" end, deny_sync = function() events[#events + 1] = "deny"; return false end}
 			inform._deny_pending = true
 
 			local ctx = {interval = 10, backoff = 10}
