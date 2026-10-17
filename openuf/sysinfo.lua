@@ -215,6 +215,33 @@ function M.channel_from_freq(freq)
 	return nil
 end
 
+-- The key of an `iw` dump line: the text before its first colon, without the
+-- indent and the " * " bullet ("\t\t * channel width: 1" -> "channel width").
+-- The three dump parsers below look each line's key up first and try only the
+-- pattern written for that key. They used to try every pattern on every line,
+-- which on the Archer C5 cost about 13 matches per line of scan dump and made
+-- these parsers most of a heartbeat's CPU. Each pattern is still the one it
+-- was, so a line its key routes to reads exactly as before. It now also reads
+-- only from its own line: an SSID such as "x freq: 2412" no longer sets the
+-- neighbour's frequency. A plain find for the colon: a pattern that also
+-- strips the indent backtracks over it on every line without one, which cost
+-- more than the patterns it saves.
+local function dump_key(line)
+	local colon = line:find(":", 1, true)
+	return colon and line:sub(line:match("^[%s%*]*()"), colon - 1)
+end
+
+-- survey dump key -> {field, pattern}. Anchored to (whitespace-then-)start of
+-- line so "channel busy time:" doesn't also match inside the separate
+-- "extension channel busy time:" field iw emits on wider channels.
+local SURVEY_FIELDS = {
+	["noise"]                 = {"noise",             "noise:%s+(-?%d+)"},
+	["channel active time"]   = {"channel_time",      "^%s*channel active time:%s+(%d+)"},
+	["channel busy time"]     = {"channel_time_busy", "^%s*channel busy time:%s+(%d+)"},
+	["channel receive time"]  = {"channel_time_rx",   "^%s*channel receive time:%s+(%d+)"},
+	["channel transmit time"] = {"channel_time_tx",   "^%s*channel transmit time:%s+(%d+)"},
+}
+
 -- Returns per-radio channel utilisation from `iw dev <ifname> survey dump`.
 -- Returns a table: {freq, noise, channel_time, channel_time_busy, channel_time_rx, channel_time_tx}
 function M.radio_stats(ifname)
@@ -223,7 +250,8 @@ function M.radio_stats(ifname)
 	local result = {}
 	local current = nil
 	for line in output:gmatch("[^\n]+") do
-		local freq = line:match("frequency:%s+(%d+)")
+		local key = dump_key(line)
+		local freq = key == "frequency" and line:match("frequency:%s+(%d+)")
 		if freq then
 			if current then result[#result + 1] = current end
 			-- iw marks the operating channel's entry "[in use]" on this same
@@ -239,19 +267,9 @@ function M.radio_stats(ifname)
 			-- /usr/sbin/iw`; the previous patterns never matched any real
 			-- iw output on any hardware, so channel utilisation always
 			-- silently reported 0%/absent regardless of actual airtime.
-			-- Anchored to (whitespace-then-)start of line so "channel busy
-			-- time:" doesn't also match inside the separate "extension
-			-- channel busy time:" field iw emits on wider channels.
-			local noise   = line:match("noise:%s+(-?%d+)")
-			local ct      = line:match("^%s*channel active time:%s+(%d+)")
-			local ct_busy = line:match("^%s*channel busy time:%s+(%d+)")
-			local ct_rx   = line:match("^%s*channel receive time:%s+(%d+)")
-			local ct_tx   = line:match("^%s*channel transmit time:%s+(%d+)")
-			if noise   then current.noise              = tonumber(noise)   end
-			if ct      then current.channel_time       = tonumber(ct)      end
-			if ct_busy then current.channel_time_busy  = tonumber(ct_busy) end
-			if ct_rx   then current.channel_time_rx    = tonumber(ct_rx)   end
-			if ct_tx   then current.channel_time_tx    = tonumber(ct_tx)   end
+			local f = SURVEY_FIELDS[key]
+			local v = f and line:match(f[2])
+			if v then current[f[1]] = tonumber(v) end
 		end
 	end
 	if current then result[#result + 1] = current end
@@ -304,6 +322,38 @@ function M.u32_count(v)
 	return v
 end
 
+-- station dump key -> {field, pattern, u32 counter}.
+-- signal is ANCHORED, and this matters: `iw` emits "avg ack signal:\t-95 dBm"
+-- further down the same station block, which an unanchored "signal:%s+" also
+-- matches -- and being later, it overwrote the real reading. Every client was
+-- reported at the ack-signal value (-95 dBm on this driver) no matter its
+-- actual RSSI. That feeds the Clients list, the vap's avg_client_signal, the
+-- satisfaction estimate AND Minimum RSSI enforcement, which would have
+-- deauthed every client on the radio the moment the feature was switched on.
+-- The per-chain suffix ("-53 [-76, -53, -66] dBm") is ignored -- the first
+-- number is the combined RSSI.
+local STA_FIELDS = {
+	["signal"]         = {"signal",        "^%s*signal:%s+(-?%d+)"},
+	["signal avg"]     = {"signal_avg",    "^%s*signal avg:%s+(-?%d+)"},
+	["tx bytes"]       = {"tx_bytes",      "tx bytes:%s+(%d+)"},
+	["rx bytes"]       = {"rx_bytes",      "rx bytes:%s+(%d+)"},
+	["tx packets"]     = {"tx_packets",    "tx packets:%s+(%d+)"},
+	["rx packets"]     = {"rx_packets",    "rx packets:%s+(%d+)"},
+	["tx retries"]     = {"tx_retries",    "tx retries:%s+(%d+)", true},
+	["tx failed"]      = {"tx_failed",     "tx failed:%s+(%d+)",  true},
+	["inactive time"]  = {"inactive_ms",   "inactive time:%s+(%d+)"},
+	["connected time"] = {"connected_sec", "connected time:%s+(%d+)"},
+}
+-- "tx bitrate"/"rx bitrate" -> the patterns and fields of that direction.
+local BITRATE = {}
+for _, d in ipairs({"tx", "rx"}) do
+	BITRATE[d .. " bitrate"] = {
+		rate_pat = d .. " bitrate:%s+(%S+)", mcs_pat = d .. " bitrate:.*MCS%s+(%d+)",
+		rate = d .. "_bitrate", mcs = d .. "_mcs", gen = d .. "_generation",
+		nss = d .. "_nss", width = d .. "_width",
+	}
+end
+
 -- Returns a table of connected stations from `iw dev <ifname> station dump`.
 -- Each entry: {mac, signal, signal_avg, tx_bitrate, rx_bitrate, tx_mcs,
 --              rx_mcs, tx_generation, tx_nss, rx_generation, rx_nss,
@@ -324,57 +374,28 @@ function M.sta_table(ifname)
 			if cur then clients[#clients + 1] = cur end
 			cur = {mac = mac}
 		elseif cur then
-			-- ANCHORED, and this matters: `iw` emits "avg ack signal:\t-95 dBm"
-			-- further down the same station block, which an unanchored
-			-- "signal:%s+" also matches -- and being later, it overwrote the
-			-- real reading. Every client was reported at the ack-signal value
-			-- (-95 dBm on this driver) no matter its actual RSSI. That feeds
-			-- the Clients list, the vap's avg_client_signal, the satisfaction
-			-- estimate AND Minimum RSSI enforcement, which would have deauthed
-			-- every client on the radio the moment the feature was switched
-			-- on. ("last ack signal:-95" escaped only by luck: no space after
-			-- the colon.) The per-chain suffix ("-53 [-76, -53, -66] dBm") is
-			-- ignored -- the first number is the combined RSSI.
-			local signal     = line:match("^%s*signal:%s+(-?%d+)")
-			local tx_rate    = line:match("tx bitrate:%s+(%S+)")
-			local rx_rate    = line:match("rx bitrate:%s+(%S+)")
-			-- tx_mcs/rx_mcs: only present on their respective bitrate line,
-			-- and only for 11n/ac/ax rates -- legacy (pre-MCS) rates have no
-			-- "MCS N" suffix, so these stay nil for those, same as other
-			-- optional fields below.
-			local tx_mcs     = line:match("tx bitrate:.*MCS%s+(%d+)")
-			local rx_mcs     = line:match("rx bitrate:.*MCS%s+(%d+)")
-			if line:find("tx bitrate:") then
-				cur.tx_generation, cur.tx_nss = _bitrate_generation_nss(line)
+			local key = dump_key(line)
+			local b = BITRATE[key]
+			if b then
+				-- tx_mcs/rx_mcs: only for 11n/ac/ax rates -- legacy (pre-MCS)
+				-- rates have no "MCS N" suffix, so these stay nil for those,
+				-- same as other optional fields below.
+				local rate = line:match(b.rate_pat)
+				local mcs  = line:match(b.mcs_pat)
+				if rate then cur[b.rate] = tonumber(rate) end
+				if mcs  then cur[b.mcs]  = tonumber(mcs)  end
+				cur[b.gen], cur[b.nss] = _bitrate_generation_nss(line)
 				-- "80MHz"; iw prints no width token for 20 MHz rates.
-				cur.tx_width = tonumber(line:match("(%d+)MHz")) or 20
-			elseif line:find("rx bitrate:") then
-				cur.rx_generation, cur.rx_nss = _bitrate_generation_nss(line)
-				cur.rx_width = tonumber(line:match("(%d+)MHz")) or 20
+				cur[b.width] = tonumber(line:match("(%d+)MHz")) or 20
+			else
+				local f = STA_FIELDS[key]
+				local v = f and line:match(f[2])
+				if v then
+					v = tonumber(v)
+					if f[3] then v = M.u32_count(v) end
+					cur[f[1]] = v
+				end
 			end
-			local signal_avg = line:match("^%s*signal avg:%s+(-?%d+)")
-			if signal_avg then cur.signal_avg = tonumber(signal_avg) end
-			local tx_bytes   = line:match("tx bytes:%s+(%d+)")
-			local rx_bytes   = line:match("rx bytes:%s+(%d+)")
-			local tx_pkts    = line:match("tx packets:%s+(%d+)")
-			local rx_pkts    = line:match("rx packets:%s+(%d+)")
-			local tx_retries = line:match("tx retries:%s+(%d+)")
-			local tx_failed  = line:match("tx failed:%s+(%d+)")
-			local inactive   = line:match("inactive time:%s+(%d+)")
-			local connected  = line:match("connected time:%s+(%d+)")
-			if signal    then cur.signal      = tonumber(signal)     end
-			if tx_rate   then cur.tx_bitrate  = tonumber(tx_rate)    end
-			if rx_rate   then cur.rx_bitrate  = tonumber(rx_rate)    end
-			if tx_mcs    then cur.tx_mcs      = tonumber(tx_mcs)     end
-			if rx_mcs    then cur.rx_mcs      = tonumber(rx_mcs)     end
-			if tx_bytes  then cur.tx_bytes    = tonumber(tx_bytes)   end
-			if rx_bytes  then cur.rx_bytes    = tonumber(rx_bytes)   end
-			if tx_pkts   then cur.tx_packets  = tonumber(tx_pkts)    end
-			if rx_pkts   then cur.rx_packets  = tonumber(rx_pkts)    end
-			if tx_retries then cur.tx_retries = M.u32_count(tonumber(tx_retries)) end
-			if tx_failed  then cur.tx_failed  = M.u32_count(tonumber(tx_failed))  end
-			if inactive  then cur.inactive_ms = tonumber(inactive)   end
-			if connected then cur.connected_sec = tonumber(connected) end
 		end
 	end
 	if cur then clients[#clients + 1] = cur end
@@ -737,6 +758,79 @@ function M.channel_width(vht_w, vht_seg1, vht_seg2, ht_sec)
 	return 20
 end
 
+-- scan dump key -> what that line sets: on the BSS (cur) or in the per-BSS
+-- evidence (ev) that flush() resolves into bw and security.
+local SCAN_LINE = {
+	-- Operation-element width evidence. The VHT line is anchored on
+	-- "* channel width:" so that the HT capability line sitting two lines
+	-- below it cannot match: that one reads "* STA channel width: 20 MHz" on
+	-- a 20 MHz neighbour, and reading its 20 as a VHT width field would report
+	-- the BSS as 80 MHz. (Its key differs too, "STA channel width".)
+	["channel width"] = function(line, cur, ev)
+		local w = line:match("^%s*%*%s+channel width:%s+(%d+)")
+		if w then ev.vht_w = tonumber(w) end
+	end,
+	["center freq segment 1"] = function(line, cur, ev)
+		local s1 = line:match("center freq segment 1:%s+(%d+)")
+		if s1 then ev.vht_seg1 = tonumber(s1) end
+	end,
+	["center freq segment 2"] = function(line, cur, ev)
+		local s2 = line:match("center freq segment 2:%s+(%d+)")
+		if s2 then ev.vht_seg2 = tonumber(s2) end
+	end,
+	["secondary channel offset"] = function(line, cur, ev)
+		local sec = line:match("secondary channel offset:%s+(%a+)")
+		if sec then ev.ht_sec = sec end
+	end,
+	["freq"] = function(line, cur)
+		local freq = line:match("freq:%s+(%d+)")
+		if freq then
+			cur.freq    = tonumber(freq)
+			cur.channel = M.channel_from_freq(freq)
+		end
+	end,
+	-- Anchored for the same reason as the station-dump copy above,
+	-- defensively: scan output carries no ack-signal lines today.
+	["signal"] = function(line, cur)
+		local signal = line:match("^%s*signal:%s+(-?%d+)")
+		if signal then cur.signal = tonumber(signal) end
+	end,
+	["SSID"] = function(line, cur)
+		local ssid = line:match("^\tSSID:%s?(.*)$")
+		if ssid and not cur.essid then cur.essid = unescape_iw_ssid(ssid) end
+	end,
+	-- iw also prints the driver's BOOTTIME stamp: "last seen: 662754.792s
+	-- [boottime]". Some entries carry ONLY that form -- seen on our own
+	-- AX3000T -- which the "ms ago" pattern never matched, so their age
+	-- stayed at the 0 default and every such neighbour was reported as seen
+	-- this instant, however stale. The "ms ago" line wins when both are
+	-- printed for one BSS (it is what the controller's own staleness rule is
+	-- written against, and it is printed second); this fills in when it is
+	-- the only one.
+	["last seen"] = function(line, cur, ev, now_up)
+		local last_ms = line:match("last seen:%s+(%d+) ms ago")
+		local last_bt = line:match("last seen:%s+([%d%.]+)s %[boottime%]")
+		if last_ms then
+			cur.age = math.floor(tonumber(last_ms) / 1000)
+		elseif last_bt and cur.age == nil and now_up > 0 then
+			cur.age = math.max(0, math.floor(now_up - tonumber(last_bt)))
+		end
+	end,
+	["BSS operating channel width"] = function(line, cur)
+		local bw = line:match("BSS operating channel width:%s+(%d+) MHz")
+		if bw then cur.bw = tonumber(bw) end
+	end,
+	["capability"] = function(line, cur, ev)
+		if line:find("capability:.*Privacy") then ev.privacy = true end
+	end,
+	["RSN"] = function(line, cur, ev)
+		if line:find("^\tRSN:") then ev.rsn = true end
+	end,
+	["WPA"] = function(line, cur, ev)
+		if line:find("^\tWPA:") then ev.wpa = true end
+	end,
+}
+
 function M.scan_table(ifname)
 	if not ifname then return {} end
 	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
@@ -745,9 +839,9 @@ function M.scan_table(ifname)
 	local now_up = M.uptime()
 	local nets = {}
 	local cur = nil
-	local seen_rsn, seen_wpa, seen_privacy = false, false, false
-	-- Width evidence from the operation elements, per BSS. See flush().
-	local vht_w, vht_seg1, vht_seg2, ht_sec = nil, nil, nil, nil
+	-- Per BSS: the security elements seen, and the width evidence from the
+	-- operation elements (see flush()).
+	local ev = {}
 
 	local function flush()
 		if not cur then return end
@@ -772,11 +866,11 @@ function M.scan_table(ifname)
 		-- field 0 means "20 or 40", which the HT secondary channel offset
 		-- resolves; nothing at all means 20.
 		if not cur.bw then
-			cur.bw = M.channel_width(vht_w, vht_seg1, vht_seg2, ht_sec)
+			cur.bw = M.channel_width(ev.vht_w, ev.vht_seg1, ev.vht_seg2, ev.ht_sec)
 		end
-		if seen_rsn then cur.security = "wpa2"
-		elseif seen_wpa then cur.security = "wpa"
-		elseif seen_privacy then cur.security = "wep"
+		if ev.rsn then cur.security = "wpa2"
+		elseif ev.wpa then cur.security = "wpa"
+		elseif ev.privacy then cur.security = "wep"
 		else cur.security = "open" end
 		nets[#nets + 1] = cur
 	end
@@ -786,54 +880,10 @@ function M.scan_table(ifname)
 		if bssid then
 			flush()
 			cur = {bssid = bssid}
-			seen_rsn, seen_wpa, seen_privacy = false, false, false
-			vht_w, vht_seg1, vht_seg2, ht_sec = nil, nil, nil, nil
+			ev = {}
 		elseif cur then
-			-- Operation-element width evidence, consumed by flush(). The VHT
-			-- line is anchored on "* channel width:" so that the HT capability
-			-- line sitting two lines below it cannot match: that one reads
-			-- "* STA channel width: 20 MHz" on a 20 MHz neighbour, and an
-			-- unanchored pattern would read the 20 as a VHT width field and
-			-- report the BSS as 80 MHz.
-			local w = line:match("^%s*%*%s+channel width:%s+(%d+)")
-			if w then vht_w = tonumber(w) end
-			local s1 = line:match("center freq segment 1:%s+(%d+)")
-			if s1 then vht_seg1 = tonumber(s1) end
-			local s2 = line:match("center freq segment 2:%s+(%d+)")
-			if s2 then vht_seg2 = tonumber(s2) end
-			local sec = line:match("secondary channel offset:%s+(%a+)")
-			if sec then ht_sec = sec end
-			local freq     = line:match("freq:%s+(%d+)")
-			-- Anchored for the same reason as the station-dump copy above,
-			-- defensively: scan output carries no ack-signal lines today.
-			local signal   = line:match("^%s*signal:%s+(-?%d+)")
-			local ssid     = line:match("^\tSSID:%s?(.*)$")
-			local last_ms  = line:match("last seen:%s+(%d+) ms ago")
-			-- iw also prints the driver's BOOTTIME stamp: "last seen:
-			-- 662754.792s [boottime]". Some entries carry ONLY that form --
-			-- seen on our own AX3000T -- which the pattern above never
-			-- matched, so their age stayed at the 0 default and every such
-			-- neighbour was reported as seen this instant, however stale. The
-			-- "ms ago" line wins when both are printed for one BSS (it is what
-			-- the controller's own staleness rule is written against, and it
-			-- is printed second); this fills in when it is the only one.
-			local last_bt  = line:match("last seen:%s+([%d%.]+)s %[boottime%]")
-			local bw       = line:match("BSS operating channel width:%s+(%d+) MHz")
-			if freq then
-				cur.freq    = tonumber(freq)
-				cur.channel = M.channel_from_freq(freq)
-			end
-			if signal then cur.signal = tonumber(signal) end
-			if ssid and not cur.essid then cur.essid = unescape_iw_ssid(ssid) end
-			if last_ms then
-				cur.age = math.floor(tonumber(last_ms) / 1000)
-			elseif last_bt and cur.age == nil and now_up > 0 then
-				cur.age = math.max(0, math.floor(now_up - tonumber(last_bt)))
-			end
-			if bw then cur.bw = tonumber(bw) end
-			if line:find("capability:.*Privacy") then seen_privacy = true end
-			if line:find("^\tRSN:") then seen_rsn = true end
-			if line:find("^\tWPA:") then seen_wpa = true end
+			local on_line = SCAN_LINE[dump_key(line)]
+			if on_line then on_line(line, cur, ev, now_up) end
 		end
 	end
 	flush()

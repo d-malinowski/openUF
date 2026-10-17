@@ -1368,6 +1368,32 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: scan_table() reads each field from its own line, never from an SSID",
+		fn = function()
+			-- iw prints ':' and the rest of printable ASCII in an SSID as is.
+			-- The parser used to try every pattern on every line, so a
+			-- neighbour's name could set its own frequency, age, width and
+			-- security, since the SSID line comes after those.
+			local ssid = "x freq: 2412 last seen: 99000 ms ago capability: Privacy" ..
+				" secondary channel offset: above"
+			local dump = "BSS 00:00:5e:00:53:01(on wlan0)\n" ..
+				"\tlast seen: 120 ms ago\n\tfreq: 5180\n" ..
+				"\tcapability: ESS ShortSlotTime (0x0401)\n\tsignal: -60.00 dBm\n" ..
+				"\tSSID: " .. ssid .. "\n" ..
+				"\tHT operation:\n\t\t * secondary channel offset: no secondary\n"
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 1, "one BSS")
+				assert_eq(nets[1].essid, ssid, "the whole name is the essid")
+				assert_eq(nets[1].freq, 5180, "freq from the freq line")
+				assert_eq(nets[1].channel, 36, "channel from that freq")
+				assert_eq(nets[1].age, 0, "age from the last seen line")
+				assert_eq(nets[1].security, "open", "no Privacy in the capability line")
+				assert_eq(nets[1].bw, 20, "no secondary channel")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: scan_table() classifies Privacy-only (no RSN/WPA IE) as wep",
 		fn = function()
 			local dump = "BSS cc:cc:cc:cc:cc:cc(on wlan0)\n"
