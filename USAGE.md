@@ -151,6 +151,9 @@ dev = dofile("modelmap/tl-wdr3500-v1.lua")
 -- For Xiaomi Mi Router AX3000T (802.11ax, DSA — no swconfig):
 dev = dofile("modelmap/xiaomi-ax3000t.lua")
 
+-- For BT Home Hub 5 Type A (lantiq xrx200, DSA — no swconfig):
+dev = dofile("modelmap/bt-homehub-v5a.lua")
+
 -- For any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 

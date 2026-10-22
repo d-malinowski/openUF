@@ -159,6 +159,14 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   leaving it stuck on whatever the bootloader set (a steady orange). `install.sh` adds the
   module when it sees that situation. Do not point `dev.conf.led` at `mt76-phy0` instead —
   it exists and accepts writes, but is wired to nothing on this board
+- **BT Home Hub 5 Type A** (dual-band 802.11n/ac) — use `modelmap/bt-homehub-v5a.lua`.
+  lantiq/xrx200 with a DSA switch (GSWIP): `lan1`..`lan4` are bridge ports of `br-lan`, the
+  `wan` socket is not used by an AP and not reported. `radio0` is 5 GHz (ath10k, QCA988x),
+  `radio1` 2.4 GHz (ath9k). Adoption, the WiFi config push and live clients are confirmed
+  on OpenWrt 25.12.6 against a UCG Ultra; plenty of room (~98 MB free overlay, ~35 MB RAM
+  available before openUF). Locate drives `green:broadband`, the DSL LED, which has no
+  other consumer on an AP. Not yet confirmed on this board: `install.sh`, the controller's
+  radio settings (channel, width, power) and Locate itself
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
