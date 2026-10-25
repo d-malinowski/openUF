@@ -18,6 +18,10 @@
 	that this netdev is enslaved to (sysinfo.bridge_of): lan1 is a member
 	whether or not a cable is in it, so the uplink is still found when the
 	cable moves.
+
+	Caveat: that only covers uplink detection. A VLAN-tagged SSID builds its
+	sub-device on lan_cpueth (`lan1.<vid>`), so those SSIDs assume the uplink
+	cable is in lan1. Not tested on this board.
 ]]--
 
 local dev = {}

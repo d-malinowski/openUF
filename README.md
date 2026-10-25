@@ -166,7 +166,8 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   on OpenWrt 25.12.6 against a UCG Ultra; plenty of room (~98 MB free overlay, ~35 MB RAM
   available before openUF). Locate drives `green:broadband`, the DSL LED, which has no
   other consumer on an AP. Not yet confirmed on this board: `install.sh`, the controller's
-  radio settings (channel, width, power) and Locate itself
+  radio settings (channel, width, power) and Locate itself. VLAN-tagged SSIDs build on
+  `lan1`, so they assume the uplink cable is in `lan1`
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
