@@ -100,6 +100,12 @@ end
 
 local function get_bcfilter() return get_sibling("bcfilter", M._bcfilter) end
 local function get_minrssi()  return get_sibling("minrssi",  M._minrssi)  end
+local _plugins_mod
+local function get_plugins()
+	if M._plugins then return M._plugins end
+	_plugins_mod = _plugins_mod or get_sibling("plugins", nil)
+	return _plugins_mod
+end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
 -- The real controller's radio_table schema requires this "radio" field
@@ -827,6 +833,15 @@ local function mac_of(ifname)
 	local raw = ifname and M._read_file("/sys/class/net/" .. ifname .. "/address")
 	local mac = type(raw) == "string" and raw:match("(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
 	return mac and mac:lower() or nil
+end
+
+-- The BSSID a VAP has right now: its live netdev's address, resolved the same
+-- way the per-VAP features resolve it (find_vap_iface). Asked during
+-- apply_config, before the reload, so a VAP being rebuilt still answers with
+-- the netdev it is about to get back. nil when the radio has no live
+-- interface for it. Handed to plugins as ctx.bssid.
+function M.vap_bssid(radio, ssid)
+	return mac_of(M.get_ifname_for_vap(radio, ssid))
 end
 
 -- The bridge a netdev is enslaved to, or nil when it carries its own address.
@@ -1595,6 +1610,20 @@ function M.apply_config(resp, cfg, opts)
 			-- above all: netifd, not hostapd, bridges the VLAN netdev) only
 			-- when it is set.
 			if vap.ppsk then extra.dynamic_vlan = "1" end
+
+			-- conf.lua config.plugins: third-party edits to this VAP's
+			-- options, after everything built in (plugins.lua). Never
+			-- raises, and does nothing unless a plugin is listed.
+			do
+				local plugins = get_plugins()
+				if plugins then
+					plugins.vap_options(extra, vap, cfg, {
+						DELETE = M.DELETE,
+						bssid  = M.vap_bssid,
+						cursor = function() return get_uci().cursor() end,
+					})
+				end
+			end
 
 			local section = M.wlan_add(vap.radio, vap.ssid, vap.security,
 				vap.x_passphrase, extra, network, vap.wlanconf_id)
