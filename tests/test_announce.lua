@@ -564,4 +564,132 @@ return {
 				"the default suffix is M.VERSION_SUFFIX")
 		end
 	},
+	{
+		name = "announce: a v1 discovery request is answered with header 01 00 and the announce TLVs",
+		fn = function()
+			local cfg = sample_cfg()
+			local reply = announce.reply_for(string.char(1, 0, 0, 0), cfg)
+			assert_true(reply ~= nil, "v1 request answered")
+			assert_eq(reply:byte(1), 1, "version")
+			assert_eq(reply:byte(2), 0, "command")
+			local plen = reply:byte(3) * 256 + reply:byte(4)
+			assert_eq(plen, #reply - 4, "length field covers the body")
+			assert_eq(find_tlv(reply, 0x0b), "openUF", "hostname TLV")
+			assert_eq(find_tlv(reply, 0x01), string.char(0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xad), "hw TLV")
+			-- Same body as the broadcast, only the header differs.
+			assert_eq(reply:sub(3), announce.build_packet(cfg):sub(3), "body equals the announce body")
+		end
+	},
+	{
+		name = "announce: a v2 discovery request is answered with header 02 09",
+		fn = function()
+			local reply = announce.reply_for(string.char(2, 8, 0, 0), sample_cfg())
+			assert_true(reply ~= nil, "v2 request answered")
+			assert_eq(reply:byte(1), 2, "version")
+			assert_eq(reply:byte(2), 9, "command")
+		end
+	},
+	{
+		name = "announce: a targeted v1 request is answered only for our own MAC",
+		fn = function()
+			local cfg = sample_cfg()
+			local mine  = string.char(1, 4, 0, 6, 0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xad)
+			local other = string.char(1, 4, 0, 6, 0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xae)
+			local reply = announce.reply_for(mine, cfg)
+			assert_true(reply ~= nil, "own MAC answered")
+			assert_eq(reply:byte(2), 4, "reply command 4")
+			assert_eq(announce.reply_for(other, cfg), nil, "another MAC is not ours")
+			assert_eq(announce.reply_for(string.char(1, 4, 0, 6, 0x24, 0xa4), cfg), nil, "truncated MAC")
+		end
+	},
+	{
+		name = "announce: anything that is not a request gets no reply",
+		fn = function()
+			local cfg = sample_cfg()
+			assert_eq(announce.reply_for(announce.build_packet(cfg), cfg), nil, "our own broadcast echoed back")
+			assert_eq(announce.reply_for(string.char(2, 6, 0, 0), cfg), nil, "02 06 with no body")
+			assert_eq(announce.reply_for(string.char(1, 0, 0, 1, 0), cfg), nil, "v1 with a nonzero length")
+			assert_eq(announce.reply_for(string.char(1, 0, 1, 0), cfg), nil, "length high byte set")
+			assert_eq(announce.reply_for(string.char(3, 0, 0, 0), cfg), nil, "unknown version")
+			assert_eq(announce.reply_for(string.char(2, 9, 0, 0), cfg), nil, "a reply is not a request")
+			assert_eq(announce.reply_for("", cfg), nil, "empty")
+			assert_eq(announce.reply_for(nil, cfg), nil, "nil")
+		end
+	},
+	{
+		name = "announce: _serve_requests replies to the asker's address and port, once per request type per gap",
+		fn = function()
+			local now = 0
+			local queue = {
+				{string.char(1, 0, 0, 0), "192.0.2.50", 40001},
+				{string.char(1, 0, 0, 0), "192.0.2.50", 40002},   -- same asker, same request, too soon
+				{string.char(2, 8, 0, 0), "192.0.2.50", 40001},   -- same asker, the app's other probe: answered
+				{announce.build_packet(sample_cfg()), "192.0.2.9", 10001},   -- not a request
+				{string.char(2, 8, 0, 0), "192.0.2.51", 40003},
+			}
+			local sent = {}
+			local udpl = {
+				receivefrom = function() local q = table.remove(queue, 1); return q[1], q[2], q[3] end,
+				sendto = function(_, data, ip, port) sent[#sent + 1] = {data, ip, port}; return 1 end,
+			}
+			local fake = {
+				gettime = function() now = now + 0.01; return now end,
+				select = function() if #queue > 0 then return {udpl} end; now = now + 100; return {} end,
+			}
+			local saved_refresh, saved_last = announce._refresh, announce._last_reply
+			announce._refresh = function(c) return c end
+			announce._last_reply = {}
+			announce._serve_requests(udpl, sample_cfg(), 10, fake)
+			announce._refresh, announce._last_reply = saved_refresh, saved_last
+			assert_eq(#sent, 3, "three replies: the repeat and the non-request are skipped")
+			assert_eq(sent[1][2], "192.0.2.50", "first asker")
+			assert_eq(sent[1][3], 40001, "to the asker's own port")
+			assert_eq(sent[1][1]:byte(2), 0, "v1 reply")
+			assert_eq(sent[2][2], "192.0.2.50", "the same asker's v2 probe is answered too")
+			assert_eq(sent[2][1]:byte(2), 9, "v2 reply")
+			assert_eq(sent[3][2], "192.0.2.51", "second asker")
+			assert_eq(sent[3][1]:byte(2), 9, "v2 reply")
+		end
+	},
+	{
+		name = "announce: the discovery multicast group is joined on the LAN address, once, and again when the address moves",
+		fn = function()
+			local calls = {}
+			local fail = false
+			local udpl = {setoption = function(_, opt, v)
+				calls[#calls + 1] = opt .. " " .. v.multiaddr .. " " .. v.interface
+				if fail and opt == "ip-add-membership" then return nil, "no such device" end
+				return 1
+			end}
+			local saved_j, saved_e = announce._joined, announce._join_err
+			announce._joined, announce._join_err = nil, nil
+			announce._join_multicast(udpl, {ip = {192, 0, 2, 7}})
+			announce._join_multicast(udpl, {ip = {192, 0, 2, 7}})
+			assert_eq(#calls, 1, "a second call with the same address does nothing")
+			assert_eq(calls[1], "ip-add-membership 233.89.188.1 192.0.2.7", "joined on the LAN address")
+			announce._join_multicast(udpl, {ip = {192, 0, 2, 8}})
+			assert_eq(calls[2], "ip-drop-membership 233.89.188.1 192.0.2.7", "the old membership is dropped")
+			assert_eq(calls[3], "ip-add-membership 233.89.188.1 192.0.2.8", "and the new address joined")
+			-- A failed join is retried on the next call, not remembered as done.
+			announce._joined, announce._join_err = nil, nil
+			calls = {}
+			fail = true
+			announce._join_multicast(udpl, {ip = {192, 0, 2, 9}})
+			announce._join_multicast(udpl, {ip = {192, 0, 2, 9}})
+			assert_eq(#calls, 2, "a failed join is attempted again")
+			assert_eq(announce._joined, nil, "and not recorded as joined")
+			fail = false
+			announce._join_multicast(udpl, {ip = {192, 0, 2, 9}})
+			assert_eq(announce._joined, "192.0.2.9", "recorded once it works")
+			announce._joined, announce._join_err = saved_j, saved_e
+		end
+	},
+	{
+		name = "announce: build_packet's default header is still 02 06",
+		fn = function()
+			local pkt = announce.build_packet(sample_cfg())
+			assert_eq(pkt:byte(1), 2, "version")
+			assert_eq(pkt:byte(2), 6, "command")
+		end
+	},
 }

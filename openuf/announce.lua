@@ -3,7 +3,9 @@
 
 	Sends a TLV-encoded announce packet to 255.255.255.255 every 10 seconds.
 	This makes the device visible in UniFi Discover / UBNT-Discovery before
-	and after adoption.
+	and after adoption. The same process answers the discovery requests other
+	Ubiquiti tools send to this port, broadcast, unicast or to the IPv4
+	multicast group (M.reply_for, M._join_multicast). IPv6 is not served.
 
 	Can be loaded as a module (returns M) or run as a standalone script.
 	When run as a script, call M.run(cfg) at the bottom of this file.
@@ -24,6 +26,20 @@ M.PORT = 10001
 -- definition: it used to be typed out twice, in build_packet and in the entry
 -- point below, and the two could drift.
 M.VERSION_SUFFIX = "-openUF-0.2"
+
+-- Packet headers (version byte, command byte). ANNOUNCE is the unsolicited
+-- broadcast; the others answer a discovery request (see M.reply_for).
+M.HDR_ANNOUNCE      = {0x02, 0x06}
+M.HDR_REPLY_V1      = {0x01, 0x00}
+M.HDR_REPLY_V2      = {0x02, 0x09}
+M.HDR_REPLY_TARGET  = {0x01, 0x04}
+
+-- The same request from the same asker inside this many seconds gets no second
+-- reply: the reply is ~100x the probe, so an answering AP is otherwise a UDP
+-- reflector. Keyed on asker AND request type, because the UniFi app sends
+-- 01 00 00 00 and 02 08 00 00 back to back from one address and port, once a
+-- second (captured 2026-10-25), and needs an answer to each.
+M.REPLY_MIN_GAP = 0.5
 
 -- TLV type codes for the Ubiquiti discovery protocol
 local PKT = {
@@ -66,9 +82,10 @@ end
 --   version_suffix string     appended after fw_ver in verbose/short strings
 --   uptime       number       seconds since boot
 --   counter      number       monotonically increasing send counter
-function M.build_packet(cfg)
+function M.build_packet(cfg, hdr)
 	-- Outer packet: 2-byte header + 2-byte length field (filled in at end)
-	local packet = {0x02, 0x06, 0x00, 0x00}
+	hdr = hdr or M.HDR_ANNOUNCE
+	local packet = {hdr[1], hdr[2], 0x00, 0x00}
 	local w
 
 	-- 0x02: IP address (MAC + IP concatenated)
@@ -336,6 +353,102 @@ function M._refresh(cfg)
 	return cfg
 end
 
+-- The reply a received datagram deserves, or nil. Pure.
+--
+-- Ubiquiti's discovery tools (UniFi app, WiFiman's Discovery tab, the Device
+-- Discovery Tool) broadcast a bare request to UDP 10001 and list whoever
+-- answers. Captured 2026-10-25 from a UCG Ultra, broadcast or unicast, from an
+-- ephemeral port:
+--   01 00 00 00 -> 01 00 <len> <TLVs>      (replied from port 10001)
+--   02 08 00 00 -> 02 09 <len> <TLVs>
+-- and nothing for a v1 request with a nonzero length, `02 06 00 00`, or the
+-- targeted `01 04`. The AP firmware (mcad, UAP BZ2 4.0.15) also answers a
+-- targeted v1 request, `01 04 00 06 <mac>`, when the MAC is its own; that
+-- one is firmware-confirmed for 4.0.15 only. Everything else is not a request,
+-- notably our own broadcast (02 06) arriving back on the listener.
+function M.reply_for(data, cfg)
+	if type(data) ~= "string" then return nil end
+	local ver, cmd, l1, l2 = data:byte(1, 4)
+	if not (ver and l1 and l1 == 0) then return nil end
+	if #data == 4 and l2 == 0 then
+		if ver == 1 and cmd == 0 then return M.build_packet(cfg, M.HDR_REPLY_V1) end
+		if ver == 2 and cmd == 8 then return M.build_packet(cfg, M.HDR_REPLY_V2) end
+	elseif #data == 10 and ver == 1 and cmd == 4 and l2 == 6 and cfg.mac then
+		local want = {}
+		for i = 1, 6 do want[i] = string.char(cfg.mac[i] or 0) end
+		if data:sub(5, 10) == table.concat(want) then
+			return M.build_packet(cfg, M.HDR_REPLY_TARGET)
+		end
+	end
+	return nil
+end
+
+-- Join the discovery multicast group on the LAN address, so requests sent to
+-- 233.89.188.1:10001 arrive too (the UCG sends its probes there and to the
+-- broadcast address; the firmware's mcad joins the same group). Idempotent: a
+-- no-op while the address is unchanged, a re-join when it moves (DHCP renewal,
+-- a pushed static address), a retry on the next call when the join failed. A
+-- failure is logged once per distinct error. The group is IPv4 only; see
+-- PROTOCOL-VALIDATION.md "Discovery requests" for the IPv6 gap.
+M._joined = nil
+M._join_err = nil
+function M._join_multicast(udpl, cfg)
+	local ip = cfg.ip and table.concat(cfg.ip, ".") or "0.0.0.0"
+	if M._joined == ip then return end
+	if M._joined then
+		pcall(udpl.setoption, udpl, "ip-drop-membership",
+			{multiaddr = M.MULTICAST_ADDR, interface = M._joined})
+		M._joined = nil
+	end
+	local ok, err = udpl:setoption("ip-add-membership",
+		{multiaddr = M.MULTICAST_ADDR, interface = ip})
+	if ok then
+		M._joined, M._join_err = ip, nil
+	elseif M._join_err ~= tostring(err) then
+		M._join_err = tostring(err)
+		io.stderr:write("announce: cannot join " .. M.MULTICAST_ADDR .. " on " .. ip
+			.. " (" .. M._join_err .. "); multicast requests go unanswered\n")
+	end
+end
+
+-- Last reply time per asker address and request type, for REPLY_MIN_GAP.
+M._last_reply = {}
+
+-- Wait out `interval` seconds on the listener, answering each request that
+-- arrives meanwhile: unicast to the asker's address and port, from port 10001
+-- (the listener's own socket), as the UCG does. `socket` is LuaSocket (a seam).
+function M._serve_requests(udpl, cfg, interval, socket)
+	local deadline = socket.gettime() + interval
+	while true do
+		local remaining = deadline - socket.gettime()
+		if remaining <= 0 then return end
+		local readable = socket.select({udpl}, nil, remaining)
+		if readable and readable[1] then
+			local data, ip, port = udpl:receivefrom()
+			if data and ip then
+				local now = socket.gettime()
+				local key = ip .. "/" .. tostring(data:byte(1)) .. "." .. tostring(data:byte(2))
+				local last = M._last_reply[key]
+				if not (last and now - last < M.REPLY_MIN_GAP)
+						and M.reply_for(data, cfg) then
+					-- Fresh figures (IP, uptime, adoption) for the reply itself.
+					M._refresh(cfg)
+					local reply = M.reply_for(data, cfg)
+					local n = 0
+					for _ in pairs(M._last_reply) do n = n + 1 end
+					if n > 64 then M._last_reply = {} end
+					M._last_reply[key] = now
+					local sent, serr = udpl:sendto(reply, ip, port)
+					if not sent then
+						io.stderr:write("announce: reply to " .. tostring(ip) .. ":"
+							.. tostring(port) .. " failed: " .. tostring(serr) .. "\n")
+					end
+				end
+			end
+		end
+	end
+end
+
 -- Start the main announce loop (blocks forever).
 -- cfg: same table as build_packet() requires, plus:
 --   interval    number  seconds between sends (default 10)
@@ -360,6 +473,19 @@ function M.run(cfg)
 	-- respawned it five seconds later so it healed itself, but every boot
 	-- logged a crash. A failed sendto is logged and simply retried next tick.
 
+	-- The listener answers discovery requests (M.reply_for) for the daemon's
+	-- whole life, adopted or not, as mcad does. If the bind fails the loop
+	-- runs as before, broadcasting only, and says so once.
+	-- udp4 where LuaSocket has it: a plain "*" bind falls back to an IPv6
+	-- socket when the IPv4 one is taken, and the probes are IPv4 only.
+	local udpl = (socket.udp4 or socket.udp)()
+	local bound, berr = udpl:setsockname("*", M.PORT)
+	if not bound then
+		io.stderr:write("announce: cannot listen on udp/" .. M.PORT .. " ("
+			.. tostring(berr) .. "); discovery requests go unanswered\n")
+		udpl = nil
+	end
+
 	local counter  = cfg.counter or 0
 	local interval = cfg.interval or 10
 
@@ -375,7 +501,12 @@ function M.run(cfg)
 		if not ok then
 			io.stderr:write("announce: send failed: " .. tostring(err) .. "\n")
 		end
-		socket.select(nil, nil, interval)
+		if udpl then
+			M._join_multicast(udpl, cfg)
+			M._serve_requests(udpl, cfg, interval, socket)
+		else
+			socket.select(nil, nil, interval)
+		end
 	end
 end
 

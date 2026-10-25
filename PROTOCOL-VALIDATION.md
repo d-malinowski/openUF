@@ -624,6 +624,64 @@ Two things real hardware does that the validation container had to be taught:
 alias for `inform_url`. Treating them as the same key makes the device overwrite its working
 inform endpoint on the first routine post-adopt `setparam` and disappear permanently.
 
+### Discovery requests (UDP 10001)
+
+Ubiquiti's own tools (the UniFi app, WiFiman's Discovery tab, the Device Discovery Tool)
+find devices by sending a bare request to UDP 10001 and listing whoever answers. Until
+2026-10-25 openUF only broadcast (`02 06`, from an ephemeral port) and never listened, so
+those tools saw a host with no model, name or firmware.
+
+**Captured 2026-10-25 from a real UCG Ultra (Network 10.6), requests from an ephemeral port,
+broadcast and unicast:**
+
+| Request | Reply |
+|---|---|
+| `01 00 00 00` | unicast from **UDP 10001** to the asker's port: `01 00 <len16> <TLVs>`, 504 bytes |
+| `02 08 00 00` | `02 09 <len16> <TLVs>`, the same 504-byte body; a broadcast request also drew a second 137-byte `02 09` datagram with announce-style TLVs (the UCG has two responders) |
+| `01 04 00 06 <mac>` (right or wrong MAC), `02 06 00 00`, `01 00 00 01 00` | nothing |
+
+The UCG body carries `0x01` hw, `0x02` (mac + ip) x4, `0x0a` uptime, `0x0b` hostname,
+`0x0c` platform, `0x03` / `0x16` firmware, `0x15`, `0x17`, `0x0e`, `0x0d`, `0x06`, `0x0f`,
+and gateway-only `0x2f`, `0x2b` (UUID), `0x32` (port JSON). An AP's reply is its announce TLVs
+under the reply header. The two openUF APs answered nothing before the change (no listener).
+
+**Firmware, `/bin/mcad` of UAP BZ2 4.0.15 (firmware-confirmed for 4.0.15 only):**
+`init_mcast_sock` binds UDP 10001 at daemon start and joins `233.89.188.1`, with no
+adoption check. `mcast_sock_process` drops any datagram whose source port is 10001 (other
+devices' announces) and hands version 1 to `handle_version1`: command 0 with length 0
+answers every asker, command 4 with length 6 answers only when the MAC equals the AP's own,
+the reply header being `01` plus the request's command byte. No version-2 request handler
+was found in this old build, so the AP side of `02 08` rests on the UCG capture alone.
+
+**openUF** (`announce.lua`, `reply_for` / `_serve_requests`): listens on IPv4 UDP 10001 for
+the daemon's whole life, under `l2_announce`; answers `01 00 00 00` with `01 00`, `02 08 00 00`
+with `02 09`, and `01 04 00 06 <own mac>` with `01 04` (the last firmware-only, not seen on a
+UCG); ignores everything else, including its own broadcast coming back. One reply per
+asker address and request type per 0.5 s, since the reply is ~100x the request.
+The UniFi app (WiFiman, captured on the home LAN 2026-10-25) sends `01 00 00 00` and
+`02 08 00 00` back to back from one address and port, every second, to the broadcast
+address and to `ff02::1`; a limit keyed on the address alone answered only one of the two,
+and one AP lost the app's "AP" badge Lab (Docker AP, luasocket
+3.0.0): replies arrive from port 10001, the body parses as the announce TLVs, and a second
+instance logs `cannot listen on udp/10001` once and keeps broadcasting.
+
+**Multicast (done 2026-10-25).** The UCG sends its own probes to `233.89.188.1:10001` and to
+the broadcast address in the same millisecond, and the firmware's `mcad` joins the group, so
+the AP joins it too (`ip-add-membership` on the LAN address, re-joined when the address moves,
+retried on failure, logged once per distinct error). Probes sent to the group from the Mac
+(unconnected socket) were answered by both home APs with `01 00` / `02 09`; the UCG answered
+`02 08` over multicast with `02 09` and ignored `01 00 00 00` sent there. A request that
+arrives as both a broadcast and a multicast copy is answered once (the limit above).
+
+**IPv6 (NOT done, gap).** WiFiman also sends both probes to `ff02::1` every second from a
+link-local address, and `mcad` opens an IPv6 socket on port 10001 (`init_mcast_sock`, family
+`AF_INET6`), so a real AP may answer there. openUF listens on IPv4 only. What we know: a v4
+broadcast of the same probe is sent alongside every v6 one, so the app is answered either
+way; a v6 probe to `ff02::1` from the Mac drew **no reply from any device on the LAN, the UCG
+included** (2026-10-25), so we have no reply format to copy; and LuaSocket 3.0 has no
+scope-id handling for sending to a `fe80::` asker. Revisit if a client shows up that probes
+IPv6 only, and capture a UAP's v6 reply before writing one.
+
 ### Response `_type`s
 
 The complete set, per `InformServlet`: `noop`, `setparam`, `cmd`, `upgrade`, `reboot`,
@@ -4329,6 +4387,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname`; a client's own profile as `rate-update` | ✅ Wire format confirmed live 2026-07-18 (kbps; the discriminator is the presence of `maxspeed`; needs a profile to exist). **Per client**, both directions queued (firmware-confirmed for 4.0.15; corrected 2026-10-11 from "per-VAP aggregate"). openUF: one HTB class per client per direction (upload on an IFB), live on both APs 2026-10-11: a phone held 1.97 Mbit/s up under 2 and 4.5 down under 5. See "`qos.*` — WiFi Speed Limit" |
 | 39 | Ports view Connection column on an **uplink** port | `port_table[]` with **no** `mac_table` field on `is_uplink` ports | ✅ Blank (or a retained stale value) is the CORRECT state, verified 2026-09-12. Reporting the one MAC on the other end of the cable is tempting — openUF knows it, since finding it is how the uplink socket is identified, and a real UniFi gateway visibly does it on its own uplink port — but it would invert the topology map: the controller files a known device seen alone on a port into this device's `downlink_table`, and the `isUplinkMac` guard against that is ANDed with `!is_uplink`, so it disables itself on exactly the port where it is needed. The gateway would hang beneath every AP that reported it. A real gateway escapes it only because the ISP's router is not an adopted device. Live proof of the correct shape: both APs' `downlink_table` empty, the gateway's holding both APs. The stale text persists because `last_connection` is never recomputed when a port sends no `mac_table` field (and only ever recomputed when a port reports exactly **one** MAC) — clear it with the Ports view's **Clear Last Seen Device**. |
 | 40 | Roaming Assistant | `wifi_caps2` bit `0x20` → `wireless.<n>.btm_disassoc.status`/`.threshold` | ✅ Wire format, gate and teardown confirmed live in the lab (10.4.57) and against a real UCG Ultra (Network 10.6), 2026-09-26: the keys arrive on the 5 GHz WLAN entry only, and switching off removes openUF's stamp on both APs. **Steering confirmed on real radios:** a client at −80 dBm on one AP, heard at −52 by the other, got a BTM request, answered `BSS-TM-RESP status_code=4` (refused), was disassociated 16 s later by openUF, and reassociated on the other AP within 1 s at −61 dBm. Its hostapd `extended_capabilities` did not advertise BSS Transition, yet it answered, so the capability bytes do not predict which clients reply. It stayed put for all 30 one-minute samples, with no further actions. The no-better-AP rule is unit-tested only: no qualifying client was present. |
+| 41 | Discovery requests (UniFi app, WiFiman Discovery, Device Discovery Tool) | UDP 10001 request `01 00 00 00` / `02 08 00 00`, reply `01 00` / `02 09` + announce TLVs from port 10001 | ✅ Wire format captured 2026-10-25 from a real UCG Ultra (see "Discovery requests (UDP 10001)"). AP always-listening and targeted `01 04` firmware-confirmed for UAP 4.0.15. openUF answers all three; lab-validated only (home APs run `l2_announce = false`), not seen in WiFiman's UI. |
 
 ---
 

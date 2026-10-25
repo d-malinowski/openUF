@@ -35,7 +35,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 
 | Feature | Status |
 |---|---|
-| L2 UDP discovery (port 10001) | ✅ Working |
+| L2 UDP discovery (port 10001) | ✅ Working: the periodic announce the controller adopts from. The same process also **answers** the discovery requests of the UniFi app, WiFiman's Discovery tab and the Device Discovery Tool (`01 00 00 00` → `01 00`, `02 08 00 00` → `02 09`, both captured from a real UCG Ultra, by broadcast, unicast or the `233.89.188.1` multicast group; targeted `01 04` is firmware-confirmed for UAP 4.0.15). IPv6 (`ff02::1`) probes are not answered. ⚠️ Lab-validated only: the home APs run with `l2_announce = false`, which turns the responder off with the broadcast |
 | TNBU inform protocol | ✅ Working — AES-128-CBC and AES-128-GCM |
 | AES-128-GCM | ✅ Working — **required**: 10.4.57 will not finish provisioning a device until it receives a genuine GCM inform. Needs a GCM-capable `lua-openssl` build |
 | L2 adoption (SSH `syswrapper.sh set-adopt`) | ✅ Working — completes to **Connected** |
