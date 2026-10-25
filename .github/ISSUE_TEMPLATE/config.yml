@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or design discussion
+    url: https://github.com/jonasevcik/openUF/discussions
+    about: Ideas that are not yet a concrete request, how-to questions, "would you accept ...". Start here before writing a pull request for a larger change.

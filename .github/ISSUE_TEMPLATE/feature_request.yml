@@ -1,0 +1,34 @@
+name: Feature request
+description: A controller feature openUF does not honour yet, or a capability you would like.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        openUF makes an OpenWrt AP present itself to a UniFi Network Application as a Ubiquiti AP, on a stock OpenWrt install. A feature fits when the controller can push it and OpenWrt can enforce it with what ships on the device. Anything that needs extra software changing the stock system is out of scope for openUF itself; open a discussion first.
+
+        Mask MACs, IPs, passphrases and keys in anything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What should happen, and where do you see it in the controller?
+      description: The page, toggle or field. If you know the REST field or `system_cfg` key, name it.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why do you need it?
+      description: The problem you are solving, not only the feature.
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Your setup
+      description: Device and OpenWrt version, controller version.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence you already have (masked)
+      description: A before/after diff of `system_cfg` across the toggle, a capture, or a pointer to the OpenWrt option that would implement it. Optional, but it speeds things up.

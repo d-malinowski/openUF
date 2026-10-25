@@ -1,0 +1,55 @@
+name: Bug report
+description: Something openUF does is wrong, or a controller setting has no effect.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you paste anything, mask it.** This is a public repository.
+        - Replace real MAC addresses and IPs with placeholders (`00:00:5e:00:53:01`, `192.0.2.1`), one placeholder per real value.
+        - **Never paste** `/etc/openuf/state.json` (it holds the adoption `authkey`), a raw `system_cfg` (it holds WLAN passphrases and `iapp_key`), or `/var/run/hostapd-*.conf` unredacted.
+  - type: input
+    id: version
+    attributes:
+      label: openUF version
+      description: The release tag, or the commit if you run from git.
+    validations:
+      required: true
+  - type: input
+    id: board
+    attributes:
+      label: Device and OpenWrt version
+      description: Board, switch type (swconfig or DSA), OpenWrt release, and the modelmap you selected.
+      placeholder: "TP-Link Archer C5 v1, swconfig, OpenWrt 25.12.x, archer-c5-v1"
+    validations:
+      required: true
+  - type: input
+    id: controller
+    attributes:
+      label: UniFi Network Application version
+      description: And whether it runs on a UniFi gateway, in Docker, or elsewhere.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you do, what did you expect, what happened?
+      description: Name the controller setting or page. If you changed a setting, say whether you used Force Provision afterwards.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence (masked)
+      description: |
+        What the device says, not what you wrote into UCI: `logread | grep -i openuf`, `uci show wireless` for the WLAN, `/var/run/hostapd-*.conf` lines for the option, `nft list` or `swconfig` output where it applies. Say which of these you checked.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I masked every MAC, IP, passphrase and key above.
+          required: true
+        - label: I am not running a third-party plugin, or I say so above.
+          required: true

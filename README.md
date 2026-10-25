@@ -275,6 +275,13 @@ Key reference material:
 - [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol)
 - [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering)
 
+## Questions, bugs and ideas
+
+- **Bug or a controller setting that has no effect:** open an [issue](https://github.com/jonasevcik/openUF/issues/new/choose) with the bug template. It asks for what the device itself reports (`logread`, `/var/run/hostapd-*.conf`, `nft list`), not only the UCI you wrote.
+- **A feature the controller can push:** open an issue with the feature template. A before/after diff of `system_cfg` across the toggle is the most useful evidence.
+- **A question, or an idea you want to talk through before building it:** use [Discussions](https://github.com/jonasevcik/openUF/discussions). Please start there before sending a pull request for a larger change.
+- **This is a public repository, so mask what you paste.** Replace real MACs and IPs with placeholders (`00:00:5e:00:53:01`, `192.0.2.1`). Never paste `/etc/openuf/state.json` (it holds the adoption `authkey`), a raw `system_cfg` (WLAN passphrases and `iapp_key`), or an unredacted `/var/run/hostapd-*.conf`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
